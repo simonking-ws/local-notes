@@ -1,0 +1,26 @@
+# IDE 配置
+.idea/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 备份文件
+*.bak
+*.bak-*
+
+# 临时调试脚本
+_t*.py
+_v*.py
+
+# 本地个人数据（不上云，保护隐私）
+notes_data.db
+notes_data.json
+
+# 预览截图（与项目代码无关）
+preview-*.png
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store

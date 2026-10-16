@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>备忘录</title>
+<style>
+  :root {
+    --bg-title: #f6f6f7;
+    --bg-sidebar: #ececef;
+    --bg-list: #fbfbfd;
+    --bg-editor: #ffffff;
+    --line: #d9d9de;
+    --line-soft: #ededf0;
+    --text: #1d1d1f;
+    --text-soft: #8a8a8e;
+    --text-faint: #b0b0b5;
+    --hover: #e3e3e8;
+    --select: #cfe3ff;
+    --select-text: #0a58ca;
+    --accent: #007aff;
+    --shadow: rgba(0,0,0,.12);
+  }
+  [data-theme="dark"] {
+    --bg-title: #2a2a2c;
+    --bg-sidebar: #232325;
+    --bg-list: #2c2c2e;
+    --bg-editor: #1e1e20;
+    --line: #3a3a3c;
+    --line-soft: #333336;
+    --text: #f2f2f4;
+    --text-soft: #9a9aa0;
+    --text-faint: #6a6a70;
+    --hover: #3a3a3c;
+    --select: #2b4a73;
+    --select-text: #7fb2ff;
+    --accent: #0a84ff;
+    --shadow: rgba(0,0,0,.45);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+      "Helvetica Neue", "Microsoft YaHei", sans-serif;
+    color: var(--text);
+    background: var(--bg-editor);
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  .window { height: 100vh; display: flex; flex-direction: column; }
+
+  .titlebar {
+    height: 40px; flex: 0 0 40px;
+    background: var(--bg-title);
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: center;
+    padding: 0 12px; gap: 10px;
+    -webkit-app-region: drag;
+  }
+  .lights { display: flex; gap: 8px; -webkit-app-region: no-drag; }
+  .light { width: 12px; height: 12px; border-radius: 50%; cursor: pointer; }
+  .light:hover { filter: brightness(.92); }
+  .light.red { background: #ff5f57; }
+  .light.yellow { background: #febc2e; }
+  .light.green { background: #28c840; }
+  .title-center { flex: 1; display: flex; justify-content: center; align-items: center; }
+  .search {
+    width: min(360px, 46%);
+    height: 26px; background: var(--bg-editor);
+    border: 1px solid var(--line); border-radius: 7px;
+    display: flex; align-items: center; padding: 0 8px; gap: 6px;
+    color: var(--text-soft); -webkit-app-region: no-drag;
+  }
+  .search input { border: none; outline: none; background: transparent; flex: 1; font-size: 13px; color: var(--text); }
+  .search svg { flex: 0 0 14px; }
+  .title-right { display: flex; gap: 6px; -webkit-app-region: no-drag; }
+  .icon-btn {
+    width: 28px; height: 26px; border: none; background: transparent;
+    border-radius: 6px; display: flex; align-items: center; justify-content: center;
+    cursor: pointer; color: var(--text-soft); -webkit-app-region: no-drag;
+  }
+  .icon-btn:hover { background: var(--hover); color: var(--text); }
+  .icon-btn:active { transform: scale(.94); }
+
+  .body { flex: 1; display: grid; grid-template-columns: 210px 300px 1fr; min-height: 0; }
+
+  .sidebar { background: var(--bg-sidebar); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  .sidebar-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px 6px; font-size: 12px; font-weight: 700; color: var(--text-soft); letter-spacing: .3px; }
+  .folder-list { flex: 1; overflow-y: auto; padding: 0 8px 8px; }
+  .folder { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; border-radius: 7px; font-size: 13.5px; cursor: pointer; color: var(--text); gap: 6px; }
+  .folder:hover { background: var(--hover); }
+  .folder.active { background: var(--select); color: var(--select-text); font-weight: 600; }
+  .folder .name { display: flex; align-items: center; gap: 7px; flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .folder .count { font-size: 12px; color: var(--text-faint); }
+  .folder.active .count { color: var(--select-text); }
+  .folder .menu-btn { opacity: 0; color: var(--text-soft); }
+  .folder:hover .menu-btn { opacity: .7; }
+  .sidebar-foot { padding: 7px 8px; border-top: 1px solid var(--line-soft); }
+  .side-add { width: 100%; border: none; background: transparent; padding: 6px 10px; border-radius: 7px; text-align: left; font-size: 13px; color: var(--accent); cursor: pointer; display: flex; align-items: center; gap: 7px; }
+  .side-add:hover { background: var(--hover); }
+
+  .notelist { background: var(--bg-list); border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+  .notelist-head { display: flex; align-items: center; justify-content: space-between; padding: 9px 14px; border-bottom: 1px solid var(--line-soft); font-size: 13px; font-weight: 600; color: var(--text-soft); }
+  .notes-scroll { flex: 1; overflow-y: auto; }
+  .note-item { padding: 10px 14px; border-bottom: 1px solid var(--line-soft); cursor: pointer; position: relative; }
+  .note-item:hover { background: var(--hover); }
+  .note-item.active { background: var(--select); }
+  .note-item.active .ni-title, .note-item.active .ni-preview, .note-item.active .ni-date { color: var(--select-text); }
+  .ni-top { display: flex; align-items: center; gap: 6px; }
+  .ni-title { font-size: 13.5px; font-weight: 600; color: var(--text); flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .ni-pin { color: var(--accent); flex: 0 0 auto; }
+  .ni-date { font-size: 11.5px; color: var(--text-faint); flex: 0 0 auto; }
+  .ni-preview { font-size: 12.5px; color: var(--text-soft); margin-top: 3px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+  .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; color: var(--text-faint); gap: 10px; font-size: 13px; text-align: center; padding: 30px; }
+  .empty svg { opacity: .5; }
+
+  .editor-wrap { background: var(--bg-editor); display: flex; flex-direction: column; min-height: 0; }
+  .editor-bar { height: 44px; flex: 0 0 44px; display: flex; align-items: center; gap: 2px; padding: 0 10px; border-bottom: 1px solid var(--line-soft); }
+  .fmt { min-width: 30px; height: 30px; padding: 0 7px; border: none; background: transparent; border-radius: 6px; cursor: pointer; color: var(--text-soft); font-size: 14px; display: flex; align-items: center; justify-content: center; }
+  .fmt:hover { background: var(--hover); color: var(--text); }
+  .fmt.active { background: var(--select); color: var(--accent); }
+  .bar-sep { width: 1px; height: 20px; background: var(--line); margin: 0 6px; }
+  .editor-scroll { flex: 1; overflow-y: auto; }
+  .editor { max-width: 760px; margin: 0 auto; padding: 28px 36px 80px; min-height: 100%; outline: none; font-size: 15px; line-height: 1.7; color: var(--text); user-select: text; }
+  .editor::first-line { font-weight: 700; font-size: 20px; }
+  .editor:empty::before { content: "开始书写…"; color: var(--text-faint); font-weight: 400; font-size: 15px; }
+  .editor h1 { font-size: 20px; font-weight: 700; margin: 8px 0; }
+  .editor h2 { font-size: 17px; font-weight: 600; margin: 6px 0; }
+  .editor div.check { display: flex; align-items: flex-start; gap: 8px; margin: 2px 0; }
+  .editor .box { flex: 0 0 auto; width: 17px; height: 17px; margin-top: 3px; border: 1.5px solid var(--text-faint); border-radius: 5px; cursor: pointer; position: relative; }
+  .editor .check.done .box { background: var(--accent); border-color: var(--accent); }
+  .editor .check.done .box::after { content: ""; position: absolute; left: 5px; top: 1px; width: 5px; height: 10px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+  .editor .check.done .txt { color: var(--text-faint); text-decoration: line-through; }
+  .editor .txt { flex: 1; }
+
+  .pop { position: fixed; background: var(--bg-editor); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 8px 30px var(--shadow); padding: 5px; z-index: 50; min-width: 150px; }
+  .pop button { width: 100%; border: none; background: transparent; text-align: left; padding: 7px 12px; border-radius: 6px; font-size: 13px; color: var(--text); cursor: pointer; display: flex; align-items: center; gap: 9px; }
+  .pop button:hover { background: var(--accent); color: #fff; }
+  .pop button.danger:hover { background: #ff3b30; }
+
+  ::-webkit-scrollbar { width: 9px; }
+  ::-webkit-scrollbar-thumb { background: rgba(140,140,140,.4); border-radius: 6px; border: 2px solid transparent; background-clip: content-box; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(140,140,140,.6); background-clip: content-box; }
+
+  @media (max-width: 760px) { .body { grid-template-columns: 1fr; } .sidebar, .notelist { display: none; } }
+</style>
+</head>
+<body>
+<div class="window">
+  <div class="titlebar">
+    <div class="lights">
+      <span class="light red" id="lw-close"></span>
+      <span class="light yellow" id="lw-min"></span>
+      <span class="light green" id="lw-max"></span>
+    </div>
+    <div class="title-center">
+      <div class="search">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        <input id="search" type="text" placeholder="搜索" />
+      </div>
+    </div>
+    <div class="title-right">
+      <button class="icon-btn" id="themeBtn" title="切换深色/浅色">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z"/></svg>
+      </button>
+      <button class="icon-btn" id="newNoteBtn" title="新建备忘录">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="body">
+    <aside class="sidebar">
+      <div class="sidebar-head">文件夹</div>
+      <div class="folder-list" id="folderList"></div>
+      <div class="sidebar-foot">
+        <button class="side-add" id="newFolderBtn">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+          新建文件夹
+        </button>
+      </div>
+    </aside>
+
+    <section class="notelist">
+      <div class="notelist-head">
+        <span id="listTitle">全部备忘录</span>
+        <span id="listCount" style="font-weight:400;color:var(--text-faint)"></span>
+      </div>
+      <div class="notes-scroll" id="notesScroll"></div>
+    </section>
+
+    <section class="editor-wrap">
+      <div class="editor-bar" id="editorBar" style="visibility:hidden">
+        <button class="fmt" data-cmd="title" title="标题"><b style="font-size:13px">标题</b></button>
+        <button class="fmt" data-cmd="h2" title="小标题"><b style="font-size:12px">小标题</b></button>
+        <button class="fmt" data-cmd="p" title="正文">正文</button>
+        <span class="bar-sep"></span>
+        <button class="fmt" data-cmd="bold" title="加粗"><b>B</b></button>
+        <button class="fmt" data-cmd="italic" title="斜体"><i>I</i></button>
+        <button class="fmt" data-cmd="underline" title="下划线"><u>U</u></button>
+        <button class="fmt" data-cmd="strikeThrough" title="删除线"><s>S</s></button>
+        <span class="bar-sep"></span>
+        <button class="fmt" data-cmd="insertUnorderedList" title="项目符号"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="5" cy="7" r="1.4" fill="currentColor"/><circle cx="5" cy="12" r="1.4" fill="currentColor"/><circle cx="5" cy="17" r="1.4" fill="currentColor"/><path d="M9 7h11M9 12h11M9 17h11"/></svg></button>
+        <button class="fmt" data-cmd="insertOrderedList" title="编号列表"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 7h10M10 12h10M10 17h10M4 7h.01M4 12h.01M4 17h.01"/></svg></button>
+        <button class="fmt" data-cmd="checklist" title="待办清单"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6l2 2 3-3M3 13l2 2 3-3M3 20l2 2 3-3M12 6h9M12 13h9M12 20h9"/></svg></button>
+        <span class="bar-sep"></span>
+        <button class="fmt" id="pinBtn" title="置顶"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 17v5M9 3h6l-1 6 3 3H7l3-3-1-6z"/></svg></button>
+        <button class="fmt" id="delBtn" title="删除备忘录"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg></button>
+      </div>
+      <div class="editor-scroll">
+        <div class="editor" id="editor" contenteditable="false"></div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+  const KEY = "macnotes_v1";
+  const $ = (s) => document.querySelector(s);
+
+  let data = load();
+  function load() {
+    try { const raw = localStorage.getItem(KEY); if (raw) return JSON.parse(raw); } catch (e) {}
+    return seed();
+  }
+  function save() { localStorage.setItem(KEY, JSON.stringify(data)); }
+  function seed() {
+    const now = Date.now();
+    const mk = (folderId, content, pinned, ago) => ({ id: "n" + Math.random().toString(36).slice(2, 9), folderId, content, pinned: !!pinned, createdAt: now - ago, updatedAt: now - ago });
+    return {
+      folders: [
+        { id: "f_all", name: "全部备忘录", smart: true },
+        { id: "f_mac", name: "我的 Mac", smart: true },
+        { id: "f_work", name: "工作" },
+        { id: "f_life", name: "个人" },
+      ],
+      notes: [
+        mk("f_work", "<div>欢迎使用备忘录</div><div>这是一款复刻 macOS 备忘录的桌面应用 ✨</div><div>试试顶部工具栏：加粗、标题、待办清单都支持。</div>", true, 1000 * 60 * 5),
+        mk("f_work", "<div>周会待办</div><div class='check'><span class='box'></span><span class='txt'>整理上周进度</span></div><div class='check'><span class='box'></span><span class='txt'>同步需求文档</span></div>", false, 1000 * 60 * 60 * 3),
+        mk("f_life", "<div>读书清单</div><div>《人类简史》</div><div>《思考，快与慢》</div>", false, 1000 * 60 * 60 * 26),
+        mk("f_life", "<div>周末计划</div><div>爬山 + 看一部电影</div>", false, 1000 * 60 * 60 * 50),
+      ],
+      currentFolderId: "f_all", currentNoteId: null, theme: "light",
+    };
+  }
+
+  function uid() { return "x" + Math.random().toString(36).slice(2, 10); }
+  function folderNotes(folderId) {
+    if (folderId === "f_all" || folderId === "f_mac") return data.notes;
+    return data.notes.filter((n) => n.folderId === folderId);
+  }
+  function visibleNotes() {
+    const q = ($("#search").value || "").trim().toLowerCase();
+    let list = folderNotes(data.currentFolderId);
+    if (q) list = list.filter((n) => textOf(n).toLowerCase().includes(q));
+    return list.slice().sort((a, b) => {
+      if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+      return b.updatedAt - a.updatedAt;
+    });
+  }
+  function textOf(n) { const t = document.createElement("div"); t.innerHTML = n.content || ""; return (t.textContent || "").replace(/\s+/g, " ").trim(); }
+  function titleOf(n) { const t = textOf(n); const i = t.indexOf(" "); return i > 0 ? t.slice(0, i) : (t || "新建备忘录"); }
+  function previewOf(n) { const t = textOf(n); const i = t.indexOf(" "); return i > 0 ? t.slice(i + 1) : ""; }
+  function fmtDate(ts) {
+    const d = new Date(ts), n = new Date();
+    if (d.toDateString() === n.toDateString()) return d.toTimeString().slice(0, 5);
+    const y = new Date(n); y.setDate(n.getDate() - 1);
+    if (d.toDateString() === y.toDateString()) return "昨天";
+    if (d.getFullYear() === n.getFullYear()) return (d.getMonth() + 1) + "月" + d.getDate() + "日";
+    return d.getFullYear() + "/" + (d.getMonth() + 1) + "/" + d.getDate();
+  }
+
+  function renderFolders() {
+    const box = $("#folderList"); box.innerHTML = "";
+    data.folders.forEach((f) => {
+      const el = document.createElement("div");
+      el.className = "folder" + (f.id === data.currentFolderId ? " active" : "");
+      const cnt = f.smart ? data.notes.length : data.notes.filter((n) => n.folderId === f.id).length;
+      el.innerHTML = '<span class="name"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>' + escapeHtml(f.name) + "</span><span class='count'>" + cnt + "</span>";
+      el.onclick = () => { data.currentFolderId = f.id; renderAll(); };
+      if (!f.smart) {
+        const menu = document.createElement("span");
+        menu.className = "menu-btn";
+        menu.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>';
+        menu.onclick = (e) => { e.stopPropagation(); folderMenu(e, f); };
+        el.appendChild(menu);
+      }
+      box.appendChild(el);
+    });
+  }
+  function renderNotes() {
+    const cur = data.folders.find((f) => f.id === data.currentFolderId);
+    $("#listTitle").textContent = cur ? cur.name : "备忘录";
+    const list = visibleNotes();
+    $("#listCount").textContent = list.length ? list.length + " 条" : "";
+    const box = $("#notesScroll"); box.innerHTML = "";
+    if (!list.length) {
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.innerHTML = '<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4h16v16H4z"/><path d="M8 9h8M8 13h8M8 17h5"/></svg><div>' + ($("#search").value ? "未找到匹配的备忘录" : "暂无备忘录") + "</div>";
+      box.appendChild(empty); return;
+    }
+    list.forEach((n) => {
+      const el = document.createElement("div");
+      el.className = "note-item" + (n.id === data.currentNoteId ? " active" : "");
+      el.innerHTML = '<div class="ni-top">' + (n.pinned ? '<span class="ni-pin"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 17v5M9 3h6l-1 6 3 3H7l3-3-1-6z"/></svg></span>' : "") + '<span class="ni-title">' + escapeHtml(titleOf(n)) + "</span><span class='ni-date'>" + fmtDate(n.updatedAt) + "</span></div><div class='ni-preview'>" + escapeHtml(previewOf(n) || "暂无更多文字") + "</div>";
+      el.onclick = () => selectNote(n.id);
+      box.appendChild(el);
+    });
+  }
+  function renderEditor() {
+    const bar = $("#editorBar"); const ed = $("#editor");
+    const n = data.notes.find((x) => x.id === data.currentNoteId);
+    if (!n) { bar.style.visibility = "hidden"; ed.contentEditable = "false"; ed.innerHTML = ""; return; }
+    bar.style.visibility = "visible"; ed.contentEditable = "true";
+    if (ed.innerHTML !== n.content) ed.innerHTML = n.content || "";
+    updateBtnStates();
+  }
+  function renderAll() { renderFolders(); renderNotes(); renderEditor(); }
+
+  function selectNote(id) { data.currentNoteId = id; renderNotes(); renderEditor(); $("#editor").focus(); }
+  function newNote() {
+    const f = data.currentFolderId;
+    const folderId = (f === "f_all" || f === "f_mac") ? "f_work" : f;
+    const n = { id: uid(), folderId, content: "<div><br></div>", pinned: false, createdAt: Date.now(), updatedAt: Date.now() };
+    data.notes.unshift(n);
+    if (f === "f_all" || f === "f_mac") data.currentFolderId = folderId;
+    data.currentNoteId = n.id; save(); renderAll(); $("#editor").focus();
+    document.getSelection().removeAllRanges();
+  }
+  function deleteNote() {
+    const n = data.notes.find((x) => x.id === data.currentNoteId);
+    if (!n) return; if (!confirm("确定删除这条备忘录？")) return;
+    data.notes = data.notes.filter((x) => x.id !== n.id); data.currentNoteId = null; save(); renderAll();
+  }
+  function pinCurrent() {
+    const n = data.notes.find((x) => x.id === data.currentNoteId);
+    if (!n) return; n.pinned = !n.pinned; n.updatedAt = Date.now(); save(); renderAll();
+  }
+  function newFolder() {
+    const name = prompt("新建文件夹名称：", "新文件夹"); if (!name) return;
+    data.folders.push({ id: uid(), name: name.trim() }); save(); renderFolders();
+  }
+  function folderMenu(e, f) {
+    closePop();
+    const pop = document.createElement("div");
+    pop.className = "pop"; pop.style.left = e.clientX + "px"; pop.style.top = e.clientY + "px";
+    pop.innerHTML = '<button data-act="rename">重命名文件夹</button><button data-act="delete" class="danger">删除文件夹</button>';
+    pop.querySelector('[data-act="rename"]').onclick = () => { const name = prompt("重命名：", f.name); if (name) { f.name = name.trim(); save(); renderFolders(); } closePop(); };
+    pop.querySelector('[data-act="delete"]').onclick = () => {
+      if (!confirm("删除文件夹「" + f.name + "」？其中的备忘录将移到“我的 Mac”。")) { closePop(); return; }
+      data.notes.forEach((n) => { if (n.folderId === f.id) n.folderId = "f_work"; });
+      data.folders = data.folders.filter((x) => x.id !== f.id);
+      if (data.currentFolderId === f.id) data.currentFolderId = "f_all";
+      save(); renderAll(); closePop();
+    };
+    document.body.appendChild(pop);
+    setTimeout(() => document.addEventListener("click", closePop, { once: true }), 0);
+  }
+  function closePop() { document.querySelectorAll(".pop").forEach((p) => p.remove()); }
+
+  const ed = $("#editor");
+  let saveTimer = null;
+  ed.addEventListener("input", () => {
+    const n = data.notes.find((x) => x.id === data.currentNoteId); if (!n) return;
+    n.content = ed.innerHTML; n.updatedAt = Date.now();
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => { save(); renderNotes(); updateBtnStates(); }, 400);
+  });
+  ed.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      const sel = window.getSelection(); const node = sel.anchorNode;
+      const check = node && node.nodeType === 3 ? node.parentElement.closest(".check") : (node && node.closest ? node.closest(".check") : null);
+      if (check && !e.shiftKey) {
+        e.preventDefault();
+        const div = document.createElement("div"); div.className = "check";
+        div.innerHTML = '<span class="box"></span><span class="txt"><br></span>';
+        check.after(div); placeCaret(div.querySelector(".txt"));
+      }
+    }
+  });
+  ed.addEventListener("mousedown", (e) => {
+    const box = e.target.closest && e.target.closest(".box");
+    if (box) {
+      e.preventDefault(); box.parentElement.classList.toggle("done");
+      const n = data.notes.find((x) => x.id === data.currentNoteId);
+      if (n) { n.content = ed.innerHTML; n.updatedAt = Date.now(); save(); }
+    }
+  });
+
+  function applyFormat(cmd) {
+    ed.focus();
+    if (cmd === "checklist") { insertChecklist(); return; }
+    if (cmd === "title") return document.execCommand("formatBlock", false, "h1");
+    if (cmd === "h2") return document.execCommand("formatBlock", false, "h2");
+    if (cmd === "p") return document.execCommand("formatBlock", false, "p");
+    document.execCommand(cmd, false, null); updateBtnStates(); ed.dispatchEvent(new Event("input"));
+  }
+  function insertChecklist() { document.execCommand("insertHTML", false, '<div class="check"><span class="box"></span><span class="txt">待办事项</span></div><div><br></div>'); }
+  function updateBtnStates() {
+    const map = { bold: "bold", italic: "italic", underline: "underline", strikeThrough: "strikeThrough" };
+    Object.keys(map).forEach((k) => {
+      const btn = document.querySelector('.fmt[data-cmd="' + k + '"]');
+      if (!btn) return;
+      try { btn.classList.toggle("active", document.queryCommandState(map[k])); } catch (e) {}
+    });
+  }
+  function placeCaret(el) { const r = document.createRange(); r.selectNodeContents(el); r.collapse(false); const s = window.getSelection(); s.removeAllRanges(); s.addRange(r); }
+
+  $("#newNoteBtn").onclick = newNote;
+  $("#newFolderBtn").onclick = newFolder;
+  $("#delBtn").onclick = deleteNote;
+  $("#pinBtn").onclick = pinCurrent;
+  document.querySelectorAll(".fmt[data-cmd]").forEach((b) => { b.addEventListener("mousedown", (e) => e.preventDefault()); b.onclick = () => applyFormat(b.dataset.cmd); });
+  ed.addEventListener("keyup", updateBtnStates);
+  ed.addEventListener("mouseup", updateBtnStates);
+  $("#search").addEventListener("input", renderNotes);
+  $("#themeBtn").onclick = () => { data.theme = data.theme === "light" ? "dark" : "light"; document.documentElement.setAttribute("data-theme", data.theme); save(); };
+
+  function escapeHtml(s) { return (s || "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])); }
+
+  if (!data.theme) data.theme = "light";
+  document.documentElement.setAttribute("data-theme", data.theme);
+  if (!data.currentNoteId) { const first = visibleNotes()[0]; if (first) data.currentNoteId = first.id; }
+  renderAll();
+
+  // ===== 桌面窗口控制（仅 Electron 环境生效）=====
+  if (window.app) {
+    $("#lw-close").onclick = () => window.app.close();
+    $("#lw-min").onclick = () => window.app.min();
+    $("#lw-max").onclick = () => window.app.max();
+    document.querySelector(".titlebar").addEventListener("dblclick", () => window.app.max());
+  }
+})();
+</script>
+</body>
+</html>
