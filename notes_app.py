@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-复刻 macOS 备忘录的桌面应用（Python + Tkinter，零依赖，无需联网）。
+素笺 —— 复刻 macOS 笔记（Apple Notes）的桌面应用（Python + Tkinter，零依赖，无需联网）。
 运行：python notes_app.py
 数据保存在同目录的 SQLite 数据库 notes_data.db（旧的 notes_data.json 首次启动会自动迁移）
 """
@@ -9,8 +9,9 @@ import re
 import math
 import json
 import sqlite3
+import unicodedata
 import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog, filedialog
+from tkinter import ttk, filedialog
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 # 旧版 JSON 数据文件（仍在：首次运行若发现它会自动迁移进 db，不会丢数据）
@@ -30,7 +31,7 @@ try:
 except Exception:
     FONT = ("Microsoft YaHei", 13)
 
-# 仅浅色主题（已取消暗色主题）：对比更清晰、直角硬朗的 macOS 备忘录风格
+# 仅浅色主题（已取消暗色主题）：对比更清晰、直角硬朗的 macOS 笔记风格
 LIGHT = {
     "top": "#e9e9ec", "side": "#e9e9ec", "list": "#f4f4f6", "editor": "#ffffff",
     "line": "#cfcfd6", "text": "#1f1f24", "soft": "#76767e", "accent": "#2f7cf6",
@@ -43,7 +44,7 @@ LIGHT = {
 USE_SKIN = True
 SKIN_DIR = os.path.join(os.path.expanduser("~"), ".workbuddy", "appearance-resources")
 
-# 备忘录调色板键 -> 皮肤 CSS 变量名（按顺序取第一个命中的变量）
+# 笔记调色板键 -> 皮肤 CSS 变量名（按顺序取第一个命中的变量）
 SKIN_VAR_MAP = {
     "top":     ("--cb-bg-secondary", "--cb-content-background"),
     "side":    ("--cb-bg-secondary", "--cb-content-background"),
@@ -116,7 +117,7 @@ def _parse_skin_css(path):
 
 
 def load_skin_palette():
-    """读取 WorkBuddy 当前皮肤并映射为备忘录调色板；失败返回 None（回退内置配色）。"""
+    """读取 WorkBuddy 当前皮肤并映射为笔记调色板；失败返回 None（回退内置配色）。"""
     if not USE_SKIN:
         return None
     try:
@@ -169,13 +170,13 @@ PALETTE = load_skin_palette() or LIGHT
 
 # 三角列表的项目符号（Office/Word 项目符号库风格：U+27A4 黑色右向箭头头）
 TRI_MARK = "\u27a4  "
-# 旧版符号（U+25B8）：存量备忘录保持原样不迁移，但行首识别仍兼容，
+# 旧版符号（U+25B8）：存量笔记保持原样不迁移，但行首识别仍兼容，
 # 保证老三角列表回车续接等交互不失效。
 TRI_MARK_OLD = "\u25b8  "
 
 # 智能文件夹（smart=True）用区别图标，普通文件夹用文件夹图标
-SMART_ICON_ALL = "f_all"     # 全部备忘录 → 清单三线
-SMART_ICON_STAR = "f_star"   # 星标备忘录 → 五角星（金色）
+SMART_ICON_ALL = "f_all"     # 全部笔记 → 清单三线
+SMART_ICON_STAR = "f_star"   # 星标笔记 → 五角星（金色）
 
 # 文件夹图标画布尺寸（原 16x14 偏小，圆角细节放不下）
 FOLDER_ICON_W = 18
@@ -227,6 +228,9 @@ def _mix_hex(c1, c2, t):
                               int(round(b1 + (b2 - b1) * t)))
 
 
+# 应用中文名（窗口标题 / 示例笔记 / 导出备份文件名统一取这里）
+APP_NAME = "素笺"
+
 # 圆角按钮：hover/pressed 底色由强调色按不同权重混出，跟随任意皮肤自动推导
 BTN_HOVER_MIX = 0.12
 BTN_PRESS_MIX = 0.26
@@ -234,13 +238,27 @@ BTN_RADIUS = 8
 TOOLBAR_H = 46          # 工具栏高度；下方还有 1px 分隔线
 TOOL_LINE_MIX = 0.28    # 工具栏内分隔线：底色向次级文字色混合的比例
 
+# 编辑区右侧居中的浮动导航（回顶部 / 回底部）
+JUMP_W = 26             # 胶囊宽度（连同与滚动条的间隙，正好落在正文右侧留白里）
+JUMP_H = 62             # 胶囊高度（上下各一枚双箭尖）
+JUMP_GAP = 8            # 与右侧滚动条之间留出的间隙
+# 正文左右留白：右侧要容下浮动导航（JUMP_W + JUMP_GAP），所以比默认略宽
+TEXT_PADX = JUMP_W + JUMP_GAP + 8
+
 # 列表圆角卡片：左右留白 + 行间留白，选中/悬停时行会浮起成一张卡片
 CARD_RADIUS = 9
 CARD_PADX = 8
 CARD_GAP = 2
 
-# 搜索框宽度与备忘录列表列宽一致（list_frame width=300），视觉上左右对齐
-SEARCH_W = 300
+# 左侧两栏宽度：折叠条 + 文件夹列 + 分隔线 + 笔记列表列
+COLLAPSE_W = 22         # 最左缘折叠细条（宽度需容纳圆角小片 + 双箭尖）
+SIDEBAR_W = 216         # 文件夹列
+LIST_W = 300            # 笔记列表列
+# 搜索框初始宽度 = 文件夹列 + 分隔线 + 笔记列表列（展开时与下方两栏左右对齐）
+SEARCH_W = SIDEBAR_W + 1 + LIST_W
+
+# 主题化确认对话框正文的最大行宽（像素），超出则截断名称，避免多折一行
+DLG_TEXT_W = 360
 
 
 class RoundButton(tk.Canvas):
@@ -389,141 +407,222 @@ class RoundButton(tk.Canvas):
         self.redraw()
 
 
-class _SizePill(tk.Canvas):
-    """字号胶囊单选项：圆角底 + 数字，选中/悬停/按下三态全部自绘。
+class FontSizeSlider(tk.Canvas):
+    """字号滑杆：强调色填充轨道 + 圆形滑钮，拖动/点击/滚轮/方向键调整。
 
-    原生 Radiobutton 是系统方框勾，和全应用的圆角语言不搭；这里画成胶囊：
-    选中=强调色实底白字，未选=细描边 + 次级文字色，悬停/按下各浮起一档。
-    宽度按文字测量生成，同排多颗也互不挤压。
+    ttk.Scale 是系统方眼样式，和自绘圆角语言不搭，这里整条自己画：
+    常态滑钮白底强调色描边，悬停略放大，拖动时实心并浮出数值气泡。
+    取值 1pt 连续步进，不再有预设字号。
     """
 
-    def __init__(self, master, pal, text, value, variable, command=None,
-                 font=None, padx=14, pady=6):
-        tk.Canvas.__init__(self, master, bd=0, highlightthickness=0, cursor="hand2")
+    HEIGHT = 70
+    PAD = 12              # 轨道两端留白，正好容纳滑钮半径
+    TRACK_Y = 38
+
+    def __init__(self, master, pal, variable, minimum=8, maximum=25,
+                 command=None, command_end=None, width=340):
+        tk.Canvas.__init__(self, master, width=width, height=self.HEIGHT,
+                           bd=0, highlightthickness=0, bg=pal["editor"],
+                           cursor="hand2", takefocus=1)
         self._pal = dict(pal)
-        self._text = text
-        self._value = value
         self._var = variable
+        self._min, self._max = int(minimum), int(maximum)
         self._command = command
-        self._font = font or (FONT[0], 12)
-        self._padx = padx
-        self._pady = pady
-        self._state = "normal"
-        # 胶囊文字固定，字体建一次就够（实例级，绑定当前 Tk 解释器）
+        self._command_end = command_end
+        self._state = "normal"      # normal / hover / drag
+        self._bubble = False
+        # 字体建一次（实例级，绑定当前 Tk 解释器）
         import tkinter.font as _tf
-        self._tkfont = _tf.Font(family=self._font[0], size=self._font[1])
+        self._font_val = _tf.Font(family=FONT[0], size=11, weight="bold")
+        self._font_small = _tf.Font(family=FONT[0], size=9)
+        self._font_bub = _tf.Font(family=FONT[0], size=10, weight="bold")
+        self._var.trace_add("write", lambda *a: self.build())
+        self.bind("<Configure>", lambda e: self.build())
+        self.bind("<Enter>", lambda e: self._set_state("hover"))
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<MouseWheel>", self._on_wheel)
+        self.bind("<Button-4>", lambda e: self._nudge(1))     # Linux 上滚
+        self.bind("<Button-5>", lambda e: self._nudge(-1))    # Linux 下滚
+        self.bind("<Left>", lambda e: self._nudge(-1))
+        self.bind("<Right>", lambda e: self._nudge(1))
+        self.bind("<Home>", lambda e: self._set_value(self._min, end=True))
+        self.bind("<End>", lambda e: self._set_value(self._max, end=True))
+        self.bind("<FocusIn>", lambda e: self.build())
+        self.bind("<FocusOut>", lambda e: self.build())
         self.build()
 
-    def selected(self):
+    # ---------- 取值 / 坐标换算 ----------
+    def value(self):
         try:
-            return self._var.get() == self._value
+            v = int(float(self._var.get()))
         except Exception:
-            return False
+            v = self._min
+        return min(self._max, max(self._min, v))
 
-    def build(self):
-        w = int(self._tkfont.measure(self._text)) + self._padx * 2
-        h = int(self._tkfont.metrics("linespace")) + self._pady * 2
-        self.configure(width=w, height=h)
-        self.delete("all")
-        # 半径取半高 = 完整胶囊形
-        self.create_polygon(_round_rect_points(1, 1, w - 1, h - 1, h // 2, 6),
-                            fill=self._cur_fill(), outline=self._cur_outline(), width=1)
-        self.create_text(w / 2.0, h / 2.0, text=self._text,
-                         font=self._tkfont, fill=self._cur_fg())
+    def _width(self):
+        w = self.winfo_width()
+        if w <= 1:
+            w = int(float(self.cget("width")))
+        return max(w, self.PAD * 2 + 10)
 
-    # ---------- 三态配色 ----------
-    def _cur_fill(self):
-        p = self._pal
-        if self.selected():
-            if self._state == "hover":
-                return _mix_hex(p["accent"], p["selfg"], 0.12)
-            if self._state == "press":
-                return _mix_hex(p["accent"], p["selfg"], BTN_PRESS_MIX)
-            return p["accent"]
-        t = BTN_HOVER_MIX if self._state == "hover" else BTN_PRESS_MIX
-        return _mix_hex(p["editor"], p["accent"], t)
+    def _x_for(self, value):
+        w = self._width()
+        t = (value - self._min) / float(max(1, self._max - self._min))
+        return self.PAD + (w - self.PAD * 2) * t
 
-    def _cur_outline(self):
-        p = self._pal
-        if self.selected():
-            return self._cur_fill()
-        if self._state in ("hover", "press"):
-            return _mix_hex(p["line"], p["accent"], 0.45)
-        return p["line"]
-
-    def _cur_fg(self):
-        p = self._pal
-        if self.selected():
-            return "#ffffff"
-        return p["text"] if self._state in ("hover", "press") else p["soft"]
+    def _value_for(self, x):
+        w = self._width()
+        t = (x - self.PAD) / float(max(1, w - self.PAD * 2))
+        t = min(1.0, max(0.0, t))
+        return int(round(self._min + t * (self._max - self._min)))
 
     # ---------- 交互 ----------
-    def bind_events(self):
-        self.bind("<Enter>", lambda e: self._set_state("hover"))
-        self.bind("<Leave>", lambda e: self._set_state("normal"))
-        self.bind("<ButtonPress-1>", lambda e: self._set_state("press"))
-        self.bind("<ButtonRelease-1>", self._on_release)
-
     def _set_state(self, st):
         if self._state == st:
             return
         self._state = st
         self.build()
 
+    def _on_leave(self, e):
+        # 拖动中指针滑出控件也继续跟随，松手前不退出拖动态
+        if self._state != "drag":
+            self._state = "normal"
+            self.build()
+
+    def _on_press(self, e):
+        self.focus_set()
+        self._state = "drag"
+        self._bubble = True
+        self._set_value(self._value_for(e.x))
+
+    def _on_drag(self, e):
+        if self._state != "drag":
+            self._state = "drag"
+            self._bubble = True
+        self._set_value(self._value_for(e.x))
+
     def _on_release(self, e):
+        if self._state != "drag":
+            return
         self._state = "hover"
+        self._bubble = False
+        self.build()
+        if self._command_end:
+            self._command_end(self.value())
+
+    def _on_wheel(self, e):
+        self._set_value(self.value() + (1 if e.delta > 0 else -1), end=True)
+
+    def _nudge(self, delta):
+        self._set_value(self.value() + delta, end=True)
+
+    def _set_value(self, value, end=False):
+        v = min(self._max, max(self._min, int(value)))
+        if v != self.value():
+            self._var.set(v)
         self.build()
         if self._command:
-            self._command(self._value)
+            self._command(v)
+        if end and self._command_end:
+            self._command_end(v)
 
-    def refresh(self):
-        self.build()
+    # ---------- 绘制 ----------
+    def build(self):
+        self.delete("all")
+        p = self._pal
+        w = self._width()
+        v = self.value()
+        x0, x1, cy = self.PAD, w - self.PAD, self.TRACK_Y
+        tx = self._x_for(v)
 
-    def apply_theme(self, pal):
-        self._pal = dict(pal)
-        self.build()
+        self.create_polygon(_round_rect_points(x0, cy - 3, x1, cy + 3, 3, 6),
+                            fill=p["line"], outline="")
+        if tx > x0 + 1:
+            self.create_polygon(_round_rect_points(x0, cy - 3, tx, cy + 3, 3, 6),
+                                fill=p["accent"], outline="")
+
+        self.create_text(x1, 10, anchor="ne", text="%d pt" % v,
+                         font=self._font_val, fill=p["accent"])
+        self.create_text(x0, self.HEIGHT - 10, anchor="w", text=str(self._min),
+                         font=self._font_small, fill=p["soft"])
+        self.create_text(x1, self.HEIGHT - 10, anchor="e", text=str(self._max),
+                         font=self._font_small, fill=p["soft"])
+
+        if self._bubble:
+            text = "%d pt" % v
+            bw = self._font_bub.measure(text) + 16
+            bh = 20
+            bx = min(max(tx, self.PAD + bw / 2.0), w - self.PAD - bw / 2.0)
+            by = cy - 12
+            self.create_polygon(
+                _round_rect_points(bx - bw / 2.0, by - bh, bx + bw / 2.0, by,
+                                   bh / 2.0, 6),
+                fill=p["accent"], outline="")
+            self.create_text(bx, by - bh / 2.0, text=text,
+                             font=self._font_bub, fill="#ffffff")
+
+        r = 9 if self._state == "normal" else 10
+        if self._state == "drag":
+            fill, outline = p["accent"], _mix_hex(p["accent"], p["selfg"], 0.2)
+        else:
+            fill, outline = p["editor"], p["accent"]
+        if self.focus_get() is self and self._state != "drag":
+            self.create_oval(tx - r - 3, cy - r - 3, tx + r + 3, cy + r + 3,
+                             outline=_mix_hex(p["editor"], p["accent"], 0.25),
+                             width=1)
+        self.create_oval(tx - r, cy - r, tx + r, cy + r,
+                         fill=fill, outline=outline, width=2)
+        if self._state == "drag":
+            self.create_oval(tx - 3, cy - 3, tx + 3, cy + 3,
+                             fill="#ffffff", outline="")
 
 
-class SizePicker(tk.Frame):
-    """字号单选项组：一排 _SizePill 胶囊，整体替代原生 Radiobutton 行。
+def _scroll_chip_geom(size):
+    """按小片尺寸推导双箭尖参数，大小片（工具栏 24 / 折叠条 16）视觉一致。"""
+    k = size / 24.0
+    return 3.0 * k, 4.6 * k, 3.2 * k, (2.0 if size >= 20 else 1.8)
 
-    点中某颗即写入 variable、刷新全组选中态，再回调 command（供实时预览）。
-    当前值不在候选里时（历史数据可能出现）表现为全不选中，直接保存则原值不变。
+
+def _draw_scroll_chip(cv, pal, base, cx, cy, direction, state, size=24):
+    """圆角小片 + 双箭尖：工具栏滑动箭头、列表折叠按钮共用同一套画法与三态配色。
+
+    常态是比底色略深的浅灰片，悬停加深并描边，按下转强调色；
+    direction 约定与自绘控件一致：-1 向左、1 向右。
     """
-
-    def __init__(self, master, pal, values, variable, command=None,
-                 font=None, padx=14, pady=6, gap=8):
-        tk.Frame.__init__(self, master, bg=pal["editor"])
-        self._var = variable
-        self._command = command
-        self._pills = []
-        for i, v in enumerate(values):
-            pill = _SizePill(self, pal, str(v), v, variable,
-                             command=self._on_pick, font=font,
-                             padx=padx, pady=pady)
-            pill.pack(side=tk.LEFT,
-                      padx=(0, gap) if i < len(values) - 1 else 0)
-            pill.bind_events()
-            self._pills.append(pill)
-
-    def _on_pick(self, value):
-        self._var.set(value)
-        for pl in self._pills:
-            pl.refresh()
-        if self._command:
-            self._command()
-
-    def apply_theme(self, pal):
-        self.configure(bg=pal["editor"])
-        for pl in self._pills:
-            pl.apply_theme(pal)
+    if state == "press":
+        fill = _mix_hex(pal["hover"], pal["accent"], 0.22)
+        outline = _mix_hex(pal["line"], pal["accent"], 0.55)
+        fg = pal["accent"]
+    elif state == "hover":
+        fill = pal["hover"]
+        outline = _mix_hex(base, pal["line"], 0.85)
+        fg = pal["selfg"]
+    else:
+        fill = _mix_hex(base, pal["line"], 0.32)
+        outline = ""
+        fg = pal["soft"]
+    radius = int(round(min(BTN_RADIUS, size * 0.34)))
+    cv.create_polygon(
+        _round_rect_points(cx - size / 2.0, cy - size / 2.0,
+                           cx + size / 2.0, cy + size / 2.0, radius, 6),
+        fill=fill, outline=outline, width=1)
+    a, b, gap, lw = _scroll_chip_geom(size)
+    for off in (-gap, gap):
+        ax = cx + off
+        cv.create_line(ax - a * direction, cy - b, ax + a * direction, cy,
+                       ax - a * direction, cy + b, fill=fg, width=lw,
+                       capstyle=tk.ROUND, joinstyle=tk.ROUND)
 
 
 class ArrowButton(tk.Canvas):
-    """工具栏两端的滑动箭头：圆形底 + V 形箭尖，自带 hover / press 两态。
+    """工具栏两端的滑动箭头：圆角小片 + 双箭尖，垂直居中，自带三态。
 
     和 RoundButton 一样用 Canvas 自绘（Tk 的 Button 是直角，且按下会闪系统灰）。
-    箭头用圆头折线画（而非实心三角），细一点更精致；悬停才浮出圆底，避免常态太抢眼。
+    画布被 pack(fill=Y) 拉到整条工具栏高，所以按实际尺寸居中绘制，
+    窗口变小、箭头出现时也能稳稳落在垂直中线上。
     """
 
     def __init__(self, master, pal, direction, command=None, size=26, base=None):
@@ -536,27 +635,16 @@ class ArrowButton(tk.Canvas):
         self._state = "normal"
         # 常态底色 = 工具栏底色（默认取编辑区色），常态才能「隐身」不露白块
         self._base = base if base is not None else pal.get("editor", "#ffffff")
+        # 实际尺寸随布局变化（fill=Y 会拉高），尺寸一变就重画，保持垂直居中
+        self.bind("<Configure>", lambda e: self.build())
         self.build()
 
     def build(self):
         self.delete("all")
-        p, s = self._pal, self._size
-        cx, cy, r = s / 2.0, s / 2.0, s / 2.0 - 3
-        # 常态透明（与工具栏同色），hover / press 才浮出圆底
-        if self._state == "press":
-            bg = _mix_hex(p["hover"], p["accent"], 0.30)
-        elif self._state == "hover":
-            bg = p["hover"]
-        else:
-            bg = self._base
-        self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=bg, outline="")
-        # 箭尖：向左/向右的圆头折线
-        d = self._dir
-        a = 3.4          # 箭尖横向半长
-        b = 4.2          # 箭尖纵向半高
-        fg = p["selfg"] if self._state != "normal" else p["soft"]
-        self.create_line(cx - a * d, cy - b, cx + a * d, cy, cx - a * d, cy + b,
-                         fill=fg, width=2, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        w = max(self.winfo_width(), self._size)
+        h = max(self.winfo_height(), self._size)
+        _draw_scroll_chip(self, self._pal, self._base, w / 2.0, h / 2.0,
+                          self._dir, self._state, size=24)
 
     def redraw(self):
         self.build()
@@ -587,14 +675,14 @@ class ArrowButton(tk.Canvas):
 
 
 class CollapseButton(tk.Canvas):
-    """列表折叠/展开按钮：竖条上的 V 形箭头（向左收起 / 向右展开）。
+    """列表折叠/展开按钮：窄条上的圆角小片 + 双箭尖（向左收起 / 向右展开）。
 
-    与 ArrowButton 同一套自绘三态（Tk 的 Button 直角 + 按下闪系统灰）；
-    放在窗口最左缘的窄条上，常态与条同底色，悬停才浮出圆底，不抢眼。
+    与工具栏滑动箭头同一套画法和三态配色（共用 _draw_scroll_chip），
+    只是尺寸收到折叠条宽度，放在窗口最左缘的竖条中央，不抢眼。
     """
 
     def __init__(self, master, pal, command=None, base=None):
-        tk.Canvas.__init__(self, master, width=18, height=44, bd=0,
+        tk.Canvas.__init__(self, master, width=COLLAPSE_W, height=44, bd=0,
                            highlightthickness=0, cursor="hand2")
         self._pal = dict(pal)
         self._command = command
@@ -612,22 +700,9 @@ class CollapseButton(tk.Canvas):
 
     def build(self):
         self.delete("all")
-        p = self._pal
-        w, h = 18, 44
-        cx, cy = w / 2.0, h / 2.0
-        if self._state == "press":
-            bg = _mix_hex(p["hover"], p["accent"], 0.30)
-        elif self._state == "hover":
-            bg = p["hover"]
-        else:
-            bg = self._base
-        rr = 8.5
-        self.create_oval(cx - rr, cy - rr, cx + rr, cy + rr, fill=bg, outline="")
-        d = self._dir
-        a, b = 3.0, 5.0          # 箭尖横向半长 / 纵向半高
-        fg = p["selfg"] if self._state != "normal" else p["soft"]
-        self.create_line(cx - a * d, cy - b, cx + a * d, cy, cx - a * d, cy + b,
-                         fill=fg, width=2, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        _draw_scroll_chip(self, self._pal, self._base,
+                          COLLAPSE_W / 2.0, 22, self._dir, self._state,
+                          size=COLLAPSE_W - 2)
 
     def redraw(self):
         self.build()
@@ -655,6 +730,123 @@ class CollapseButton(tk.Canvas):
         self.redraw()
         if self._command:
             self._command()
+
+
+class ScrollJumpNav(tk.Canvas):
+    """编辑区右侧居中的浮动小导航：上下两枚双箭尖，点一下回顶部 / 回底部。
+
+    只在这篇正文确实溢出（出现滚动条）时出现，已经到顶/到底的那一头会变淡、点了不动。
+    视觉与工具栏滑动箭头、列表折叠条同族：圆角片 + 双箭尖 + 悬停/按下三态，
+    底色取编辑区色再略微加深，浮在正文上不抢眼。
+    """
+
+    def __init__(self, master, pal, command=None, base=None):
+        tk.Canvas.__init__(self, master, width=JUMP_W, height=JUMP_H, bd=0,
+                           highlightthickness=0, cursor="hand2",
+                           bg=(base if base is not None else pal.get("editor", "#ffffff")))
+        self._pal = dict(pal)
+        self._base = base if base is not None else pal.get("editor", "#ffffff")
+        self._command = command
+        self._state = "normal"     # normal / press
+        self._part = None          # 当前指向哪一半：None / "top" / "bottom"
+        self._top_on = True        # 该端是否还能滚（已到头就变淡）
+        self._bottom_on = True
+        self.bind("<Motion>", self._on_motion)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.build()
+
+    # ---------- 绘制 ----------
+    def build(self):
+        self.delete("all")
+        self.create_polygon(
+            _round_rect_points(0.5, 0.5, JUMP_W - 0.5, JUMP_H - 0.5, JUMP_W / 2.0, 8),
+            fill=_mix_hex(self._base, self._pal["line"], 0.30),
+            outline=_mix_hex(self._base, self._pal["line"], 0.55), width=1)
+        # 两枚图标之间的细分隔线
+        self.create_line(7, JUMP_H / 2.0, JUMP_W - 7, JUMP_H / 2.0,
+                         fill=_mix_hex(self._base, self._pal["line"], 0.5), width=1)
+        self._draw_half("top", JUMP_H * 0.25)
+        self._draw_half("bottom", JUMP_H * 0.75)
+
+    def _draw_half(self, part, cy):
+        """画一半：悬停/按下时在图标后面铺一块圆角片，禁用时图标变淡。"""
+        p = self._pal
+        on = self._top_on if part == "top" else self._bottom_on
+        focused = (self._part == part) and on
+        if focused and self._state == "press":
+            fill = _mix_hex(p["hover"], p["accent"], 0.22)
+            fg = p["accent"]
+            outline = _mix_hex(p["line"], p["accent"], 0.55)
+        elif focused:
+            fill = p["hover"]
+            fg = p["selfg"]
+            outline = _mix_hex(self._base, p["line"], 0.75)
+        else:
+            fill = outline = ""
+            fg = p["soft"] if on else _mix_hex(self._base, p["soft"], 0.34)
+        if fill:
+            cx = JUMP_W / 2.0
+            self.create_polygon(
+                _round_rect_points(cx - 11, cy - 11, cx + 11, cy + 11, 8, 6),
+                fill=fill, outline=outline, width=1)
+        up = (part == "top")
+        # 上下箭尖自成一档：比左右滑动箭头更宽、更平，小尺寸下也看得清朝向
+        a, b, gap, lw = 4.6, 3.1, 3.2, 2.0
+        for off in (-gap, gap):
+            apex = cy + off - (b / 2.0 if up else -b / 2.0)
+            wing = b if up else -b
+            self.create_line(JUMP_W / 2.0 - a, apex + wing, JUMP_W / 2.0, apex,
+                             JUMP_W / 2.0 + a, apex + wing, fill=fg, width=lw,
+                             capstyle=tk.ROUND, joinstyle=tk.ROUND)
+
+    def redraw(self):
+        self.build()
+
+    def apply_theme(self, pal, base=None):
+        self._pal = dict(pal)
+        if base is not None:
+            self._base = base
+        self.configure(bg=self._base)
+        self.redraw()
+
+    # ---------- 状态 ----------
+    def set_ends(self, top_on, bottom_on):
+        """同步「还能往上/往下滚」——顶/底那端变淡，避免点了没反应。"""
+        if (top_on, bottom_on) == (self._top_on, self._bottom_on):
+            return
+        self._top_on, self._bottom_on = top_on, bottom_on
+        self.redraw()
+
+    def _hit(self, ev):
+        return "top" if ev.y < JUMP_H / 2.0 else "bottom"
+
+    def _on_motion(self, ev):
+        part = self._hit(ev)
+        if part != self._part:
+            self._part = part
+            self.redraw()
+
+    def _on_leave(self, ev):
+        if self._part is not None or self._state != "normal":
+            self._part = None
+            self._state = "normal"
+            self.redraw()
+
+    def _on_press(self, ev):
+        self._part = self._hit(ev)
+        self._state = "press"
+        self.redraw()
+
+    def _on_release(self, ev):
+        part = self._hit(ev)
+        self._state = "normal"
+        self._part = part
+        self.redraw()
+        on = self._top_on if part == "top" else self._bottom_on
+        if on and self._command:
+            self._command(part)
 
 
 class MarqueeLabel(tk.Canvas):
@@ -760,6 +952,566 @@ class MarqueeLabel(tk.Canvas):
         self._dirty = False
 
 
+# 自绘右键菜单的尺寸与配色
+MENU_ROW_H = 30         # 单项高度
+MENU_SEP_H = 9          # 分隔线占高
+MENU_PAD_X = 14         # 卡片内左右留白
+MENU_GUTTER = 22        # 文字左缩进（留出图标/勾选位，视觉不贴边）
+MENU_DANGER = "#e5484d"  # 危险项（删除）红色
+
+# ---------- 代码块 ----------
+# 支持插入的语言（显示名 -> 高亮规则名；空串 = 纯文本，不做高亮）
+CODE_LANGS = [
+    ("纯文本", ""),
+    ("JSON", "json"),
+    ("XML", "xml"),
+    ("HTML", "html"),
+    ("Java", "java"),
+    ("Python", "python"),
+    ("Bash", "bash"),
+    ("SQL", "sql"),
+]
+CODE_LANG_LABEL = dict((k, l) for l, k in CODE_LANGS)
+
+# 代码块用的等宽字体候选（按顺序取第一个系统里装了的）
+CODE_FONTS = ["Consolas", "Cascadia Mono", "JetBrains Mono", "Courier New", "monospace"]
+
+# 高亮分词颜色：浅底一套、深底一套（跟随皮肤明暗自动选，见 CodeBlock._scheme）
+CODE_TOKEN_COLORS = {
+    "light": {"kw": "#0b6bcb", "tag": "#0b6bcb", "str": "#0a7d3f", "num": "#b3541e",
+              "lit": "#b3541e", "var": "#b3541e", "key": "#8250df", "attr": "#8250df",
+              "dec": "#8250df", "ann": "#8250df", "com": "#8a909c"},
+    "dark": {"kw": "#79b8ff", "tag": "#79b8ff", "str": "#8fd98f", "num": "#ffb86b",
+             "lit": "#ffb86b", "var": "#ffb86b", "key": "#c9a2ff", "attr": "#c9a2ff",
+             "dec": "#c9a2ff", "ann": "#c9a2ff", "com": "#8a909c"},
+}
+
+# 各语言的分词规则：[(标签, 正则, flags), ...]，列表顺序 = 标签栈顺序（越靠后越优先），
+# 所以「注释 / 字符串 / 键名」总能盖住「关键字 / 数字」。纯文本没有规则。
+_STR_D = r'"(?:[^"\\\n]|\\.)*"'          # 双引号字符串（不跨行）
+_STR_S = r"'(?:[^'\\\n]|\\.)*'"          # 单引号字符串
+_NUM = r"\b\d+(?:\.\d+)?\b"
+_SQL_STR = r"'(?:[^']|'')*'"             # SQL 字符串：'' 表示一个引号
+CODE_RULES = {
+    "": [],
+    "json": [
+        ("num", _NUM, 0),
+        ("lit", r"\b(?:true|false|null)\b", 0),
+        ("str", _STR_D, 0),
+        ("key", r'"[^"\n]*"(?=\s*:)', 0),
+    ],
+    "python": [
+        ("num", _NUM, 0),
+        ("kw", r"\b(?:def|class|return|if|elif|else|for|while|in|not|and|or|is|None|True"
+               r"|False|import|from|as|with|try|except|finally|raise|lambda|yield|global"
+               r"|nonlocal|pass|break|continue|assert|del|async|await|self)\b", 0),
+        ("str", r'"""(?:.|\n)*?"""', 0),
+        ("str", _STR_D, 0),
+        ("str", _STR_S, 0),
+        ("dec", r"(?m)^\s*@[\w.]+", 0),
+        ("com", r"(?m)#[^\n]*", 0),
+    ],
+    "java": [
+        ("num", _NUM, 0),
+        ("kw", r"\b(?:public|private|protected|class|interface|enum|extends|implements"
+               r"|static|final|abstract|void|new|return|if|else|for|while|do|switch|case"
+               r"|default|break|continue|try|catch|finally|throw|throws|import|package"
+               r"|this|super|null|true|false|int|long|short|double|float|boolean|char"
+               r"|byte|String|var|record|instanceof|synchronized)\b", 0),
+        ("str", _STR_D, 0),
+        ("str", _STR_S, 0),
+        ("ann", r"@\w+", 0),
+        ("com", r"(?m)//[^\n]*", 0),
+        ("com", r"/\*(?:.|\n)*?\*/", 0),
+    ],
+    "bash": [
+        ("kw", r"\b(?:if|then|elif|else|fi|for|while|until|do|done|case|esac|function"
+               r"|in|return|export|local|readonly|source|exit|set|unset|trap|echo|printf"
+               r"|read|cd|pwd|ls|mv|cp|rm|mkdir|touch|cat|grep|sed|awk|find|xargs|curl"
+               r"|wget|git|sudo|apt|yum|brew|chmod|chown|kill|ps|tar|zip|unzip)\b", 0),
+        ("num", _NUM, 0),
+        ("var", r"\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@#?*!$-]", 0),
+        ("str", _STR_D, 0),
+        ("str", _STR_S, 0),
+        ("com", r"(?m)#[^\n]*", 0),
+    ],
+    "sql": [
+        ("num", _NUM, 0),
+        ("kw", r"\b(?:select|from|where|insert|into|values|update|set|delete|create|table"
+               r"|alter|drop|index|view|join|left|right|inner|outer|full|cross|on|group|by"
+               r"|order|having|limit|offset|distinct|as|and|or|not|null|is|in|like|between"
+               r"|union|all|exists|case|when|then|else|end|primary|key|foreign|references"
+               r"|default|count|sum|avg|min|max|asc|desc|with|begin|commit|rollback|if)\b",
+         re.I),
+        ("str", _SQL_STR, 0),
+        ("com", r"(?m)--[^\n]*", 0),
+        ("com", r"/\*(?:.|\n)*?\*/", 0),
+    ],
+    "html": [
+        ("tag", r"</?[A-Za-z][\w:.-]*", 0),
+        ("tag", r"/?>", 0),
+        ("attr", r"[\w:.-]+(?==)", 0),
+        ("str", _STR_D, 0),
+        ("str", _STR_S, 0),
+        ("com", r"(?s)<!--.*?-->", 0),
+    ],
+    "xml": [
+        ("tag", r"</?[A-Za-z_][\w:.-]*", 0),
+        ("tag", r"/?>", 0),
+        ("attr", r"[\w:.-]+(?==)", 0),
+        ("str", _STR_D, 0),
+        ("str", _STR_S, 0),
+        ("com", r"(?s)<!--.*?-->", 0),
+    ],
+}
+
+
+# ---------- 代码格式化 ----------
+# 纯标准库实现。格式化只重排「行首缩进」与结构化换行，绝不改写行内的标识符、
+# 运算符或字符串——拿不准时宁可少做，也不要把用户的代码改坏；实在无法安全处理
+# 就抛 _FormatError，由界面弹提示（原内容保持不动）。
+
+class _FormatError(Exception):
+    """格式化失败（如语法错误、暂不支持的语言），消息直接面向用户。"""
+
+
+# 各语言的注释 / 字符串标记：用来把字符串与注释「掩码」成空格，
+# 免得统计括号与冒号时被注释或字符串里的符号带偏。
+_FMT_SYNTAX = {
+    "python": {"line": ["#"], "block": [], "quotes": ["'", '"'], "triple": True},
+    "java":   {"line": ["//"], "block": [("/*", "*/")], "quotes": ["'", '"'], "triple": False},
+    "bash":   {"line": ["#"], "block": [], "quotes": ["'", '"'], "triple": False},
+    "sql":    {"line": ["--"], "block": [("/*", "*/")], "quotes": ["'"], "triple": False},
+    "json":   {"line": [], "block": [], "quotes": ['"'], "triple": False},
+    "html":   {"line": [], "block": [("<!--", "-->")], "quotes": ['"', "'"], "triple": False},
+    "xml":    {"line": [], "block": [("<!--", "-->")], "quotes": ['"', "'"], "triple": False},
+    "":       {"line": [], "block": [], "quotes": [], "triple": False},
+}
+
+# 关键字成块的语言：行尾命中「开」就多缩进一级，行首命中「合」就先退一级
+_FMT_KEYWORD_BLOCKS = {
+    "bash": (r"(?:\bthen|\bdo|\belse|\{)\s*$", r"^(?:fi|done|esac|\})"),
+}
+
+_FMT_VOID_TAGS = set(
+    "area base br col embed hr img input link meta param source track wbr".split())
+
+# 标签「一行展示」的显示宽度上限（列数）：纯文本内容的标签整块拼接后不超过它就
+# 保持一行，超过（或内容本身含换行）才拆成多行。中文按 2 列宽计算（见 _display_width）。
+_FMT_MARKUP_MAX = 88
+
+
+def _display_width(s):
+    """按终端习惯估算显示宽度：全角 / 东亚宽字符算 2 列，其余算 1 列。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in s)
+
+
+def _mask_strings(text, lang):
+    """把字符串与注释替换成空格（保留括号、冒号与换行），返回等长结构的文本。"""
+    syn = _FMT_SYNTAX.get(lang, _FMT_SYNTAX[""])
+    line_marks, blocks, quotes, triple = \
+        syn["line"], syn["block"], syn["quotes"], syn["triple"]
+    out = []
+    i, n = 0, len(text)
+    block_end = None
+    str_end = None
+    while i < n:
+        c = text[i]
+        if block_end is not None:                 # 处于块注释中
+            if text.startswith(block_end, i):
+                out.append(" " * len(block_end))
+                i += len(block_end)
+                block_end = None
+            else:
+                out.append("\n" if c == "\n" else " ")
+                i += 1
+            continue
+        if str_end is not None:                   # 处于字符串中
+            if len(str_end) == 1 and c == "\\":   # 转义：连同下一个字符一起掩掉
+                out.append(" ")
+                out.append(" " if i + 1 < n and text[i + 1] != "\n" else "\n")
+                i += 2
+                continue
+            if text.startswith(str_end, i):
+                out.append(" " * len(str_end))
+                i += len(str_end)
+                str_end = None
+            else:
+                out.append("\n" if c == "\n" else " ")
+                i += 1
+            continue
+        handled = False
+        for lm in line_marks:                     # 行注释：吃到行尾
+            if text.startswith(lm, i):
+                j = text.find("\n", i)
+                if j < 0:
+                    j = n
+                out.append(" " * (j - i))
+                i = j
+                handled = True
+                break
+        if handled:
+            continue
+        for bs, be in blocks:                     # 块注释起始
+            if text.startswith(bs, i):
+                out.append(" " * len(bs))
+                i += len(bs)
+                block_end = be
+                handled = True
+                break
+        if handled:
+            continue
+        if triple and (text.startswith('"""', i) or text.startswith("'''", i)):
+            out.append("   ")
+            str_end = text[i:i + 3]
+            i += 3
+            continue
+        if c in quotes:                           # 普通单行字符串
+            out.append(" ")
+            i += 1
+            str_end = c
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _fmt_reindent(text, lang):
+    """按括号层级（以及关键字成块语言）重排行首缩进，逐行保留原内容。"""
+    lines = text.split("\n")
+    masked = _mask_strings(text, lang).split("\n")
+    if len(masked) != len(lines):                 # 掩码不该改变行数，保险起见对齐
+        masked = (masked + [""] * len(lines))[:len(lines)]
+    open_pat, ded_pat = _FMT_KEYWORD_BLOCKS.get(lang, (None, None))
+    kb_open = re.compile(open_pat) if open_pat else None
+    kb_ded = re.compile(ded_pat) if ded_pat else None
+    out = []
+    depth = 0
+    for raw, m in zip(lines, masked):
+        body = raw.rstrip()
+        stripped = body.lstrip()
+        ms = m.strip()
+        if not stripped:
+            out.append("")
+            continue
+        opens = len(re.findall(r"[(\[{]", ms))
+        closes = len(re.findall(r"[)\]}]", ms))
+        lead_close = 1 if ms[:1] in ")]}" else 0
+        ded_kw = 1 if (kb_ded and kb_ded.match(ms)) else 0
+        indent = max(0, depth - max(lead_close, ded_kw))
+        out.append("    " * indent + stripped)
+        depth += opens - closes
+        if ded_kw:
+            depth -= 1
+        if kb_open and kb_open.search(ms):
+            depth += 1
+        if depth < 0:
+            depth = 0
+    return "\n".join(out)
+
+
+def _fmt_python(code):
+    """规范化 Python 缩进（Tab → 4 空格、层级对齐），保留原有的块结构。
+
+    Python 的块边界只体现在缩进里，逐行「重算」会误判（如与 if 同级、却不再
+    带关键字收尾的语句），所以这里以原文缩进为准，只把每级缩进统一成 4 空格。
+    """
+    stack = [0]
+    out = []
+    for raw in code.split("\n"):
+        if not raw.strip():
+            out.append("")
+            continue
+        body = raw.rstrip()
+        lead = body[:len(body) - len(body.lstrip())]
+        width = len(lead.expandtabs(4))
+        stripped = body.lstrip()
+        while len(stack) > 1 and width < stack[-1]:
+            stack.pop()
+        if width > stack[-1]:
+            stack.append(width)
+        out.append("    " * (len(stack) - 1) + stripped)
+    return "\n".join(out)
+
+
+def _format_json(code):
+    try:
+        obj = json.loads(code)
+    except Exception as e:
+        raise _FormatError("JSON 解析失败：%s" % e)
+    return json.dumps(obj, indent=4, ensure_ascii=False)
+
+
+def _parse_markup(code):
+    """把 HTML/XML 解析成节点树：("raw", 文本) / ("text", 文本) / ("el", 开标签, tag, 子节点)。"""
+    parts = re.findall(
+        r"<!--.*?-->|<!\[CDATA\[.*?\]\]>|<(?:[^>\"']|\"[^\"]*\"|'[^']*')*?>|[^<]+",
+        code, re.S)
+    root = []
+    stack = [root]
+    for part in parts:
+        s = part.strip()
+        if not s:
+            continue
+        if s.startswith("<!--") or s.startswith("<!["):     # 注释 / CDATA / 声明
+            stack[-1].append(("raw", s))
+            continue
+        if s.startswith("</"):                              # 闭合标签：回到上一层
+            if len(stack) > 1:
+                stack.pop()
+            continue
+        if s.startswith("<"):
+            mt = re.match(r"<\s*([A-Za-z][\w:.-]*)", s)
+            tag = mt.group(1) if mt else ""
+            self_close = s.endswith("/>") or tag.lower() in _FMT_VOID_TAGS or not tag
+            node = ("el", s, tag, [])
+            stack[-1].append(node)
+            if not self_close:
+                stack.append(node[3])
+            continue
+        stack[-1].append(("text", s))                       # 文本节点
+    return root
+
+
+def _render_markup(nodes, depth, out, max_len):
+    for node in nodes:
+        if node[0] in ("raw", "text"):
+            out.append("    " * depth + node[1])
+            continue
+        _, open_str, tag, children = node
+        if not children:
+            out.append("    " * depth + open_str)
+            continue
+        # 子节点全是文本、且拼成一行不超长 → 整块一行展示（如 <groupId>xxx</groupId>）
+        if all(c[0] == "text" for c in children):
+            text = "".join(c[1] for c in children)
+            close = "</%s>" % tag
+            oneline = open_str + text + close
+            if "\n" not in text and _display_width(oneline) <= max_len:
+                out.append("    " * depth + oneline)
+                continue
+            out.append("    " * depth + open_str)
+            for ln in text.split("\n"):
+                if ln.strip():
+                    out.append("    " * (depth + 1) + ln.strip())
+            out.append("    " * depth + close)
+            continue
+        # 含子标签 → 逐层展开
+        out.append("    " * depth + open_str)
+        _render_markup(children, depth + 1, out, max_len)
+        out.append("    " * depth + "</%s>" % tag)
+
+
+def _format_markup(code):
+    """缩进 HTML/XML：纯文本内容的标签尽量一行展示，含子标签的才逐层展开。"""
+    out = []
+    _render_markup(_parse_markup(code), 0, out, _FMT_MARKUP_MAX)
+    return "\n".join(out)
+
+
+def _format_code(lang, code):
+    """按语言格式化代码；成功返回新文本，失败抛 _FormatError。"""
+    lang = lang or ""
+    if not code.strip():
+        return code
+    if lang == "json":
+        return _format_json(code)
+    if lang in ("html", "xml"):
+        return _format_markup(code)
+    if lang == "python":
+        return _fmt_python(code)
+    if lang in ("java", "bash", "sql"):
+        return _fmt_reindent(code, lang)
+    raise _FormatError("纯文本没有可格式化的结构")
+
+
+class PopupMenu(object):
+    """自绘的右键弹出菜单。
+
+    原生 tk.Menu 在 Windows 上是方角灰底、悬停高亮生硬，和本应用自绘的控件风格
+    割裂。这里用一个无边框 Toplevel + Canvas 画菜单卡片：直角底 + 1px 描边、
+    整行悬停高亮、危险项标红，支持禁用项与分隔线，取色全部走当前调色板（含皮肤）。
+    用直角而不是圆角：Tk 无边框窗口是矩形、无法裁剪圆角，圆角弧外会露出窗口直角
+    底色（四个小尖角），直角卡片则与窗口严丝合缝。
+    """
+
+    def __init__(self, master, pal):
+        self.master = master
+        self.pal = dict(pal)
+        self._items = []     # {"label","command","danger","enabled"}；label 为 None 表示分隔线
+        self._hit = []       # 可点击行 (y0, y1, index)
+        self._seps = []      # 分隔线纵坐标
+        self._hover = -1
+        self._win = None
+        self._canvas = None
+        self._width = 0
+        self._height = 0
+        try:
+            self._font = tkfont.Font(family=FONT[0], size=FONT[1] - 1)
+        except Exception:
+            self._font = None
+
+    # ---------- 组装 ----------
+    def add(self, label, command=None, danger=False, enabled=True):
+        self._items.append({"label": label, "command": command,
+                            "danger": danger, "enabled": enabled})
+        return self
+
+    def add_separator(self):
+        self._items.append({"label": None})
+        return self
+
+    def _measure(self, s):
+        """量文字宽度；量不了就按全角字符估宽（宁可偏宽也不截断）。"""
+        if self._font is not None:
+            try:
+                return self._font.measure(s)
+            except Exception:
+                pass
+        return len(s) * (FONT[1] + 1)
+
+    def _layout(self):
+        """算卡片尺寸与每行命中区域（先量宽，再定位，避免弹出后跳大小）。"""
+        text_w = max([self._measure(it["label"]) for it in self._items
+                      if it["label"] is not None] or [0])
+        self._width = MENU_PAD_X * 2 + MENU_GUTTER + text_w
+        y = 6
+        self._hit = []
+        self._seps = []
+        for idx, it in enumerate(self._items):
+            if it["label"] is None:
+                self._seps.append(y + MENU_SEP_H // 2)
+                y += MENU_SEP_H
+            else:
+                self._hit.append((y, y + MENU_ROW_H, idx))
+                y += MENU_ROW_H
+        self._height = y + 6
+
+    # ---------- 绘制 ----------
+    def _render(self):
+        c = self._canvas
+        p = self.pal
+        w, h = self._width, self._height
+        line = p.get("line", "#cfcfd6")
+        c.delete("all")
+        # 卡片底：直角矩形 + 1px 描边，与无边框窗口严丝合缝（圆角会露出窗口直角底色）
+        c.create_rectangle(1, 1, w - 1, h - 1,
+                           fill=p.get("editor", "#ffffff"), outline=line, width=1)
+        for y0, y1, idx in self._hit:
+            it = self._items[idx]
+            if idx == self._hover and it["enabled"]:
+                c.create_rectangle(4, y0 + 1, w - 4, y1 - 1,
+                                   fill=(MENU_DANGER if it["danger"] else p.get("sel", "#cfe0fb")),
+                                   outline="")
+                fg = "#ffffff" if it["danger"] else p.get("selfg", p.get("text", "#1f1f24"))
+            elif not it["enabled"]:
+                fg = p.get("soft", "#76767e")
+            elif it["danger"]:
+                fg = MENU_DANGER
+            else:
+                fg = p.get("text", "#1f1f24")
+            c.create_text(MENU_PAD_X + MENU_GUTTER, (y0 + y1) // 2,
+                          text=it["label"], anchor="w",
+                          font=(FONT[0], FONT[1] - 1), fill=fg)
+        # 分隔线：左右缩进，比通栏更克制
+        for y in self._seps:
+            c.create_line(MENU_PAD_X, y, w - MENU_PAD_X, y, fill=line)
+
+    # ---------- 弹出 / 关闭 ----------
+    def popup(self, x, y):
+        """在屏幕坐标 (x, y) 弹出菜单；贴近屏幕边缘时自动内收，保证整框可见。"""
+        self._layout()
+        p = self.pal
+        win = tk.Toplevel(self.master)
+        win.overrideredirect(True)
+        try:
+            win.attributes("-topmost", True)
+        except Exception:
+            pass
+        win.configure(bg=p.get("line", "#cfcfd6"))
+        self._win = win
+        c = tk.Canvas(win, width=self._width, height=self._height, bd=0,
+                      highlightthickness=0, bg=p.get("line", "#cfcfd6"))
+        c.pack()
+        self._canvas = c
+        self._render()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        px = max(0, min(int(x), sw - self._width))
+        py = max(0, min(int(y), sh - self._height))
+        win.geometry("+%d+%d" % (px, py))
+        c.bind("<Motion>", self._on_motion)
+        c.bind("<Button-1>", self._on_click)
+        # grab 生效后事件是派发给「grab 窗口」即这个 Toplevel 的（坐标相对它），
+        # 所以拦截点击/移动必须绑在 win 上；只绑 Canvas 时点菜单外毫无反应。
+        win.bind("<Motion>", self._on_motion)
+        win.bind("<Leave>", lambda e: self._set_hover(-1))
+        win.bind("<Button-1>", self._on_click)
+        win.bind("<Button-3>", lambda e: self.close())
+        win.bind("<Escape>", lambda e: self.close())
+        # 全局 grab：应用外（别的窗口 / 桌面）的点击也会落到菜单上，
+        # 与原生右键菜单一致——点任何地方都消失。
+        try:
+            win.grab_set_global()
+        except Exception:
+            try:
+                win.grab_set()
+            except Exception:
+                pass
+        try:
+            win.focus_force()
+        except Exception:
+            pass
+
+    def close(self):
+        win, self._win = self._win, None
+        self._canvas = None
+        if win is None:
+            return
+        try:
+            win.grab_release()
+        except Exception:
+            pass
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+    # ---------- 事件 ----------
+    def _row_at(self, ey):
+        for y0, y1, idx in self._hit:
+            if y0 <= ey <= y1:
+                return idx
+        return -1
+
+    def _set_hover(self, idx):
+        if idx != self._hover:
+            self._hover = idx
+            if self._canvas is not None:
+                self._render()
+
+    def _on_motion(self, e):
+        self._set_hover(self._row_at(e.y))
+
+    def _on_click(self, e):
+        # 点到卡片外（局部 grab 下坐标可能落在窗口外）→ 直接收起
+        if not (0 <= e.x <= self._width and 0 <= e.y <= self._height):
+            self.close()
+            return
+        idx = self._row_at(e.y)
+        if idx < 0:
+            self.close()
+            return
+        it = self._items[idx]
+        if not it["enabled"]:
+            return
+        cmd = it["command"]
+        self.close()
+        # 先收菜单再执行：避免命令里的对话框抢焦点时菜单还挂着
+        if cmd:
+            self.master.after(10, cmd)
+
+
 def uid():
     import random, string
     return "x" + "".join(random.choices(string.ascii_letters + string.digits, k=9))
@@ -788,15 +1540,15 @@ def seed():
     now = __import__("time").time() * 1000
     return {
         "folders": [
-            {"id": "f_all", "name": "全部备忘录", "smart": True},
-            {"id": "f_star", "name": "星标备忘录", "smart": True},
+            {"id": "f_all", "name": "全部笔记", "smart": True},
+            {"id": "f_star", "name": "星标笔记", "smart": True},
             {"id": "f_work", "name": "工作"},
             {"id": "f_life", "name": "个人"},
         ],
         "notes": [
             {"id": uid(), "folder": "f_work",
-             "content": (_t("欢迎使用备忘录", ["title"]) + [["t", "\n", []]]
-                         + _t("这是一款复刻 macOS 备忘录的桌面程序，用你电脑自带的 Python 即可运行。")
+             "content": (_t("欢迎使用" + APP_NAME, ["title"]) + [["t", "\n", []]]
+                         + _t("这是一款复刻 macOS 笔记的桌面程序，用你电脑自带的 Python 即可运行。")
                          + [["t", "\n", []]] + _t("试着用顶部工具栏：加粗、标题、待办清单都支持。")
                          + [["t", "\n", []]] + _t("所有内容自动保存在本地 notes_data.db。")
                          + [["t", "\n", []]]),
@@ -820,6 +1572,62 @@ def seed():
     }
 
 
+def _fix_sample_note(data):
+    """旧库里内置的示例笔记随应用改名。
+
+    只认“标题整串恰好等于历史示例标题”的笔记：标题换成「欢迎使用素笺」，
+    并把该篇正文里的“备忘录”措辞统一成“笔记”。用户自己改过标题的笔记一概不动。
+    返回是否改动过（改动则调用方落库，plain 搜索列会一起重建）。
+    """
+    want = "欢迎使用" + APP_NAME
+    old_titles = ("欢迎使用备忘录", "欢迎使用笔记")
+    changed = False
+    for n in data.get("notes", []):
+        content = n.get("content") or []
+        idxs = [i for i, it in enumerate(content)
+                if len(it) > 2 and it[0] == "t" and it[2] and "title" in it[2]]
+        if not idxs:
+            continue
+        if "".join(content[i][1] for i in idxs) not in old_titles:
+            continue
+        tags = list(content[idxs[0]][2])
+        mark = set(idxs)
+        start, end = idxs[0], idxs[0]
+        while end < len(content) and end in mark:     # 标题字符是连续的一段
+            end += 1
+        head, tail = content[:start], content[end:]
+
+        def _fixed(items):                            # 正文措辞同步（仅这一篇示例）
+            # 内容是按字符存的（每个字一项），所以替换要先把同标签的连续文字合并成串，
+            # 再按字符拆回去，否则“备忘录”跨项永远匹配不到。
+            out = []
+            buf, tags_run = [], None
+
+            def flush():
+                if buf:
+                    for c in "".join(buf).replace("备忘录", "笔记"):
+                        out.append(["t", c, list(tags_run)])
+                    del buf[:]
+
+            for it in items:
+                it = list(it)
+                if it[0] == "t":
+                    if buf and it[2] != tags_run:
+                        flush()
+                    tags_run = it[2]
+                    buf.append(it[1])
+                else:
+                    flush()
+                    tags_run = None
+                    out.append(it)
+            flush()
+            return out
+
+        n["content"] = _fixed(head) + [["t", c, tags] for c in want] + _fixed(tail)
+        changed = True
+    return changed
+
+
 def plain_of(n):
     """笔记纯文本（搜索用）：待办框记作一个空格，换行归为空格。"""
     s = []
@@ -828,6 +1636,8 @@ def plain_of(n):
             s.append(it[1])
         elif it[0] == "w":
             s.append(" ")
+        elif it[0] == "code":          # 代码块整段计入搜索文本
+            s.append(it[2] if len(it) > 2 else "")
     return "".join(s).replace("\n", " ").strip()
 
 
@@ -1044,6 +1854,121 @@ def save_data(d):
     store().save(d)
 
 
+class SlimScrollbar(tk.Canvas):
+    """列表右侧的细滚动条（自绘）：只在内容超出时出现，可拖、可点轨道、可滚轮。
+
+    为什么不用 tk.Scrollbar：系统滚动条是直角色块 + 两端箭头，和本项目自绘的圆角
+    控件不搭，还会占掉 17px 把两列挤窄。这里只用 8px，正好落在卡片左右留白
+    （CARD_PADX）里，拇指是圆角小条，颜色随皮肤由面板底色向次级文字色混合而来。
+    """
+
+    W = 8          # 占位宽度（画 6px 拇指，两侧各留 1px，不压到卡片）
+    INSET = 4      # 上下留白，拇指不贴面板边缘
+    THUMB_MIN = 26
+
+    def __init__(self, master, bg, palette, target):
+        tk.Canvas.__init__(self, master, width=self.W, bd=0, highlightthickness=0,
+                           bg=bg, cursor="arrow", takefocus=0)
+        self._bg = bg
+        self._pal = dict(palette)
+        self._target = target          # 要控制的 Canvas（内容画布）
+        self._first, self._last = 0.0, 1.0
+        self._hover = False
+        self._drag = None              # 拖动时记住「鼠标 y − 拇指顶 y」
+        self._thumb = (self.INSET, self.THUMB_MIN)
+        self.bind("<Configure>", lambda e: self.sync(self._first, self._last))
+        self.bind("<Enter>", lambda e: self._set_hover(True))
+        self.bind("<Motion>", lambda e: self._set_hover(True))
+        self.bind("<Leave>", lambda e: self._set_hover(False))
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<MouseWheel>", lambda e: self._scroll_wheel(e.delta))
+        self.bind("<Button-4>", lambda e: self._target.yview_scroll(-3, "units"))
+        self.bind("<Button-5>", lambda e: self._target.yview_scroll(3, "units"))
+
+    # ---------- 同步与绘制 ----------
+    def sync(self, first, last):
+        """由内容画布的 yscrollcommand 驱动：位置/长度变了就重画，不溢出则隐藏。"""
+        self._first, self._last = float(first), float(last)
+        page = self._last - self._first
+        if page >= 0.999:                 # 内容没占满：整条隐藏
+            if self.winfo_ismapped():
+                self.place_forget()
+            return
+        if not self.winfo_ismapped():     # 需要时浮在列表右侧（叠在留白里，不动布局）
+            self.place(relx=1.0, rely=0.0, anchor="ne", width=self.W, relheight=1.0)
+            tk.Misc.lift(self)
+        # 刚 place 时自身高度还是 1，退回面板高度算拇指（下一次 Configure 会再校准）
+        h = self.winfo_height()
+        if h <= 4:
+            h = self.master.winfo_height()
+        if h <= 4:
+            return
+        track = h - self.INSET * 2
+        th = max(self.THUMB_MIN, int(round(page * track)))
+        th = min(th, track)
+        span = max(1e-6, 1.0 - page)
+        top = self.INSET + (track - th) * (self._first / span)
+        self._thumb = (top, th)
+        self._draw()
+
+    def _draw(self):
+        self.delete("all")
+        top, th = self._thumb
+        if self._drag is not None:
+            mix = 0.66
+        elif self._hover:
+            mix = 0.54
+        else:
+            mix = 0.36
+        fill = _mix_hex(self._bg, self._pal.get("soft", "#76767e"), mix)
+        self.create_polygon(_round_rect_points(1, top, self.W - 1, top + th, 3, 6),
+                            fill=fill, outline="")
+
+    def apply_theme(self, pal, bg):
+        self._pal = dict(pal)
+        self._bg = bg
+        self.configure(bg=bg)
+        self._draw()
+
+    def _set_hover(self, on):
+        if self._hover != on:
+            self._hover = on
+            self._draw()
+
+    # ---------- 交互 ----------
+    def _scroll_wheel(self, delta):
+        if not delta:
+            return
+        d = -1 * (delta // 40)
+        self._target.yview_scroll(d or (-1 if delta > 0 else 1), "units")
+
+    def _on_press(self, e):
+        top, th = self._thumb
+        if top <= e.y <= top + th:        # 按在拇指上 → 开始拖动
+            self._drag = e.y - top
+            self._draw()
+            return
+        # 按在轨道上 → 翻一页（朝点击方向）
+        self._target.yview_scroll(-1 if e.y < top else 1, "pages")
+
+    def _on_drag(self, e):
+        if self._drag is None:
+            return
+        h = self.winfo_height()
+        track = h - self.INSET * 2
+        th = self._thumb[1]
+        room = max(1, track - th)
+        top = min(max(self.INSET, e.y - self._drag), self.INSET + room)
+        frac = (top - self.INSET) / float(room)
+        self._target.yview_moveto(min(1.0, max(0.0, frac)))
+
+    def _on_release(self, e):
+        self._drag = None
+        self._draw()
+
+
 class ScrollPanel(tk.Frame):
     """带滚动条的容器，内部用 Frame 摆放自定义行。"""
     def __init__(self, parent, bg, palette):
@@ -1053,9 +1978,11 @@ class ScrollPanel(tk.Frame):
         self.canvas.configure(yscrollincrement=20)
         self.inner = tk.Frame(self.canvas, bg=bg)
         self.inner_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
-        # 按需求：文件夹/备忘录列表不再显示滚动条（自绘滚动条已取消），鼠标滚轮滑动仍然可用。
-        self.sb = None
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # 右侧细滚动条：叠在卡片右侧留白上，只在内容超出时出现
+        self.sb = SlimScrollbar(self, bg, palette, self.canvas)
+        self.canvas.configure(yscrollcommand=self._on_yscroll)
+        self._inner_kids = -1               # 上次结算时的行数（用于判断要不要重算高度）
         self.inner.bind("<Configure>", lambda e: self._update())
         self.canvas.bind("<Configure>", self._on_cfg)
         # 滚轮双保险（两条路径，靠 _is_own 去重，避免一次滚动被处理两次）：
@@ -1086,6 +2013,13 @@ class ScrollPanel(tk.Frame):
 
         _bind(self.canvas)
         _bind(self.inner)
+        if self.sb is not None:
+            # 滚动条自己处理滚轮，登记进本面板避免 bind_all 兜底再滚一次
+            self._wheel_widgets.add(str(self.sb))
+
+    def _on_yscroll(self, first, last):
+        """内容画布的 yscrollcommand：交给右侧细滚动条同步拇指。"""
+        self.sb.sync(first, last)
 
     def _is_own(self, widget):
         """判断事件来源控件是否属于本面板（用于两条滚轮路径去重）。"""
@@ -1101,15 +2035,33 @@ class ScrollPanel(tk.Frame):
         y2 = y1 + self.canvas.winfo_height()
         return x1 <= e.x_root <= x2 and y1 <= e.y_root <= y2
 
+    def _nudge_reqheight(self):
+        """强制内部 Frame 重算「请求高度」。
+
+        这台机器的 Tk 有个坑：销毁子控件后 Frame 的 winfo_reqheight 不失效
+        （仍是销毁前的值），于是列表清空/筛没之后滚动区停在旧高度、滚动条不消失。
+        关掉传播→写死 1px→再打开传播，就是一次廉价的重算触发。
+        """
+        try:
+            self.inner.pack_propagate(False)
+            self.inner.configure(width=1, height=1)
+            self.inner.pack_propagate(True)
+        except Exception:
+            pass
+
     def _update(self):
         """刷新可滚动区域（内容增减后调用，确保滚动条启用、可拖）。
 
         采用双重兜底，保证任何时序下 scrollregion 都正确，彻底解决
-        “文件夹/备忘录铺满后无法滚动”：
+        “文件夹/笔记铺满后无法滚动”：
         1) 优先用内部 Frame 的「自然高度」winfo_reqheight——由几何管理器同步算出，
            不依赖画布实际渲染像素（bbox("all") 在窗口未完全映射时常返回过小值）；
         2) 若自然高度为 0（如尚未布局），回退到 bbox("all") 的像素高度。
         """
+        kids = len(self.inner.winfo_children())
+        if kids != self._inner_kids:        # 行数变了：先让 Frame 重算请求高度（见上）
+            self._inner_kids = kids
+            self._nudge_reqheight()
         w = self.canvas.winfo_width() or 200
         h = self.inner.winfo_reqheight() or 0
         if h == 0:
@@ -1121,6 +2073,10 @@ class ScrollPanel(tk.Frame):
         if vis and h < vis:
             h = vis
         self.canvas.configure(scrollregion=(0, 0, w, h))
+        # 滚动区域变了，拇指的显隐/长度要立刻跟上（不能等下一次滚动）
+        if self.sb is not None:
+            first, last = self.canvas.yview()
+            self.sb.sync(first, last)
 
     def _on_cfg(self, e):
         self.canvas.itemconfig(self.inner_id, width=e.width)
@@ -1191,6 +2147,528 @@ class TodoBox(tk.Canvas):
                              capstyle="round", joinstyle="round")
 
 
+def _has_cjk(s):
+    """是否含中日韩字符 / 全角符号（这些字走中文字体，行高比等宽字体高）。"""
+    for ch in s:
+        if ord(ch) > 0x2E7F:
+            return True
+    return False
+
+
+def _luminance(hexv):
+    """颜色亮度（0~1），用来判断当前皮肤是浅底还是深底。"""
+    h = (hexv or "#000000").lstrip("#")
+    if len(h) == 3:
+        h = "".join(ch * 2 for ch in h)
+    try:
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    except Exception:
+        r, g, b = 0, 0, 0
+    return (0.299 * r + 0.587 * g + 0.114 * b) / 255.0
+
+
+def _sel_fg(pal):
+    """文字被选中时的前景色。
+
+    Windows 上的 Tk 默认把「选中文字」画成白色（SystemHighlightText，标签色也会被
+    盖掉），而皮肤给的选区底色是浅色（#dbe8dc 之类）→ 选中一段代码就白成一片，
+    根本看不清。这里按选区底色算一个对比够大的前景色，显式设给 -selectforeground。
+    """
+    sel = pal.get("sel", "#cfe0fb")
+    text = pal.get("text", "#1f1f24")
+    if abs(_luminance(sel) - _luminance(text)) >= 0.34:
+        return text
+    return "#ffffff" if _luminance(sel) < 0.5 else "#1f2328"
+
+
+def _code_palette(pal):
+    """由调色板推导代码块配色：(底色, 语言条底色, 描边, 分词色表)。
+
+    不写死颜色，底色由编辑区底色向文字色微混，换皮肤时整块自动跟着走；
+    浅底/深底各有一套分词色，保证任何一种皮肤下关键字都读得清。
+    """
+    editor = pal.get("editor", "#ffffff")
+    text = pal.get("text", "#000000")
+    # 深底皮肤用另一套分词色：判据看「编辑区底色」——代码块底色就是从它掺出来的
+    dark = _luminance(editor) < 0.5
+    bg = _mix_hex(editor, text, 0.07 if dark else 0.045)
+    head = _mix_hex(bg, text, 0.04)
+    border = _mix_hex(bg, text, 0.14)
+    return bg, head, border, CODE_TOKEN_COLORS["dark" if dark else "light"]
+
+
+class CodeBlock(tk.Frame):
+    """笔记里的一段代码块：顶部语言条 + 等宽代码区（带轻量语法高亮）。
+
+    为什么在正文里嵌一个真正的小 Text（而不是给正文加样式标签）：
+      - 代码需要「成块」：统一底色、等宽字体、语言标签，还能整块删除；
+      - 用 Text 的 window_create 嵌进去后，光标、选择、撤销、复制粘贴、缩进
+        全是系统原生行为，用户不用学一套新的输入方式；
+      - 语言可随时切换（点顶部标签），高亮跟着重算。
+    高度按代码实际占用的像素自适应，超过 MAX_H 就不再长（改为内部滚动 + 右侧
+    细滚动条），宽度跟随编辑区宽度，窗口缩放时不跑版。
+    """
+
+    HEADER_H = 26
+    PADX = 10
+    PADY = 7
+    MAX_H = 560             # 代码区最高像素（约 33 行）；超过就内部滚动 + 右侧细滚动条
+
+    def __init__(self, parent, app, lang="", code=""):
+        tk.Frame.__init__(self, parent, bd=0, highlightthickness=1)
+        self.app = app
+        self.lang = lang if lang in CODE_LANG_LABEL else ""
+        self._loading = True
+        self._hl_job = None
+        self._width = 0
+        self._body_h = 0
+        self._scrolls = False       # 内容是否高过 MAX_H（决定右侧细滚动条出不出现）
+        self._build()
+        self.set_code(code)
+        self.set_lang(self.lang, notify=False)
+        self.apply_theme(app.pal)
+        self._loading = False
+
+    # ---------- 组装 ----------
+    def _build(self):
+        # 高度由 set_width/fit 显式给定（按代码行数算），所以关掉传播：
+        # 否则「请求高度」由子控件决定，代码区会被压成一条线。
+        self.pack_propagate(False)
+        self._head = tk.Frame(self, height=self.HEADER_H, bd=0, highlightthickness=0)
+        self._head.pack(fill=tk.X)
+        self._head.pack_propagate(False)
+        # 语言标签：点了弹出语言菜单（可随时改语言 / 复制 / 删除这一块）
+        self._chip = tk.Label(self._head, bd=0, padx=7, pady=1, cursor="hand2")
+        self._chip.pack(side=tk.LEFT, padx=(8, 0), pady=3)
+        self._chip.bind("<Button-1>", self._open_menu)
+        self._copy = tk.Label(self._head, bd=0, padx=6, pady=1, text="复制", cursor="hand2")
+        self._copy.pack(side=tk.RIGHT, padx=(0, 8), pady=3)
+        self._copy.bind("<Button-1>", lambda e: self.copy_code())
+        self._copy.bind("<Enter>", lambda e: self._copy.configure(fg=self.app.pal["accent"]))
+        self._copy.bind("<Leave>", lambda e: self._copy.configure(fg=self.app.pal["soft"]))
+        # 格式化：先 pack 复制、再 pack 格式化，RIGHT 侧从右往左叠 → 格式化落在复制左边
+        self._fmt = tk.Label(self._head, bd=0, padx=6, pady=1, text="格式化", cursor="hand2")
+        self._fmt.pack(side=tk.RIGHT, padx=(0, 2), pady=3)
+        self._fmt.bind("<Button-1>", lambda e: self.format_code())
+        self._fmt.bind("<Enter>", lambda e: self._fmt.configure(fg=self.app.pal["accent"]))
+        self._fmt.bind("<Leave>", lambda e: self._fmt.configure(fg=self.app.pal["soft"]))
+        self._sep = tk.Frame(self, height=1, bd=0, highlightthickness=0)
+        self._sep.pack(fill=tk.X)
+        self._body = tk.Frame(self, bd=0, highlightthickness=0)
+        self._body.pack(fill=tk.BOTH, expand=True)
+        self._body.pack_propagate(False)
+        fam, size = self.app.code_font()
+        self._mono, self._fsize = fam, size
+        self._char_w = float(size) * 0.6
+        self._line_h = self._measure_line()
+        self.inner = tk.Text(self._body, bd=0, highlightthickness=0, wrap=tk.WORD,
+                            undo=True, exportselection=False,
+                            padx=self.PADX, pady=self.PADY, font=(fam, size))
+        self.inner.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+        # 右侧细滚动条：代码超过 MAX_H 才出现（浮在代码区右留白里，不占宽度）
+        self.sb = SlimScrollbar(self._body, self.app.pal.get("editor", "#ffffff"),
+                                self.app.pal, self.inner)
+        self.inner.configure(yscrollcommand=self._on_yscroll)
+        self._configure_tags()
+        self.inner.bind("<<Modified>>", self._on_edit)
+        self.inner.bind("<MouseWheel>", self._on_wheel)
+        self.inner.bind("<Tab>", self._on_tab)
+        self.inner.bind("<Shift-Tab>", self._on_tab)
+        try:                        # X11 下 Shift+Tab 是 ISO_Left_Tab（Windows 没这个 keysym）
+            self.inner.bind("<ISO_Left_Tab>", self._on_tab)
+        except Exception:
+            pass
+        self.inner.bind("<BackSpace>", self._on_backspace)
+        # 滚进视野后才真正被布局（Text 只映射可视区里的嵌入窗口）→ 这时重新量一次高度
+        self.inner.bind("<Map>", lambda e: self.app._after_idle(self.fit))
+        self.inner.bind("<Escape>", lambda e: (self.app.text.focus_set(), "break")[1])
+        self._head.bind("<Button-1>", lambda e: self.focus_code())
+        self.configure(height=self.HEADER_H + 1 + self._line_h + 2 * self.PADY)
+
+    def _measure_line(self):
+        """量出「纯等宽行」和「含中文行」的行高 + 单字符宽度（等宽字体，可直接算换行）。"""
+        try:
+            import tkinter.font as _f
+            f = _f.Font(root=self.inner, family=self._mono, size=self._fsize)
+            cjk = _f.Font(root=self.inner, family=FONT[0], size=self._fsize)
+            self._char_w = max(1.0, float(f.measure("0")))
+            self._line_h_cjk = max(int(f.metrics("linespace")),
+                                   int(cjk.metrics("linespace")))
+            return int(f.metrics("linespace"))
+        except Exception:
+            self._char_w = max(1.0, self._fsize * 0.6)
+            self._line_h_cjk = self._fsize + 8
+            return self._fsize + 6
+
+    def _configure_tags(self):
+        """分词标签：字重/字号随代码字体，颜色由主题给（关键词加粗更醒目）。"""
+        cols = self._scheme()[3]
+        f = (self._mono, self._fsize)
+        self.inner.tag_configure("c_kw", font=f + ("bold",), foreground=cols["kw"])
+        self.inner.tag_configure("c_tag", font=f + ("bold",), foreground=cols["tag"])
+        self.inner.tag_configure("c_com", font=f + ("italic",), foreground=cols["com"])
+        for name in ("str", "num", "lit", "var", "key", "attr", "dec", "ann"):
+            self.inner.tag_configure("c_" + name, font=f, foreground=cols[name])
+        self._token_tags = ["c_" + n for n in
+                           ("num", "kw", "tag", "str", "key", "attr", "var", "lit",
+                            "dec", "ann", "com")]
+
+    def _scheme(self):
+        if getattr(self, "_cols", None) is None:
+            self._cols = _code_palette(self.app.pal)
+        return self._cols
+
+    # ---------- 主题 / 字号 ----------
+    def apply_theme(self, pal):
+        """换肤：底色、描边、语言标签、分词颜色全部重算并重画。"""
+        self._cols = None
+        bg, head, border, _cols = self._scheme()
+        accent = pal["accent"]
+        self.configure(bg=bg, highlightbackground=border, highlightcolor=border)
+        self._head.configure(bg=head)
+        self._sep.configure(bg=border)
+        self._body.configure(bg=bg)
+        self._chip.configure(bg=_mix_hex(head, accent, 0.16), fg=accent,
+                             font=(FONT[0], 10, "bold"))
+        self._copy.configure(bg=head, fg=pal["soft"], font=(FONT[0], 10))
+        self._fmt.configure(bg=head, fg=pal["soft"], font=(FONT[0], 10))
+        self.inner.configure(bg=bg, fg=pal.get("text", "#1f1f24"),
+                             insertbackground=accent,
+                             selectbackground=pal.get("sel", "#cfe0fb"),
+                             selectforeground=_sel_fg(pal),
+                             inactiveselectbackground=pal.get("sel2", "#e0e9f7"))
+        try:
+            self.sb.apply_theme(pal, bg)
+        except Exception:
+            pass
+        self._configure_tags()
+        self._refresh_chip()
+        self._highlight()
+
+    def apply_size(self, size):
+        """正文字号变化：代码字号跟着变（比正文小 1 号），高度重算。"""
+        self._fsize = max(8, int(size))
+        self.inner.configure(font=(self._mono, self._fsize))
+        self._line_h = self._measure_line()
+        self._configure_tags()
+        self.fit()
+
+    def _refresh_chip(self):
+        label = CODE_LANG_LABEL.get(self.lang, "纯文本")
+        self._chip.configure(text=label)
+
+    # ---------- 语言 / 内容 ----------
+    def set_lang(self, key, notify=True):
+        self.lang = key if key in CODE_LANG_LABEL else ""
+        self._refresh_chip()
+        self._highlight()
+        if notify:
+            self.app.mark_modified()
+
+    def set_code(self, code):
+        self._loading = True
+        self.inner.delete("1.0", tk.END)
+        if code:
+            self.inner.insert("1.0", code)
+        self.inner.edit_reset()
+        self.inner.edit_modified(False)
+        self._loading = False
+        self._highlight()
+        self.fit()
+
+    def snapshot(self):
+        """取回代码文本（Tk 的 Text 末尾恒有一个换行，去掉它再存）。"""
+        return self.inner.get("1.0", "end-1c")
+
+    def focus_code(self):
+        try:
+            self.inner.focus_set()
+            self.inner.mark_set("insert", "end-1c")
+            self.inner.see(tk.INSERT)
+        except Exception:
+            pass
+
+    def copy_code(self):
+        code = self.snapshot()
+        if not code:
+            return
+        try:
+            self.app.root.clipboard_clear()
+            self.app.root.clipboard_append(code)
+        except Exception:
+            return
+        self._copy.configure(text="已复制", fg=self.app.pal["green"])
+        self.app._after(1100, lambda: self._copy.configure(
+            text="复制", fg=self.app.pal["soft"]))
+
+    def format_code(self):
+        """按当前语言格式化代码块：JSON/HTML/XML 走结构化重排，其余重排缩进。"""
+        code = self.snapshot()
+        if not code.strip():
+            return
+        try:
+            out = _format_code(self.lang, code)
+        except _FormatError as e:
+            self.app._show_error("格式化失败", str(e))
+            return
+        except Exception as e:
+            self.app._show_error("格式化失败", "无法格式化这段代码：%s" % e)
+            return
+        if out == code:
+            self._flash_fmt("已是最新")
+            return
+        self.set_code(out)
+        self.app.mark_modified()
+        self._flash_fmt("已格式化")
+
+    def _flash_fmt(self, text):
+        """在「格式化」标签上短暂反馈结果，随后复原。"""
+        try:
+            self._fmt.configure(text=text, fg=self.app.pal["green"])
+        except Exception:
+            return
+        self.app._after(1100, lambda: self._fmt.configure(
+            text="格式化", fg=self.app.pal["soft"]))
+
+    def delete_block(self):
+        self.app._remove_code_block(self)
+
+    def _open_menu(self, event=None):
+        p = self.app.pal
+        m = PopupMenu(self.app.root, p)
+        for label, key in CODE_LANGS:
+            m.add(("# " if key == self.lang else "") + label,
+                  command=lambda k=key: self.set_lang(k))
+        m.add_separator()
+        m.add("复制代码", command=self.copy_code)
+        m.add("格式化代码", command=self.format_code)
+        m.add("删除代码块", danger=True, command=self.delete_block)
+        x = self._chip.winfo_rootx()
+        y = self._chip.winfo_rooty() + self._chip.winfo_height() + 2
+        m.popup(x, y)
+
+    # ---------- 编辑 ----------
+    def _on_edit(self, ev=None):
+        if not self.inner.edit_modified():
+            return
+        self.inner.edit_modified(False)
+        if self._loading:
+            return
+        self._schedule_highlight()
+        self.fit()
+        self.app.mark_modified()
+        # 敲到看不见的地方（块内有滚动条时）把光标带回视野
+        try:
+            self.inner.see(tk.INSERT)
+        except Exception:
+            pass
+
+    def _sel_lines(self):
+        """选区覆盖的行号范围（1 起，闭区间）；没有选区时就是光标所在行。"""
+        try:
+            if self.inner.tag_ranges("sel"):
+                a, b = self.inner.index("sel.first"), self.inner.index("sel.last")
+                # 选区正好停在行首时，那一行不算（和多数编辑器一致）
+                if self.inner.compare(b, ">", a) and \
+                        self.inner.compare(b, "==", self.inner.index(b + " linestart")):
+                    b = self.inner.index("%s -1c" % b)
+                return (int(a.split(".")[0]), int(b.split(".")[0]))
+        except Exception:
+            pass
+        ln = int(self.inner.index(tk.INSERT).split(".")[0])
+        return ln, ln
+
+    def _indent_sel(self, delta):
+        """把选区（或光标所在行）整体缩进/反缩进 4 空格，并保持选中状态。"""
+        ln0, ln1 = self._sel_lines()
+        if delta > 0:
+            for ln in range(ln0, ln1 + 1):
+                self.inner.insert("%d.0" % ln, "    ")
+        else:
+            for ln in range(ln0, ln1 + 1):
+                line = self.inner.get("%d.0" % ln, "%d.end" % ln)
+                n = 0
+                while n < 4 and n < len(line) and line[n] == " ":
+                    n += 1
+                if n == 0 and line[:1] == "\t":
+                    n = 1
+                if n:
+                    self.inner.delete("%d.0" % ln, "%d.%d" % (ln, n))
+        self.inner.edit_separator()
+        self.inner.tag_remove("sel", "1.0", tk.END)
+        self.inner.tag_add("sel", "%d.0" % ln0, "%d.end" % ln1)
+        self._schedule_highlight()
+        self.fit()
+        self.app.mark_modified()
+        try:
+            self.inner.see(tk.INSERT)
+        except Exception:
+            pass
+        return "break"
+
+    def _on_tab(self, event=None):
+        """Tab 缩进（选中多行时整块缩进），Shift+Tab 反缩进。
+
+        代码里缩进比切换焦点常用得多，所以 Tab 一律自己吃掉。
+        """
+        shift = bool(getattr(event, "state", 0) & 0x1) or \
+            getattr(event, "keysym", "") in ("ISO_Left_Tab", "Shift-Tab")
+        if shift or self.inner.tag_ranges("sel"):
+            return self._indent_sel(-1 if shift else 1)
+        self.inner.insert(tk.INSERT, "    ")
+        try:
+            self.inner.see(tk.INSERT)
+        except Exception:
+            pass
+        return "break"
+
+    def _on_backspace(self, event=None):
+        """空代码块里按退格 = 删掉这一块（和有内容的退格一样符合直觉）。"""
+        if self.snapshot().strip() == "" and \
+                self.inner.compare("insert", "==", "1.0"):
+            self.delete_block()
+            return "break"
+        return None
+
+    def _on_wheel(self, event=None):
+        """滚轮：代码块内部还能滚就滚内部，否则把滚动交给外层笔记（别卡住不滚）。"""
+        delta = getattr(event, "delta", 0)
+        if not delta:
+            return None
+        go = -1 if delta > 0 else 1
+        try:
+            first, last = self.inner.yview()
+        except Exception:
+            first, last = 0.0, 1.0
+        if (go < 0 and first > 0.0) or (go > 0 and last < 1.0):
+            self.inner.yview_scroll(go, "units")
+        else:
+            self.app.text.yview_scroll(go, "units")
+        return "break"
+
+    # ---------- 高亮 / 高度 ----------
+    def _schedule_highlight(self):
+        """输入时不必每键重扫全文：合并成一次（120ms 内的连续输入只算一遍）。"""
+        if self._hl_job is not None:
+            try:
+                self.app._cancel_after(self._hl_job)
+            except Exception:
+                pass
+        self._hl_job = self.app._after(120, self._highlight)
+
+    def _highlight(self):
+        self._hl_job = None
+        try:
+            code = self.inner.get("1.0", "end-1c")
+        except Exception:
+            return
+        for t in getattr(self, "_token_tags", []):
+            self.inner.tag_remove(t, "1.0", tk.END)
+        rules = CODE_RULES.get(self.lang) or []
+        if not rules or not code or len(code) > 20000:
+            return
+        for tag, pat, flags in rules:                 # 列表顺序 = 标签栈顺序
+            try:
+                rx = re.compile(pat, flags)
+            except Exception:
+                continue
+            for m in rx.finditer(code):
+                a = "1.0 + %dc" % m.start()
+                b = "1.0 + %dc" % m.end()
+                self.inner.tag_add("c_" + tag, a, b)
+        for t in getattr(self, "_token_tags", []):     # 后加的规则压在上面
+            try:
+                self.inner.tag_raise(t)
+            except Exception:
+                pass
+
+    def set_width(self, px, fit=True):
+        px = max(120, int(px))
+        if px == self._width:
+            return
+        self._width = px
+        try:
+            self.configure(width=px)
+        except Exception:
+            pass
+        if fit:
+            self.fit()
+
+    def _estimate_height(self):
+        """按字体度量估算内容像素高（含中文的行更高，按当前宽度算折行）。"""
+        avail = max(40, (self._width or 400) - 2 * self.PADX)
+        per = max(1, int(avail / max(1.0, self._char_w)))
+        total = 0
+        for line in self.inner.get("1.0", "end-1c").split("\n"):
+            wraps = max(1, -(-len(line) // per))        # 向上取整
+            total += wraps * (self._line_h_cjk if _has_cjk(line) else self._line_h)
+        return max(self._line_h, total)
+
+    def _content_height(self):
+        """代码内容在**当前宽度**下占用的像素高度（算上自动换行）。
+
+        取「字体度量估算」和 Tk 的 -ypixels 里大的那个：
+          - -ypixels 最准（连中文行更高都算进去了），但视野外的行还没被排版，
+            长代码时给的值偏小（块越矮算得越小，反馈环），不能单独信它；
+          - 估算值不随控件高度变化，偏大时只是多留一点空白，绝不会裁掉代码。
+        """
+        est = self._estimate_height()
+        try:
+            if self.inner.winfo_ismapped() and self.inner.winfo_width() > 20:
+                n = self.inner.count("1.0", "end-1c", "ypixels")
+                n = n[0] if isinstance(n, (tuple, list)) else n
+                if n:
+                    est = max(est, int(n))
+        except Exception:
+            pass
+        return est
+
+    def fit(self):
+        """按代码实际占用的高度自适应，超过 MAX_H 就定在 MAX_H（改为内部滚动）。"""
+        content = self._content_height()
+        # 该不该出滚动条只看「内容高过上限没有」：Tk 的 yview 比例在内容正好装下时
+        # 也可能给个 0.83 之类的值（末尾空行的算法），拿它判断会误判、误显示。
+        self._scrolls = content > self.MAX_H + 1
+        self._body_h = min(content, self.MAX_H) + 2 * self.PADY
+        want = self.HEADER_H + 1 + self._body_h
+        try:
+            if abs(int(self.cget("height")) - want) > 1:
+                self.configure(height=want)
+        except Exception:
+            pass
+        self._sync_scrollbar()
+
+    def _on_yscroll(self, first, last):
+        """Tk 通报 yview 变化：按「内容有没有超过 MAX_H」决定右侧细滚动条显不显示。
+
+        不能直接把滚动条挂成 yscrollcommand：Tk 在内容正好装下时也会给个
+        0.83 之类的比例（末尾空行的算法），只按比例判断会误显示滚动条。
+        """
+        try:
+            self._sb_view = (float(first), float(last))
+        except Exception:
+            self._sb_view = (0.0, 1.0)
+        if not getattr(self, "_scrolls", False):
+            if self.sb.winfo_manager():
+                self.sb.place_forget()
+            return
+        self.sb.sync(*self._sb_view)
+
+    def _sync_scrollbar(self):
+        """让滚动条按当前状态刷新一次（内容超出才出现）。"""
+        if not getattr(self, "_scrolls", False):
+            try:
+                if self.sb.winfo_manager():
+                    self.sb.place_forget()
+            except Exception:
+                pass
+            return
+        try:
+            self.sb.sync(*self.inner.yview())
+        except Exception:
+            pass
+
+
 class NotesApp:
     ROW_H = 66
 
@@ -1201,13 +2679,30 @@ class NotesApp:
         self.data["folders"] = [f for f in self.data["folders"] if f["id"] != "f_mac"]
         if self.data.get("current_folder") == "f_mac":
             self.data["current_folder"] = "f_all"
-        # 兼容旧数据：确保“星标备忘录”智能文件夹存在
+        # 兼容旧数据：确保“星标笔记”智能文件夹存在
         if not any(f["id"] == "f_star" for f in self.data["folders"]):
-            self.data["folders"].insert(1, {"id": "f_star", "name": "星标备忘录", "smart": True})
+            self.data["folders"].insert(1, {"id": "f_star", "name": "星标笔记", "smart": True})
+            save_data(self.data)
+        # 兼容旧数据：两个内置智能文件夹的显示名统一成“笔记”（老库里叫“全部备忘录/星标备忘录”）
+        _renamed = False
+        for f in self.data["folders"]:
+            if f.get("smart") and f["id"] in ("f_all", "f_star"):
+                want = "全部笔记" if f["id"] == "f_all" else "星标笔记"
+                if f.get("name") != want:
+                    f["name"] = want
+                    _renamed = True
+        if _renamed:
+            save_data(self.data)
+        # 兼容旧数据：应用内置的示例笔记随应用改名（标题整串等于示例标题才认，
+        # 用户自己改过标题的笔记不动）；顺带把正文里的“备忘录”措辞统一成“笔记”
+        if _fix_sample_note(self.data):
             save_data(self.data)
         # 配色：优先 WorkBuddy 皮肤（PALETTE），解析失败时 PALETTE 即内置浅灰 LIGHT
         self.pal = PALETTE
         self._checks = []
+        self._codes = []          # 正文里的代码块（换笔记时连同 Text 里的窗口一起销毁）
+        self._code_family = None
+        self._code_btn = None
         self._active_title = self._active_preview = self._active_date = None
         self.fmt_buttons = []
         self._star_buttons = {}
@@ -1220,7 +2715,7 @@ class NotesApp:
         self._drag = None
         self._drag_win = None
         self._drag_target = None
-        # 多选状态：文件夹 / 备忘录（Shift 区间、Ctrl 切换）
+        # 多选状态：文件夹 / 笔记（Shift 区间、Ctrl 切换）
         self._folder_sel = set()
         self._folder_anchor = None
         self._note_sel = set()
@@ -1232,6 +2727,10 @@ class NotesApp:
         self._tool_x = 0
         self._marquee = {}
         self._font_cache = {}      # 测量用字体（绑定本实例的 Tk 解释器）
+        # 布局事务：折叠/展开这类「一改牵动全身」的操作期间抑制各处 Configure 联动，
+        # 先一次性算完几何再统一刷新，避免中间态来回重排、重绘出可见的顿挫
+        self._layout_txn = False
+        self._vscroll_place_fn = None    # 编辑区滚动条重新定位（事务结束后统一调一次）
         # 延时任务登记表：主窗口销毁时统一取消，否则 Tk 会打印 invalid command name
         self._alive = True
         self._after_jobs = set()
@@ -1320,7 +2819,7 @@ class NotesApp:
         return plain_of(n)
 
     def _lines(self, n):
-        """把笔记内容按换行拆成多行（待办框记作一个空格）。"""
+        """把笔记内容按换行拆成多行（待办框记作一个空格，代码块按自己的换行拆）。"""
         lines = [""]
         for it in n["content"]:
             if it[0] == "t":
@@ -1331,12 +2830,18 @@ class NotesApp:
                         lines[-1] += ch
             elif it[0] == "w":
                 lines[-1] += " "
+            elif it[0] == "code":
+                for ch in (it[2] if len(it) > 2 else ""):
+                    if ch == "\n":
+                        lines.append("")
+                    else:
+                        lines[-1] += ch
         return lines
 
     def title_of(self, n):
         lines = self._lines(n)
         t = (lines[0] if lines else "").strip()
-        return t or "新建备忘录"
+        return t or "新建笔记"
 
     def preview_of(self, n):
         lines = self._lines(n)
@@ -1364,7 +2869,7 @@ class NotesApp:
 
     # ---------- UI ----------
     def _build_ui(self):
-        self.root.title("备忘录")
+        self.root.title(APP_NAME)
         self.root.geometry("1080x700")
         self.root.minsize(820, 540)
         try:
@@ -1377,14 +2882,16 @@ class NotesApp:
         # 顶部栏
         self.top = tk.Frame(self.root, height=46, bg=self.pal["top"])
         self.top.pack(fill=tk.X)
-        # 搜索框：自绘圆角底 + 放大镜图标，宽度与备忘录列表列宽对齐
+        # 搜索框：自绘圆角底 + 放大镜图标，宽度与下方「文件夹栏 + 笔记列表」两栏对齐
         self.search_canvas = tk.Canvas(self.top, width=SEARCH_W, height=32, bd=0,
                                        highlightthickness=0, bg=self.pal["top"])
-        self.search_canvas.pack(side=tk.LEFT, padx=14, pady=7)
+        self.search_canvas.pack(side=tk.LEFT, padx=(COLLAPSE_W, 0), pady=7)
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *a: self.refresh_notes())
         self.search_ent = tk.Entry(self.search_canvas, textvariable=self.search_var, bd=0,
                                    bg=self.pal["list"], fg=self.pal["text"],
+                                   selectbackground=self.pal.get("sel", "#cfe0fb"),
+                                   selectforeground=_sel_fg(self.pal),
                                    font=(FONT[0], 12), insertbackground=self.pal["accent"])
         # 占位文字：真实 Label（为什么不用画布文字图元，见 _style_search_box 注释）
         self.search_ph_lbl = tk.Label(self.search_canvas, text="搜索",
@@ -1400,7 +2907,7 @@ class NotesApp:
         self.search_ent.bind("<FocusOut>", lambda e: self._update_search_ph())
         self.search_var.trace_add("write", lambda *a: self._update_search_ph())
         # 主操作按钮：实心强调色圆角胶囊，hover/press 向深绿递进（不再闪系统灰）
-        self.new_btn = RoundButton(self.top, self.pal, "新建备忘录",
+        self.new_btn = RoundButton(self.top, self.pal, "新建笔记",
                                    command=self.new_note, font=(FONT[0], 12, "bold"),
                                    primary=True, padx=14, pady=7)
         self.new_btn.pack(side=tk.RIGHT, padx=10)
@@ -1415,8 +2922,8 @@ class NotesApp:
         body = tk.Frame(self.root, bg=self.pal["top"])
         body.pack(fill=tk.BOTH, expand=True)
 
-        # 最左缘：列表折叠条（点击收起/展开「文件夹 + 备忘录列表」，编辑区随之撑开）
-        self.collapse_bar = tk.Frame(body, width=16, bg=self.pal["side"])
+        # 最左缘：列表折叠条（点击收起/展开「文件夹 + 笔记列表」，编辑区随之撑开）
+        self.collapse_bar = tk.Frame(body, width=COLLAPSE_W, bg=self.pal["side"])
         self.collapse_bar.pack(side=tk.LEFT, fill=tk.Y)
         self.collapse_bar.pack_propagate(False)
         self.collapse_btn = CollapseButton(self.collapse_bar, self.pal,
@@ -1425,7 +2932,7 @@ class NotesApp:
         self._lists_collapsed = False
 
         # 左：文件夹
-        self.side = tk.Frame(body, width=216, bg=self.pal["side"])
+        self.side = tk.Frame(body, width=SIDEBAR_W, bg=self.pal["side"])
         self.side.pack(side=tk.LEFT, fill=tk.Y)
         self.side.pack_propagate(False)
         # 左栏标题行：左边「文件夹」，右边显示文件夹总数
@@ -1455,14 +2962,15 @@ class NotesApp:
         df.bind_events()
         self.folder_action_buttons = [nf, df]
 
-        # 中：备忘录列表（列间硬竖线分隔，直角硬朗）
+        # 中：笔记列表（列间硬竖线分隔，直角硬朗）
         self._vsep1 = tk.Frame(body, width=1, bg=self.pal["line"])
         self._vsep1.pack(side=tk.LEFT, fill=tk.Y)
-        self.list_frame = tk.Frame(body, width=300)
+        self.list_frame = tk.Frame(body, width=LIST_W)
         self.list_frame.pack(side=tk.LEFT, fill=tk.Y)
         self.list_frame.pack_propagate(False)
-        # 列宽变化时让顶部搜索框跟着对齐（当前固定 300，这里是兜底同步）
+        # 列宽变化时让顶部搜索框跟着对齐（宽度 = 文件夹列 + 分隔线 + 列表列）
         self.list_frame.bind("<Configure>", lambda e: self._sync_search_width(), add="+")
+        self.side.bind("<Configure>", lambda e: self._sync_search_width(), add="+")
         self.mid_head = tk.Label(self.list_frame, anchor="w", font=(FONT[0], 12, "bold"))
         self.mid_head.pack(fill=tk.X, padx=16, pady=(7, 4))
         self.note_panel = ScrollPanel(self.list_frame, self.pal["list"], self.pal)
@@ -1482,30 +2990,112 @@ class NotesApp:
         self._tool_bottom = tk.Frame(self.editor_frame, height=1, bg=self.pal["line"])
         self._tool_bottom.pack(fill=tk.X)
 
-        self.text = tk.Text(self.editor_frame, bd=0, padx=34, pady=22, wrap=tk.WORD,
+        self.text = tk.Text(self.editor_frame, bd=0, padx=TEXT_PADX, pady=22, wrap=tk.WORD,
                             undo=True, font=(FONT[0], self.body_size), spacing1=4, spacing3=4,
                             highlightthickness=0, insertbackground=self.pal["accent"],
                             selectbackground=self.pal.get("sel", "#cfe0fb"),
                             inactiveselectbackground=self.pal.get("sel2", "#e0e9f7"),
-                            selectforeground="", exportselection=False)
+                            selectforeground=_sel_fg(self.pal), exportselection=False)
         self.text.pack(fill=tk.BOTH, expand=True)
         self._config_tags()
         self.text.bind("<<Modified>>", self.on_edit)
         self.text.config(state=tk.DISABLED)
         self.text.bind("<Return>", self._editor_return)
+        # 编辑区宽度变化 → 代码块重新对齐宽度并重算高度（否则换行行数会算错）
+        self.text.bind("<Configure>", lambda e: self._sync_code_width(), add="+")
         sy = tk.Scrollbar(self.editor_frame, command=self.text.yview)
         self._place_vscroll(sy)
-        self.text.config(yscrollcommand=sy.set)
+        self._vscroll = sy
+        # 正文滚动时同步滚动条 + 浮动导航（回顶部/回底部）的显隐与可用端
+        self.text.config(yscrollcommand=self._on_text_scroll)
+        # 右侧居中的浮动导航：浮在正文之上，只在这篇能滚时才出现
+        self.jump_nav = ScrollJumpNav(self.editor_frame, self.pal,
+                                      command=self._jump_scroll, base=self.pal["editor"])
+        self._jump_placed = False
+        self._jump_job = None
+        self._sync_jump_nav()
+
+    def _on_text_scroll(self, first, last):
+        """Text 的 yscrollcommand 钩子：滚动条照旧，顺带更新浮动导航。"""
+        try:
+            self._vscroll.set(first, last)
+        except Exception:
+            pass
+        self._sync_jump_nav(float(first), float(last))
+
+    def _sync_jump_nav(self, first=None, last=None):
+        """正文能滚才显示右侧浮动导航；已经到顶/到底的那一头变淡、点了不动。"""
+        if not hasattr(self, "jump_nav"):
+            return
+        if self._layout_txn:      # 事务期间不联动，结束后统一刷
+            return
+        try:
+            if first is None:
+                first, last = self.text.yview()
+            overflow = (float(last) - float(first)) < 0.999
+        except Exception:
+            return
+        if not overflow:
+            if self._jump_placed:
+                self.jump_nav.place_forget()
+                self._jump_placed = False
+            return
+        if not self._jump_placed:
+            # 右侧垂直居中，落在竖向滚动条左边一点，别压住滚动条
+            self.jump_nav.place(relx=1.0, rely=0.5, anchor="e",
+                                x=-(int(self._vscroll.winfo_reqwidth()) + JUMP_GAP))
+            # 浮在正文之上（Canvas 的 lift 被重定向到 tag_raise，这里要走窗口层级的 raise）
+            tk.Misc.lift(self.jump_nav)
+            self._jump_placed = True
+        self.jump_nav.set_ends(float(first) > 0.001, float(last) < 0.999)
+
+    def _jump_scroll(self, part):
+        """平滑滚到顶部/底部（约 0.15s 缓出），比瞬间跳过去更容易看清落点。"""
+        try:
+            first, _last = self.text.yview()
+            first = float(first)
+        except Exception:
+            return
+        target = 0.0 if part == "top" else 1.0
+        if abs(target - first) < 0.002:
+            return
+        if self._jump_job is not None:       # 连点：丢弃上一段动画
+            self._cancel_after(self._jump_job)
+            self._jump_job = None
+        steps = 9
+        seq = []
+        for i in range(1, steps + 1):
+            t = i / float(steps)
+            ease = 1 - (1 - t) ** 3           # 缓出：起步快、落点稳
+            seq.append(first + (target - first) * ease)
+        seq[-1] = target
+
+        def step(i=[0]):
+            self._jump_job = None
+            if i[0] >= len(seq):
+                return
+            try:
+                self.text.yview_moveto(seq[i[0]])
+            except Exception:
+                return
+            i[0] += 1
+            if i[0] < len(seq):
+                self._jump_job = self._after(16, step)
+
+        step()
 
     def _place_vscroll(self, sy):
         """编辑区竖向滚动条从工具栏下缘开始（原先是整列高度，会压住工具栏右端的滑动箭头）。"""
         def place(_e=None):
+            if self._layout_txn:   # 事务期间跳过，事务结束后统一调一次
+                return
             try:
                 h = self.editor_frame.winfo_height() - (TOOLBAR_H + 1)
             except Exception:
                 return
             if h > 40:
                 sy.place(relx=1.0, y=TOOLBAR_H + 1, width=17, height=h, anchor="ne")
+        self._vscroll_place_fn = place
         self.editor_frame.bind("<Configure>", place, add="+")
         place()
 
@@ -1526,8 +3116,9 @@ class NotesApp:
         W, H = int(float(c["width"])), int(float(c["height"]))
         c.delete("all")
         # 圆角底：fill 与 Entry 同色 → 输入框与底无缝；描边用分隔线色
-        c.create_polygon(_round_rect_points(1, 1, W - 1, H - 1, 9, 6),
-                         fill=p["list"], outline=p["line"], width=1)
+        self._search_bg_item = c.create_polygon(
+            _round_rect_points(1, 1, W - 1, H - 1, 9, 6),
+            fill=p["list"], outline=p["line"], width=1)
         # 放大镜：圆环 + 右下手柄（Tk 不能用 emoji 字符，直接画）
         icx, icy, r = 19, 14, 5.5
         c.create_oval(icx - r, icy - r, icx + r, icy + r,
@@ -1540,6 +3131,21 @@ class NotesApp:
         self.search_ent.place(in_=c, x=42, rely=0.5, anchor="w", width=W - 56)
         # 占位文字跟随换色；可见性（place/place_forget）交给 _update_search_ph
         self.search_ph_lbl.configure(bg=p["list"], fg=p["soft"])
+        self._update_search_ph()
+
+    def _resize_search_box(self):
+        """只按新宽度更新圆角底与输入框：不 delete/重建图元，避免搜索框重绘时闪一下。
+
+        与 _style_search_box 的区别：那个负责首次绘制和换肤（颜色变了必须重画），
+        这个只处理列宽变化（形状和配色都不变，改坐标就够）。
+        """
+        c = self.search_canvas
+        W = int(float(c["width"]))
+        H = int(float(c["height"]))
+        item = getattr(self, "_search_bg_item", None)
+        if item:
+            c.coords(item, *_round_rect_points(1, 1, W - 1, H - 1, 9, 6))
+        self.search_ent.place_configure(x=42, rely=0.5, anchor="w", width=W - 56)
         self._update_search_ph()
 
     def _update_search_ph(self):
@@ -1560,34 +3166,67 @@ class NotesApp:
             pass
 
     def _sync_search_width(self):
-        """搜索框宽度跟随备忘录列表列宽（列表是固定 300，这里只是跟随兜底）。"""
+        """搜索框宽度对齐左侧两栏（文件夹列 + 分隔线 + 笔记列表列）。
+
+        展开时宽度取两栏实际宽度之和；折叠时两栏被 pack_forget，退化为
+        单列宽度（LIST_W），避免搜索框缩成一条线。
+        """
+        if self._layout_txn:      # 事务期间不联动，结束后由 _end_layout_txn 统一刷
+            return
         try:
-            w = self.list_frame.winfo_width()
+            if self._lists_collapsed:
+                w = LIST_W
+            else:
+                w = self._widget_width(self.side) + self._widget_width(self._vsep1) \
+                    + self._widget_width(self.list_frame)
             if w > 50 and abs(w - self.search_canvas.winfo_width()) > 1:
                 self.search_canvas.configure(width=w)
-                self._style_search_box()
+                # 只改宽度：复用已有图元移动/改宽即可，重建图元会看到搜索框闪一下
+                self._resize_search_box()
         except Exception:
             pass
 
+    @staticmethod
+    def _widget_width(widget):
+        """取控件实际宽度，尚未布局完成时退回请求宽度。"""
+        w = widget.winfo_width()
+        return w if w > 1 else widget.winfo_reqwidth()
+
     # ---------- 列表折叠 / 展开 ----------
     def toggle_lists(self):
-        """收起/展开「文件夹栏 + 备忘录列表」两栏，编辑区随之向左撑开或还原。
+        """收起/展开「文件夹栏 + 笔记列表」两栏，编辑区随之向左撑开或还原。
 
-        折叠后左侧只剩窗口最左缘的细条（箭头变向右），点它恢复原状。
+        一次折叠会牵动整行：编辑区变宽 → 正文重新换行、工具栏重算箭头、搜索框跟着
+        缩。这些联动若各自在中间的半成品宽高上跑一遍，就会看到「停一下再跳」。
+        所以这里开一个布局事务：事务期间抑制各处 Configure 联动，先让 Tk 把几何
+        一次算完，再统一刷新，最后一次性画出最终状态 —— 全程只重排、只重绘一次。
         """
         self._lists_collapsed = not self._lists_collapsed
-        if self._lists_collapsed:
-            self.side.pack_forget()
-            self._vsep1.pack_forget()
-            self.list_frame.pack_forget()
-        else:
-            # 按原顺序插回 _vsep2 之前：side | 竖线 | 列表
-            self.side.pack(side=tk.LEFT, fill=tk.Y, before=self._vsep2)
-            self._vsep1.pack(side=tk.LEFT, fill=tk.Y, before=self._vsep2)
-            self.list_frame.pack(side=tk.LEFT, fill=tk.Y, before=self._vsep2)
-            self._sync_search_width()
-        # 收起后箭头朝右（点它展开），展开时朝左（点它收起）
-        self.collapse_btn.set_dir(1 if self._lists_collapsed else -1)
+        self._layout_txn = True
+        try:
+            if self._lists_collapsed:
+                self.side.pack_forget()
+                self._vsep1.pack_forget()
+                self.list_frame.pack_forget()
+            else:
+                # 按原顺序插回 _vsep2 之前：side | 竖线 | 列表
+                self.side.pack(side=tk.LEFT, fill=tk.Y, before=self._vsep2)
+                self._vsep1.pack(side=tk.LEFT, fill=tk.Y, before=self._vsep2)
+                self.list_frame.pack(side=tk.LEFT, fill=tk.Y, before=self._vsep2)
+            # 收起后箭头朝右（点它展开），展开时朝左（点它收起）
+            self.collapse_btn.set_dir(1 if self._lists_collapsed else -1)
+            # 事务内：只结算几何，Configure 联动被抑制，不会产生中间态重排
+            self.root.update_idletasks()
+        finally:
+            self._layout_txn = False
+        # 统一刷新：搜索框宽度 / 工具栏箭头显隐 / 编辑区滚动条位置 / 浮动回顶回底按钮
+        self._sync_search_width()
+        self._sync_toolbar()
+        if self._vscroll_place_fn:
+            self._vscroll_place_fn()
+        self._sync_jump_nav()
+        # 一次性把最终状态画出来，点击返回时画面已经是收好的样子
+        self.root.update_idletasks()
 
     # ---------- 应用图标 ----------
     def _set_app_icon(self):
@@ -1662,6 +3301,8 @@ class NotesApp:
         self._mk_fmt(self.tool_inner, TRI_MARK.strip() + " 三角", self.insert_triangle)
         # 待办放在三角之后
         self._mk_fmt(self.tool_inner, "☑ 待办", self.insert_check)
+        # 代码块紧跟在待办之后（点开选语言）
+        self._mk_code_ui(self.tool_inner)
         self._sep(self.tool_inner)
         self._mk_font_ui(self.tool_inner)
         self._mk_color_ui(self.tool_inner)
@@ -1697,6 +3338,8 @@ class NotesApp:
 
     def _sync_toolbar(self):
         """内容溢出才显示箭头；已滑到最左/最右时隐藏对应箭头。"""
+        if self._layout_txn:      # 事务期间不联动，结束后由 _end_layout_txn 统一刷
+            return
         try:
             total, view, cur = self._toolbar_metrics()
         except Exception:
@@ -1741,8 +3384,10 @@ class NotesApp:
         self.folder_panel.configure(bg=p["side"])
         self.folder_panel.canvas.configure(bg=p["side"])
         self.folder_panel.inner.configure(bg=p["side"])
+        self.folder_panel.sb.apply_theme(p, p["side"])
         self.note_panel.canvas.configure(bg=p["list"])
         self.note_panel.inner.configure(bg=p["list"])
+        self.note_panel.sb.apply_theme(p, p["list"])
         # 左栏标题与文件夹总数
         self.folder_head_label.configure(bg=p["side"], fg=p["soft"])
         self.folder_total_label.configure(bg=p["side"], fg=p["soft"])
@@ -1753,6 +3398,8 @@ class NotesApp:
         # 列表折叠条与按钮
         self.collapse_bar.configure(bg=p["side"])
         self.collapse_btn.apply_theme(p, base=p["side"])
+        # 编辑区右侧浮动导航（回顶部 / 回底部）
+        self.jump_nav.apply_theme(p, base=p["editor"])
         self.new_btn.apply_theme(p)
         self.settings_btn.apply_theme(p)
         # 工具栏：外层条 / 滚动画布 / 内层 / 两端箭头 / 内部分隔线 / 底部分割线 统一跟随皮肤
@@ -1771,12 +3418,17 @@ class NotesApp:
         self.text.configure(bg=p["editor"], fg=p["text"], insertbackground=p["accent"],
                              selectbackground=p.get("sel", "#cfe0fb"),
                              inactiveselectbackground=p.get("sel2", "#e0e9f7"),
-                             selectforeground="")
+                             selectforeground=_sel_fg(p))
         self._config_tags()
         for cb in self._checks:
             try:
                 cb.config(bg=p["editor"])
                 cb._draw()
+            except Exception:
+                pass
+        for blk in self._codes:
+            try:
+                blk.apply_theme(p)
             except Exception:
                 pass
         for b in self.fmt_buttons:
@@ -1831,23 +3483,30 @@ class NotesApp:
                 pass
 
     # ---------- 全局设置：正文字号 ----------
-    BODY_SIZES = [11, 12, 13, 14, 16, 18, 20]
 
     def _read_body_size(self):
         try:
             sz = int(self.data.get("settings", {}).get("body_size", 12))
         except Exception:
             sz = 12
-        return min(40, max(8, sz))
+        return min(25, max(8, sz))
 
     def _apply_body_size(self, size):
         """套用全局正文字号：编辑器默认字体 + 正文/加粗/斜体/标题标签一起缩放。
 
         标签字号改了，已存在于文本里的这些标签会自动跟着变（Tk tag_configure 即时生效）。
         """
-        self.body_size = min(40, max(8, int(size)))
+        self.body_size = min(25, max(8, int(size)))
         self.text.configure(font=(FONT[0], self.body_size))
         self._config_tags()
+        # 代码块字号跟着正文缩放（比正文小 1 号），高度需按新字号重算
+        for blk in self._codes:
+            try:
+                blk.apply_size(max(9, self.body_size - 1))
+            except Exception:
+                pass
+        # 字号变了 → 正文高度变了，浮动导航的显隐/可用端跟着重算
+        self._sync_jump_nav()
 
     def _save_body_size(self, size):
         self.data.setdefault("settings", {})["body_size"] = int(size)
@@ -1864,30 +3523,35 @@ class NotesApp:
         dlg.configure(bg=p["editor"])
         tk.Label(dlg, text="全局设置", bg=p["editor"], fg=p["text"],
                  font=(FONT[0], 13, "bold")).pack(anchor="w", padx=20, pady=(16, 2))
-        tk.Label(dlg, text="正文字体大小（对所有备忘录的正文、加粗、斜体、标题生效）",
+        tk.Label(dlg, text="正文字体大小（对所有笔记的正文、加粗、斜体、标题生效）",
                  bg=p["editor"], fg=p["soft"], font=(FONT[0], 11)).pack(anchor="w", padx=20)
 
         cur = tk.IntVar(value=self.body_size)
 
-        def preview():
+        def preview(_v=None):
             sample.configure(font=(FONT[0], int(cur.get())))
-            # 预览换行后内容会变高：重新适配窗口高度并保持居中，
-            # 否则固定高度的窗口会把底部确定/取消按钮挤出画面
-            self._center_dialog(dlg, min_w=380)
 
-        # 字号单选：自绘圆角胶囊行（原生 Radiobutton 方框勾太丑，且和整体圆角语言不搭）
-        picker = SizePicker(dlg, p, self.BODY_SIZES, cur, command=preview,
-                            font=(FONT[0], 12))
-        picker.pack(anchor="w", padx=16, pady=(12, 4))
+        # 字号滑杆：8–25pt 连续步进，拖动时气泡显示当前值
+        # 画布本身固定 340 宽，靠 anchor="center" 整体水平居中（轨道、滑钮、
+        # 右上角 pt 数值、两端 8/25 标签都跟着居中，不再缩在左侧）
+        slider = FontSizeSlider(dlg, p, cur, minimum=8, maximum=25,
+                                command=preview, width=340)
+        slider.pack(anchor="center", pady=(12, 2))
 
-        # 预览盒用 wraplength 兜住宽度：字号选再大也只是自动换行，
-        # 不会把对话框撑成超宽、让底部按钮在超宽对话框里显得被压扁
-        box = tk.Frame(dlg, bg=p["hover"], bd=1, relief=tk.SOLID)
+        # 预览盒按最大字号 25pt 一次性算好宽高并锁死：
+        # 文字始终单行、盒高固定，滑动字号时对话框不会变宽变高（不抖动）
+        import tkinter.font as _tf
+        _max_font = _tf.Font(family=FONT[0], size=25)
+        _sample_text = "正文预览：笔记内容 Abc"
+        _sample_w = _max_font.measure(_sample_text)
+        box = tk.Frame(dlg, bg=p["hover"], bd=1, relief=tk.SOLID,
+                       height=_max_font.metrics("linespace") + 16)
         box.pack(fill=tk.X, padx=20, pady=(8, 4))
-        sample = tk.Label(box, text="正文预览：备忘录内容 Abc 123", bg=p["hover"],
+        box.pack_propagate(False)
+        sample = tk.Label(box, text=_sample_text, bg=p["hover"],
                           fg=p["text"], anchor="w", justify="left",
-                          wraplength=360, font=(FONT[0], self.body_size))
-        sample.pack(anchor="w", padx=10, pady=8)
+                          font=(FONT[0], self.body_size))
+        sample.pack(side=tk.LEFT, padx=10)
 
         # ---- 数据管理：导出 / 导入 / 清空（清空是危险操作，文字用警示色）----
         tk.Frame(dlg, height=1, bg=p["line"]).pack(fill=tk.X, padx=20, pady=(16, 10))
@@ -1931,7 +3595,7 @@ class NotesApp:
 
         dlg.bind("<Escape>", cancel)
         dlg.protocol("WM_DELETE_WINDOW", cancel)
-        self._center_dialog(dlg, min_w=380)
+        self._center_dialog(dlg, min_w=max(380, _sample_w + 76))
         try:
             dlg.grab_set()
         except Exception:
@@ -1939,10 +3603,10 @@ class NotesApp:
 
     # ---------- 数据管理：导出 / 导入 / 清空 ----------
     def export_data(self):
-        """把文件夹 + 备忘录 + 设置导出成一份 JSON 备份。"""
+        """把文件夹 + 笔记 + 设置导出成一份 JSON 备份。"""
         import datetime
         p = self.pal
-        default = "备忘录备份_%s.json" % datetime.datetime.now().strftime("%Y%m%d-%H%M")
+        default = "%s备份_%s.json" % (APP_NAME, datetime.datetime.now().strftime("%Y%m%d-%H%M"))
         path = filedialog.asksaveasfilename(
             parent=self.root, title="导出备份", defaultextension=".json",
             initialfile=default, initialdir=os.path.expanduser("~"),
@@ -1962,11 +3626,11 @@ class NotesApp:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(snap, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            messagebox.showerror("导出失败", "写入文件失败：\n%s" % e)
+            self._show_error("导出失败", "写入文件失败：\n%s" % e)
             return
-        messagebox.showinfo("导出完成",
-                            "已导出 %d 个文件夹、%d 条备忘录\n%s" %
-                            (len(self.data["folders"]), len(self.data["notes"]), path))
+        self._show_info("导出完成",
+                        "已导出 %d 个文件夹、%d 条笔记\n%s" %
+                        (len(self.data["folders"]), len(self.data["notes"]), path))
 
     def import_data(self):
         """从 JSON 备份导入：可选「覆盖现有数据」或「合并追加」。"""
@@ -1979,12 +3643,12 @@ class NotesApp:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
         except Exception as e:
-            messagebox.showerror("导入失败", "文件无法解析为 JSON：\n%s" % e)
+            self._show_error("导入失败", "文件无法解析为 JSON：\n%s" % e)
             return
         if not isinstance(d, dict) or not isinstance(d.get("folders"), list) \
                 or not isinstance(d.get("notes"), list):
-            messagebox.showerror("导入失败",
-                                 "不是有效的备忘录备份文件（缺少 folders / notes 列表）。")
+            self._show_error("导入失败",
+                             "不是有效的笔记备份文件（缺少 folders / notes 列表）。")
             return
         mode = self._ask_import_mode(len(d["folders"]), len(d["notes"]),
                                      d.get("_exported_at") or "")
@@ -1994,23 +3658,23 @@ class NotesApp:
                else self._merge_import(d))
         store().reset(new)
         self._apply_new_data(new)
-        messagebox.showinfo("导入完成",
-                            "导入方式：%s\n现有 %d 个文件夹、%d 条备忘录" %
-                            ("覆盖" if mode == "overwrite" else "合并",
-                             len(new["folders"]), len(new["notes"])))
+        self._show_info("导入完成",
+                        "导入方式：%s\n现有 %d 个文件夹、%d 条笔记" %
+                        ("覆盖" if mode == "overwrite" else "合并",
+                         len(new["folders"]), len(new["notes"])))
 
     def _ask_import_mode(self, nf, nn, exported_at=""):
         """导入方式选择：覆盖 / 合并 / 取消。"""
         p = self.pal
         win = self._dlg_body("导入数据")
         res = {"v": None}
-        tk.Label(win, text="备份文件内容：%d 个文件夹、%d 条备忘录" % (nf, nn),
+        tk.Label(win, text="备份文件内容：%d 个文件夹、%d 条笔记" % (nf, nn),
                  bg=p["top"], fg=p["text"], font=(FONT[0], 12)).pack(
                      anchor="w", padx=18, pady=(16, 4))
         if exported_at:
             tk.Label(win, text="导出时间：%s" % exported_at, bg=p["top"],
                      fg=p["soft"], font=(FONT[0], 11)).pack(anchor="w", padx=18)
-        tk.Label(win, text="当前数据：%d 个文件夹、%d 条备忘录。请选择导入方式：" %
+        tk.Label(win, text="当前数据：%d 个文件夹、%d 条笔记。请选择导入方式：" %
                  (len(self.data["folders"]), len(self.data["notes"])),
                  bg=p["top"], fg=p["soft"], font=(FONT[0], 11)).pack(
                      anchor="w", padx=18, pady=(6, 2))
@@ -2051,10 +3715,10 @@ class NotesApp:
                    if isinstance(f, dict) and f.get("id") and f.get("name")]
         ids = {f["id"] for f in folders}
         if "f_all" not in ids:
-            folders.insert(0, {"id": "f_all", "name": "全部备忘录", "smart": True})
+            folders.insert(0, {"id": "f_all", "name": "全部笔记", "smart": True})
             ids.add("f_all")
         if "f_star" not in ids:
-            folders.insert(1, {"id": "f_star", "name": "星标备忘录", "smart": True})
+            folders.insert(1, {"id": "f_star", "name": "星标笔记", "smart": True})
             ids.add("f_star")
         if "f_work" not in ids:
             folders.append({"id": "f_work", "name": "工作"})
@@ -2067,7 +3731,7 @@ class NotesApp:
                 continue
             notes.append({
                 "id": n.get("id") or uid(),
-                # 备份里的文件夹若已不存在，落到「工作」，避免备忘录变成孤儿
+                # 备份里的文件夹若已不存在，落到「工作」，避免笔记变成孤儿
                 "folder": n.get("folder") if n.get("folder") in ids else "f_work",
                 "content": n["content"],
                 "pinned": bool(n.get("pinned")),
@@ -2081,7 +3745,7 @@ class NotesApp:
                 "styles": d.get("styles") or self.data.get("styles", {})}
 
     def _merge_import(self, d):
-        """合并：保留现有文件夹/备忘录，追加备份里没有的（id 冲突则生成新 id）。"""
+        """合并：保留现有文件夹/笔记，追加备份里没有的（id 冲突则生成新 id）。"""
         folders = [dict(f) for f in self.data["folders"]]
         by_id = {f["id"]: f for f in folders}
         by_name = {f.get("name"): f for f in folders}
@@ -2128,25 +3792,27 @@ class NotesApp:
                 "styles": self.data.get("styles", {})}
 
     def clear_all_data(self):
-        """清空所有数据并回到初次打开的状态（4 个文件夹 + 示例备忘录）。"""
+        """清空所有数据并回到初次打开的状态（4 个文件夹 + 示例笔记）。"""
         mine = [f for f in self.data["folders"] if not f.get("smart")]
         n_notes = len(self.data["notes"])
-        if not messagebox.askyesno(
+        if not self._ask_confirm(
                 "清空数据",
                 "确定要清空所有数据吗？\n\n"
-                "将删除 %d 个自建文件夹、%d 条备忘录。" % (len(mine), n_notes)):
+                "将删除 %d 个自建文件夹、%d 条笔记。" % (len(mine), n_notes),
+                ok_text="清空", danger=True):
             return
-        if not messagebox.askyesno(
+        if not self._ask_confirm(
                 "再次确认",
                 "这是最后一次确认：\n"
-                "所有备忘录与文件夹都会被永久删除，无法恢复，\n"
+                "所有笔记与文件夹都会被永久删除，无法恢复，\n"
                 "程序会回到初次打开时的状态（4 个文件夹）。\n\n"
-                "确认清空？"):
+                "确认清空？",
+                ok_text="确认清空", danger=True):
             return
         new = seed()
         store().reset(new)
         self._apply_new_data(new)
-        messagebox.showinfo("已完成", "数据已清空，界面已恢复到初始状态。")
+        self._show_info("已完成", "数据已清空，界面已恢复到初始状态。")
 
     def _apply_new_data(self, new):
         """导入/清空后统一收尾：重置选中态、搜索词、重建界面。"""
@@ -2205,7 +3871,7 @@ class NotesApp:
             return
         sel = self.text.tag_ranges("sel")
         if not sel:
-            messagebox.showinfo("提示", "请先选中要设置字体的文字。")
+            self._show_info("提示", "请先选中要设置字体的文字。")
             return
         self.text.config(state=tk.NORMAL)
         a, b = sel[0], sel[1]
@@ -2223,10 +3889,10 @@ class NotesApp:
 
     def _pick_color(self):
         if not self.current_note():
-            messagebox.showinfo("提示", "请先选择一条备忘录。")
+            self._show_info("提示", "请先选择一条笔记。")
             return
         if not self.text.tag_ranges("sel"):
-            messagebox.showinfo("提示", "请先选中要设置颜色的文字。")
+            self._show_info("提示", "请先选中要设置颜色的文字。")
             return
         self._open_color_dialog()
 
@@ -2305,7 +3971,7 @@ class NotesApp:
             return
         sel = self.text.tag_ranges("sel")
         if not sel:
-            messagebox.showinfo("提示", "请先选中要设置颜色的文字。")
+            self._show_info("提示", "请先选中要设置颜色的文字。")
             return
         self.text.config(state=tk.NORMAL)
         a, b = sel[0], sel[1]
@@ -2343,10 +4009,10 @@ class NotesApp:
 
     def _pick_underline_color(self):
         if not self.current_note():
-            messagebox.showinfo("提示", "请先选择一条备忘录。")
+            self._show_info("提示", "请先选择一条笔记。")
             return
         if not self.text.tag_ranges("sel"):
-            messagebox.showinfo("提示", "请先选中要设置下划线颜色的文字。")
+            self._show_info("提示", "请先选中要设置下划线颜色的文字。")
             return
         self._open_color_dialog("选择下划线颜色", self.apply_underline_color)
 
@@ -2356,7 +4022,7 @@ class NotesApp:
             return
         sel = self.text.tag_ranges("sel")
         if not sel:
-            messagebox.showinfo("提示", "请先选中要设置下划线颜色的文字。")
+            self._show_info("提示", "请先选中要设置下划线颜色的文字。")
             return
         self.text.config(state=tk.NORMAL)
         a, b = sel[0], sel[1]
@@ -2365,20 +4031,21 @@ class NotesApp:
         self.mark_modified()
 
     def reset_format(self):
-        """把当前备忘录恢复为默认格式：清空行内样式（加粗/颜色/字体/删除线等），
+        """把当前笔记恢复为默认格式：清空行内样式（加粗/颜色/字体/删除线等），
         但保留行级标签（title/h2/body）——标题仍还原为标题。纯文本与待办框保留。"""
         n = self.current_note()
         if not n:
-            messagebox.showinfo("提示", "请先选择一条备忘录。")
+            self._show_info("提示", "请先选择一条笔记。")
             return
-        if not messagebox.askyesno("还原默认格式",
-                                    "确定将当前备忘录恢复为默认格式吗？\n加粗、颜色、字体、删除线等行内样式会被清除，"
-                                    "标题/正文格式会保留。"):
+        if not self._ask_confirm(
+                "还原默认格式",
+                "确定将当前笔记恢复为默认格式吗？\n加粗、颜色、字体、删除线等行内样式会被清除，"
+                "标题/正文格式会保留。", ok_text="还原"):
             return
-        # 只清除行内样式标签，保留行级标签 title/h2/body
+        # 只清除行内样式标签，保留行级标签 title/h2/body（代码块没有样式标签，跳过）
         keep = {"title", "h2", "body"}
         for it in n["content"]:
-            if len(it) > 2:
+            if len(it) > 2 and it[0] in ("t", "w"):
                 it[2] = [t for t in it[2] if t in keep]
         save_data(self.data)
         self.load_editor()
@@ -2441,7 +4108,7 @@ class NotesApp:
     def _refresh_folder_counts(self):
         """就地刷新左栏每个文件夹的条数。
 
-        新建/删除/移动备忘录时调用：文件夹行不重建（避免闪烁），只改计数文本。
+        新建/删除/移动笔记时调用：文件夹行不重建（避免闪烁），只改计数文本。
         """
         for fid, lbl in list(self._folder_count_labels.items()):
             if lbl is None:
@@ -2639,7 +4306,7 @@ class NotesApp:
         self._refit_and_keep_hover(fid, row, lbl, lambda: self._fit_folder_name(fid))
 
     def _fit_note_title(self, nid):
-        """把备忘录标题按可用像素截断成「…」；空间尚未量出时随后重试。
+        """把笔记标题按可用像素截断成「…」；空间尚未量出时随后重试。
 
         与文件夹名同一套逻辑：标题装在固定宽盒子里，超长被裁掉，右侧的
         星标 / 日期永远不会被挤走。
@@ -2689,9 +4356,9 @@ class NotesApp:
                 hi = mid - 1
         return (s[:lo] + ell) if lo > 0 else ell, True
 
-    # ---------- 跑马灯（文件夹名 / 备忘录标题共用） ----------
+    # ---------- 跑马灯（文件夹名 / 笔记标题共用） ----------
     # 行上约定三个字段：_name_box（固定宽盒子）、_full_name（完整文字）、
-    # _name_clipped（是否已被截断）。滚动表以 key 区分：文件夹用 fid，备忘录用 "n:"+nid。
+    # _name_clipped（是否已被截断）。滚动表以 key 区分：文件夹用 fid，笔记用 "n:"+nid。
 
     def _start_marquee(self, fid):
         """悬停被截断的文件夹名。"""
@@ -2700,7 +4367,7 @@ class NotesApp:
                                lambda: self._fit_folder_name(fid))
 
     def _start_note_marquee(self, nid):
-        """悬停被截断的备忘录标题（与文件夹名同一套滚动实现）。"""
+        """悬停被截断的笔记标题（与文件夹名同一套滚动实现）。"""
         rec = self._rows.get(nid)
         self._start_marquee_at("n:" + nid, (rec or {}).get("row"),
                                (rec or {}).get("tl"),
@@ -2800,7 +4467,7 @@ class NotesApp:
     def _draw_folder_icon(self, c, fid=None):
         """在 18x16 画布上自绘文件夹图标。
 
-        - 智能文件夹：全部备忘录 = 清单三线；星标备忘录 = 五角星（金色）。
+        - 智能文件夹：全部笔记 = 清单三线；星标笔记 = 五角星（金色）。
         - 普通文件夹：圆角双色（白底 + 主题色描边 + 左上小舌，macOS Finder 风）。
           主体用 editor 白而非 sel 浅绿，因为选中行的底色就是 sel，浅绿填充会和行底糊在一起。
         """
@@ -2856,7 +4523,7 @@ class NotesApp:
             return
         self.data["current_folder"] = fid
         self.data["current_note"] = None
-        # 切换文件夹时清空备忘录多选，并就地更新文件夹行高亮，不重建整列 → 避免“全部/星标”闪烁
+        # 切换文件夹时清空笔记多选，并就地更新文件夹行高亮，不重建整列 → 避免“全部/星标”闪烁
         self._note_sel = set()
         self._note_anchor = None
         self._restyle_folders()
@@ -2941,46 +4608,42 @@ class NotesApp:
         self._restyle_folders()
 
     def _sync_folder_sel_to_note(self, nid):
-        """「普通点击」备忘录时：取消文件夹 Shift 多选，并单独选中该备忘录所属的真实文件夹。
+        """「普通点击」笔记时：取消文件夹 Shift 多选，且不切换文件夹视图。
 
-        - 智能文件夹（全部 / 星标）不算真实归属 → 只清掉文件夹多选，保留当前视图。
-        - 归属文件夹与当前不同 → 切过去；select_folder 会重置 current_note / _note_sel，
-          这里把选中态恢复成「只选中刚点的这条」，再统一重绘两侧列表。
-        - 仅由普通点击触发；Shift/Ctrl 多选备忘录时调用会切视图并破坏区间多选，切勿挂上去。
+        - 智能文件夹（全部 / 星标）视图：只清掉文件夹多选，保留当前视图，
+          点哪条笔记都不会跳转到它所属的文件夹。
+        - 普通文件夹视图：同步高亮该文件夹为唯一选中（视图本来就是它，无需切换）。
+        - 仅由普通点击触发；Shift/Ctrl 多选笔记时调用会破坏区间多选，切勿挂上去。
         """
         n = next((x for x in self.data["notes"] if x["id"] == nid), None)
         fid = (n.get("folder") if n else None)
         cur = self.data["current_folder"]
-        if fid and fid not in ("f_all", "f_star"):
-            if cur != fid:
-                self.select_folder(fid)
-                # 切换会清空 current_note / _note_sel，这里恢复，避免选中态丢失
-                self.data["current_note"] = nid
-                self._note_sel = {nid}
-                self._note_anchor = nid
+        if cur in ("f_all", "f_star"):
+            self._folder_sel = set()
+            self._folder_anchor = None
+        elif fid and fid not in ("f_all", "f_star"):
             self._folder_sel = {fid}
             self._folder_anchor = fid
         else:
-            # 备忘录无真实归属（智能文件夹视图）：清掉文件夹多选即可
             self._folder_sel = set()
             self._folder_anchor = None
         # 必须重绘：否则文件夹行的多选高亮会残留在界面上，看起来“没生效”
         self._restyle_folders()
 
     def _delete_folders(self, fids):
-        """批量删除选中的普通文件夹，其中的备忘录一起删除。"""
+        """批量删除选中的普通文件夹，其中的笔记一起删除。"""
         real = [i for i in fids if i not in ("f_all", "f_star")]
         if not real:
-            messagebox.showinfo("提示", "智能文件夹（全部备忘录 / 星标备忘录）不可删除。")
+            self._show_info("提示", "智能文件夹（全部笔记 / 星标笔记）不可删除。")
             return
         realset = set(real)
         cnt = sum(1 for n in self.data["notes"] if n["folder"] in realset)
         if cnt:
-            msg = ("选中的 %d 个文件夹下共有 %d 条备忘录。\n"
-                   "删除后这些备忘录会一起删除，是否继续？" % (len(real), cnt))
+            msg = ("选中的 %d 个文件夹下共有 %d 条笔记。\n"
+                   "删除后这些笔记会一起删除，是否继续？" % (len(real), cnt))
         else:
             msg = "确定删除选中的 %d 个文件夹？" % len(real)
-        if not messagebox.askyesno("删除文件夹", msg):
+        if not self._ask_confirm("删除文件夹", msg, ok_text="删除", danger=True):
             return
         if cnt:
             dropped = {n["id"] for n in self.data["notes"] if n["folder"] in realset}
@@ -2996,99 +4659,20 @@ class NotesApp:
         save_data(self.data)
         self.refresh_all()
 
-    # ---------- 备忘录行 ----------
+    # ---------- 笔记行 ----------
     def refresh_notes(self):
         p = self.pal
         self._star_buttons = {}
         self._rows = {}
         cur = next((f for f in self.data["folders"] if f["id"] == self.data["current_folder"]), None)
-        self.mid_head.configure(text=cur["name"] if cur else "备忘录", fg=p["soft"], bg=p["list"])
+        self.mid_head.configure(text=cur["name"] if cur else "笔记", fg=p["soft"], bg=p["list"])
         self._stop_all_marquee()     # 行即将销毁，先停掉跑马灯计时器
         for w in list(self.note_panel.inner.children.values()):
             w.destroy()
         notes = self.visible_notes()
         self._active_title = self._active_preview = self._active_date = None
         for i, n in enumerate(notes):
-            active = (n["id"] == self.data.get("current_note"))
-            starred = n.get("starred", False)
-            # 行 Frame 用实底色（不能用透明 ""：Windows 下透明 Frame 不会触发父级重绘，
-            # 取消选中时会残留上一次的高亮像素，表现为“背景色没消失”）
-            row_frame_bg = p["sel"] if active else p["list"]
-            child_bg = p["sel"] if active else p["list"]
-            # 圆角悬浮卡片：外层 wrap 负责左右留白与行间距，内层 row 自带圆角背景层
-            wrap = tk.Frame(self.note_panel.inner, bg=p["list"])
-            wrap.pack(fill=tk.X, padx=CARD_PADX, pady=(CARD_GAP if i else 2, 0))
-            row = tk.Frame(wrap, bg=row_frame_bg)
-            row.pack(fill=tk.BOTH, expand=True)
-            row._card_outside = p["list"]
-            row._card = self._card_layer(row, row_frame_bg, p["list"])
-            top = tk.Frame(row, bg=row_frame_bg)
-            top.pack(fill=tk.X, padx=14, pady=(2, 0))
-            # 右侧（星标 + 日期）先 pack：先把宽度占死，标题再长也压不到它
-            right = tk.Frame(top, bg=row_frame_bg)
-            right.pack(side=tk.RIGHT)
-            sb = tk.Button(right, text="★" if starred else "☆",
-                           fg=(p["star"] if starred else p["soft"]),
-                           bg=child_bg, bd=0, relief=tk.FLAT, cursor="hand2",
-                           font=(FONT[0], 17),
-                           activebackground=child_bg, activeforeground=(p["star"] if starred else p["soft"]),
-                           command=lambda nid=n["id"]: self.toggle_star(nid))
-            sb.pack(side=tk.RIGHT, padx=(0, 6))
-            self._star_buttons[n["id"]] = sb
-            dl = tk.Label(right, text=self._date_text(n), bg=child_bg, fg=p["soft"],
-                           anchor="e", font=(FONT[0], 11))
-            dl.pack(side=tk.RIGHT)
-            # 标题装进「固定高度 + 不随内容扩张」的盒子：超长部分被盒子裁掉，
-            # 不会把右侧的星标/日期挤走（与文件夹名同一套做法）
-            t_h = self._measure_font(FONT[0], 13, "bold").metrics("linespace")
-            tl_box = tk.Frame(top, bg=child_bg, height=t_h)
-            tl_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-            tl_box.pack_propagate(False)
-            tl = MarqueeLabel(tl_box, bg=child_bg,
-                              fg=(p["selfg"] if active else p["text"]),
-                              font=(FONT[0], 13, "bold"))
-            tl.set_text(self.title_of(n))
-            tl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-            row._full_name = self.title_of(n)
-            row._name_box = tl_box
-            row._name_clipped = False
-            row._fit_tries = 0
-            prev = self.trunc(self.preview_of(n), 22) or "暂无更多文字"
-            pl = tk.Label(row, text=prev, bg=child_bg, fg=p["soft"], anchor="w",
-                           font=(FONT[0], 12))
-            pl.pack(fill=tk.X, padx=14, pady=(0, 2))
-            if active:
-                self._active_title, self._active_preview, self._active_date = tl, pl, dl
-            self._rows[n["id"]] = {"row": row, "top": top, "right": right,
-                                    "starred": starred, "active": active,
-                                    "tl": tl, "pl": pl, "dl": dl, "sb": sb}
-            row._base_bg = row_frame_bg
-            row.bind("<Enter>", lambda e, r=row, p=p: self._row_hover(r, p["hover"] if r._base_bg != p["sel"] else p["sel"]))
-            row.bind("<Leave>", lambda e, r=row: self._row_hover(r, r._base_bg))
-            # 拖拽移动：按下记录起点，移动超过阈值进入拖拽态，松手落到目标文件夹；
-            # 未超过阈值则视为普通点击 → 选中该备忘录。
-            row.bind("<ButtonPress-1>", lambda e, nid=n["id"]: self._note_press(e, nid))
-            row.bind("<B1-Motion>", lambda e, nid=n["id"]: self._note_motion(e, nid))
-            row.bind("<ButtonRelease-1>", lambda e, nid=n["id"]: self._note_release(e, nid))
-            row.bind("<Button-3>", lambda e, nid=n["id"]: self._popup(e, nid))
-            # 子控件也要绑定拖拽/右键：父级不在子控件的 bindtags 中，事件不会自动冒泡
-            # （背景层 Canvas 同样要绑定，它覆盖了行四周的内边距区域）
-            for w in (top, right, tl_box, tl, dl, pl, row._card):
-                w.bind("<ButtonPress-1>", lambda e, nid=n["id"]: self._note_press(e, nid))
-                w.bind("<B1-Motion>", lambda e, nid=n["id"]: self._note_motion(e, nid))
-                w.bind("<ButtonRelease-1>", lambda e, nid=n["id"]: self._note_release(e, nid))
-                w.bind("<Button-3>", lambda e, nid=n["id"]: self._popup(e, nid))
-            # 悬停标题：被截断过的标题用跑马灯滚动展示完整内容（同文件夹名）
-            for w in (tl_box, tl):
-                w.bind("<Enter>", lambda e, nid=n["id"]: self._start_note_marquee(nid), add="+")
-                # 注意：这里必须用默认参数 nid，不能写 n["id"]——n 是循环变量的
-                # 闭包引用，事件真正触发时它已指向最后一条备忘录，会停错对象。
-                w.bind("<Leave>", lambda e, nid=n["id"]: self._stop_marquee("n:" + nid, restore=True), add="+")
-            # 窗口宽度变化后盒子可用宽度变了 → 重新按像素截断
-            tl_box.bind("<Configure>", lambda e, nid=n["id"]: self._fit_note_title(nid), add="+")
-            # 星标按钮只触发 toggle_star（就地切换，不重建列表、不整页闪烁）；
-            # 若也绑定 select_note，会因「点击→整列重建→按钮被销毁→command 来不及触发」导致无法取消星标。
-            # 卡片之间靠间距分隔，不再插 1px 分割线（分割线会横穿圆角区域的留白）
+            self._make_note_row(n, i, n["id"] == self.data.get("current_note"))
         # 布局完成后按可用像素截断标题（此时盒子宽度才量得出来）
         for n in notes:
             self._after_idle(lambda nid=n["id"]: self._fit_note_title(nid))
@@ -3103,10 +4687,161 @@ class NotesApp:
         # 行重建 = 新控件：指针若正停在某个标题上，收不到 Enter，这里补一次
         self._after(120, self._resume_marquee_under_pointer)
 
+    def _make_note_row(self, n, index, active, before=None):
+        """创建并追加单条笔记行，返回它的外层 wrap。
+
+        与文件夹行（_make_folder_row）同一套思路：新建笔记时只调用这个，把新行
+        插到正确位置，避免整列重建——否则已存在的行被销毁再重建会闪一下。
+        before 给定时插到该控件之前（用于把新笔记放到列表中间）。
+        """
+        p = self.pal
+        starred = n.get("starred", False)
+        # 行 Frame 用实底色（不能用透明 ""：Windows 下透明 Frame 不会触发父级重绘，
+        # 取消选中时会残留上一次的高亮像素，表现为“背景色没消失”）
+        row_frame_bg = p["sel"] if active else p["list"]
+        child_bg = p["sel"] if active else p["list"]
+        # 圆角悬浮卡片：外层 wrap 负责左右留白与行间距，内层 row 自带圆角背景层
+        wrap = tk.Frame(self.note_panel.inner, bg=p["list"])
+        opts = dict(fill=tk.X, padx=CARD_PADX, pady=(CARD_GAP if index else 2, 0))
+        if before is not None:
+            opts["before"] = before
+        wrap.pack(**opts)
+        row = tk.Frame(wrap, bg=row_frame_bg)
+        row.pack(fill=tk.BOTH, expand=True)
+        row._card_outside = p["list"]
+        row._card = self._card_layer(row, row_frame_bg, p["list"])
+        top = tk.Frame(row, bg=row_frame_bg)
+        top.pack(fill=tk.X, padx=14, pady=(2, 0))
+        # 右侧（星标 + 日期）先 pack：先把宽度占死，标题再长也压不到它
+        right = tk.Frame(top, bg=row_frame_bg)
+        right.pack(side=tk.RIGHT)
+        sb = tk.Button(right, text="★" if starred else "☆",
+                       fg=(p["star"] if starred else p["soft"]),
+                       bg=child_bg, bd=0, relief=tk.FLAT, cursor="hand2",
+                       font=(FONT[0], 17),
+                       activebackground=child_bg, activeforeground=(p["star"] if starred else p["soft"]),
+                       command=lambda nid=n["id"]: self.toggle_star(nid))
+        sb.pack(side=tk.RIGHT, padx=(0, 6))
+        self._star_buttons[n["id"]] = sb
+        dl = tk.Label(right, text=self._date_text(n), bg=child_bg, fg=p["soft"],
+                       anchor="e", font=(FONT[0], 11))
+        dl.pack(side=tk.RIGHT)
+        # 标题装进「固定高度 + 不随内容扩张」的盒子：超长部分被盒子裁掉，
+        # 不会把右侧的星标/日期挤走（与文件夹名同一套做法）
+        t_h = self._measure_font(FONT[0], 13, "bold").metrics("linespace")
+        tl_box = tk.Frame(top, bg=child_bg, height=t_h)
+        tl_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        tl_box.pack_propagate(False)
+        tl = MarqueeLabel(tl_box, bg=child_bg,
+                          fg=(p["selfg"] if active else p["text"]),
+                          font=(FONT[0], 13, "bold"))
+        tl.set_text(self.title_of(n))
+        tl.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        row._full_name = self.title_of(n)
+        row._name_box = tl_box
+        row._name_clipped = False
+        row._fit_tries = 0
+        prev = self.trunc(self.preview_of(n), 22) or "暂无更多文字"
+        pl = tk.Label(row, text=prev, bg=child_bg, fg=p["soft"], anchor="w",
+                       font=(FONT[0], 12))
+        pl.pack(fill=tk.X, padx=14, pady=(0, 2))
+        if active:
+            self._active_title, self._active_preview, self._active_date = tl, pl, dl
+        self._rows[n["id"]] = {"row": row, "top": top, "right": right,
+                                "starred": starred, "active": active,
+                                "tl": tl, "pl": pl, "dl": dl, "sb": sb,
+                                "wrap": wrap}
+        row._base_bg = row_frame_bg
+        row.bind("<Enter>", lambda e, r=row, p=p: self._row_hover(r, p["hover"] if r._base_bg != p["sel"] else p["sel"]))
+        row.bind("<Leave>", lambda e, r=row: self._row_hover(r, r._base_bg))
+        # 拖拽移动：按下记录起点，移动超过阈值进入拖拽态，松手落到目标文件夹；
+        # 未超过阈值则视为普通点击 → 选中该笔记。
+        row.bind("<ButtonPress-1>", lambda e, nid=n["id"]: self._note_press(e, nid))
+        row.bind("<B1-Motion>", lambda e, nid=n["id"]: self._note_motion(e, nid))
+        row.bind("<ButtonRelease-1>", lambda e, nid=n["id"]: self._note_release(e, nid))
+        row.bind("<Button-3>", lambda e, nid=n["id"]: self._popup(e, nid))
+        # 子控件也要绑定拖拽/右键：父级不在子控件的 bindtags 中，事件不会自动冒泡
+        # （背景层 Canvas 同样要绑定，它覆盖了行四周的内边距区域）
+        for w in (top, right, tl_box, tl, dl, pl, row._card):
+            w.bind("<ButtonPress-1>", lambda e, nid=n["id"]: self._note_press(e, nid))
+            w.bind("<B1-Motion>", lambda e, nid=n["id"]: self._note_motion(e, nid))
+            w.bind("<ButtonRelease-1>", lambda e, nid=n["id"]: self._note_release(e, nid))
+            w.bind("<Button-3>", lambda e, nid=n["id"]: self._popup(e, nid))
+        # 悬停标题：被截断过的标题用跑马灯滚动展示完整内容（同文件夹名）
+        for w in (tl_box, tl):
+            w.bind("<Enter>", lambda e, nid=n["id"]: self._start_note_marquee(nid), add="+")
+            # 注意：这里必须用默认参数 nid，不能写 n["id"]——n 是循环变量的
+            # 闭包引用，事件真正触发时它已指向最后一条笔记，会停错对象。
+            w.bind("<Leave>", lambda e, nid=n["id"]: self._stop_marquee("n:" + nid, restore=True), add="+")
+        # 窗口宽度变化后盒子可用宽度变了 → 重新按像素截断
+        tl_box.bind("<Configure>", lambda e, nid=n["id"]: self._fit_note_title(nid), add="+")
+        # 星标按钮只触发 toggle_star（就地切换，不重建列表、不整页闪烁）；
+        # 若也绑定 select_note，会因「点击→整列重建→按钮被销毁→command 来不及触发」导致无法取消星标。
+        # 卡片之间靠间距分隔，不再插 1px 分割线（分割线会横穿圆角区域的留白）
+        return wrap
+
+    def _insert_note_row(self, n):
+        """新建笔记时只把新行插到它应在的位置，不重建整列（避免其它行闪烁）。
+
+        位置由 visible_notes() 的排序（置顶 > 星标 > 更新时间）决定；若新笔记
+        因搜索过滤等原因不在可见列表里，则退回整列重建。
+        """
+        notes = self.visible_notes()
+        ids = [x["id"] for x in notes]
+        if n["id"] not in ids:
+            self.refresh_notes()
+            return
+        idx = ids.index(n["id"])
+        before = None
+        if idx + 1 < len(notes):
+            nxt = self._rows.get(notes[idx + 1]["id"])
+            if nxt:
+                before = nxt["wrap"]
+        self._make_note_row(n, idx, True, before=before)
+        # 插到最前面时，原来的首行从「首位小间距」变成「行间距」，同步一下
+        if idx == 0 and len(notes) > 1:
+            nxt = self._rows.get(notes[1]["id"])
+            if nxt:
+                nxt["wrap"].pack_configure(pady=(CARD_GAP, 0))
+        self._after_idle(lambda nid=n["id"]: self._fit_note_title(nid))
+        self.note_panel.inner.update_idletasks()
+        self.note_panel._update()
+        self.note_panel.canvas.after(30, self.note_panel._update)
+        self.note_panel.bind_wheel()
+
+    def _remove_note_rows(self, ids):
+        """就地移除若干笔记行，不重建整列（文件夹行与其余笔记都不闪）。
+
+        只销毁被删笔记自己的 wrap（连同它的跑马灯状态），再把新的首行上间距
+        收回「首位小间距」——否则删掉第一行后，第二行会多出一段行间距。
+        """
+        ids = set(ids)
+        for nid in list(ids):
+            rec = self._rows.pop(nid, None)
+            self._star_buttons.pop(nid, None)
+            self._note_sel.discard(nid)
+            try:
+                self._stop_marquee("n:" + nid)
+            except Exception:
+                pass
+            if rec is not None:
+                try:
+                    rec["wrap"].destroy()
+                except Exception:
+                    pass
+        vis = self.visible_notes()
+        if vis:
+            first = self._rows.get(vis[0]["id"])
+            if first is not None:
+                first["wrap"].pack_configure(pady=(2, 0))
+        self.note_panel.inner.update_idletasks()
+        self.note_panel._update()
+        self.note_panel.bind_wheel()
+
     def select_note(self, nid):
         prev = self.data.get("current_note")
         if prev == nid:
-            # 点中「已是当前项」的备忘录：同样要取消文件夹多选（否则这里直接 return 会漏掉同步）
+            # 点中「已是当前项」的笔记：同样要取消文件夹多选（否则这里直接 return 会漏掉同步）
             self._note_sel = {nid}
             self._note_anchor = nid
             self._sync_folder_sel_to_note(nid)
@@ -3116,12 +4851,12 @@ class NotesApp:
         self.data["current_note"] = nid
         self._note_sel = {nid}
         self._note_anchor = nid
-        # 点单条备忘录：取消文件夹 Shift 多选，单独选中其对应文件夹
+        # 点单条笔记：取消文件夹 Shift 多选，单独选中其对应文件夹
         self._sync_folder_sel_to_note(nid)
         # 先把上一条选中行强制还原为普通底色（防旧高亮残留），再统一刷新当前行
         if prev:
             self._restore_note_row(prev)
-        # 就地高亮当前行，不重建整列 → 避免其它备忘录闪烁
+        # 就地高亮当前行，不重建整列 → 避免其它笔记闪烁
         self._restyle_notes()
         # 空闲时再刷一次（兜底：若后续事件又改动了行背景，这里会按最新状态纠正）
         try:
@@ -3131,7 +4866,7 @@ class NotesApp:
         self.load_editor()
 
     def _restore_note_row(self, nid):
-        """把指定备忘录行就地还原为「未选中」底色（背景 + 文字色），不重建行、不闪烁。"""
+        """把指定笔记行就地还原为「未选中」底色（背景 + 文字色），不重建行、不闪烁。"""
         rec = self._rows.get(nid)
         if not rec:
             return
@@ -3150,7 +4885,7 @@ class NotesApp:
         self._paint_card(rec["row"], p["list"])
 
     def _set_note_active(self, nid):
-        """就地切换备忘录选中态（背景 + 文字色），不销毁重建行。"""
+        """就地切换笔记选中态（背景 + 文字色），不销毁重建行。"""
         p = self.pal
         for rid, rec in self._rows.items():
             is_act = (rid == nid)
@@ -3171,7 +4906,7 @@ class NotesApp:
                 self._active_title, self._active_preview, self._active_date = rec["tl"], rec["pl"], rec["dl"]
 
     def _restyle_notes(self):
-        """统一刷新备忘录行样式：当前(active) > 多选高亮 > 普通；不重建行、不闪烁。"""
+        """统一刷新笔记行样式：当前(active) > 多选高亮 > 普通；不重建行、不闪烁。"""
         p = self.pal
         cur = self.data.get("current_note")
         valid = {n["id"] for n in self.data["notes"]}
@@ -3214,31 +4949,40 @@ class NotesApp:
         else:
             self._note_sel = {nid}
             self._note_anchor = nid
-        # 注意：备忘录自身的 Shift/Ctrl 多选不要同步文件夹。
+        # 注意：笔记自身的 Shift/Ctrl 多选不要同步文件夹。
         # 一旦同步会切换文件夹视图 → 列表重建 → 跨文件夹的选中项被「&= valid」过滤掉，
         # 表现为 Shift 区间多选只剩 1 条。文件夹侧的同步只由「普通点击」触发（见 select_note）。
         self._restyle_notes()
 
     def _delete_notes(self, nids):
-        """批量删除选中的备忘录。"""
+        """批量删除选中的笔记。"""
         if not nids:
             return
-        if not messagebox.askyesno("删除", "确定删除选中的 %d 条备忘录？" % len(nids)):
+        if not self._ask_confirm("删除", "确定删除选中的 %d 条笔记？" % len(nids),
+                                 ok_text="删除", danger=True):
             return
         ids = set(nids)
         self.data["notes"] = [x for x in self.data["notes"] if x["id"] not in ids]
         self._note_sel = set()
         self._note_anchor = None
-        if self.data.get("current_note") in ids:
+        cur_removed = self.data.get("current_note") in ids
+        if cur_removed:
             self.data["current_note"] = None
         save_data(self.data)
-        self.refresh_all()
+        # 只移除被删的行 + 就地刷新计数：文件夹行与其余笔记都不重建 → 不闪烁
+        self._remove_note_rows(ids)
+        if cur_removed:
+            self._active_title = self._active_preview = self._active_date = None
+        self._refresh_folder_counts()
+        self._restyle_notes()
+        if cur_removed:
+            self.load_editor()
 
     def current_note(self):
         nid = self.data.get("current_note")
         return next((n for n in self.data["notes"] if n["id"] == nid), None)
 
-    # ---------- 拖拽移动备忘录到文件夹 ----------
+    # ---------- 拖拽移动笔记到文件夹 ----------
     def _release_stale_grab(self):
         """释放可能残留的局部 grab（只释放我们记录过的那一个控件，不动系统/菜单的 grab）。"""
         gw = getattr(self, "_grab_widget", None)
@@ -3266,7 +5010,7 @@ class NotesApp:
         # 防呆：上一次拖拽若没走完释放流程，会残留局部 grab 占住鼠标事件，导致后续点击全部失效
         self._release_stale_grab()
         self._drag = {"nid": nid, "x": e.x_root, "y": e.y_root, "started": False, "grab": e.widget}
-        # 本地 grab：拖拽过程中即使指针移出备忘录行，也能持续收到 B1-Motion / 释放事件
+        # 本地 grab：拖拽过程中即使指针移出笔记行，也能持续收到 B1-Motion / 释放事件
         try:
             e.widget.grab_set()
             self._grab_widget = e.widget     # 记下来，下次按下时可兜底释放
@@ -3305,21 +5049,21 @@ class NotesApp:
             if fid and fid not in ("f_all", "f_star"):
                 self._move_note_to_folder(nid, fid)
                 moved = True
-        # 关键：只有真正把备忘录拖进了某个文件夹才跳过选中。
+        # 关键：只有真正把笔记拖进了某个文件夹才跳过选中。
         # Shift / Ctrl 多选时：保留已选集合，只把当前笔记同步为编辑器加载对象（不重建多选）
         if (e.state & 0x0001) or (e.state & 0x0004):
             self.data["current_note"] = nid
-            # 备忘录 Shift/Ctrl 多选：只同步编辑器加载对象，保留多选集合、不动文件夹列表
+            # 笔记 Shift/Ctrl 多选：只同步编辑器加载对象，保留多选集合、不动文件夹列表
             self._restyle_notes()
             self.load_editor()
-        # 普通点击 / 拖拽中途松手：视为选中该备忘录
+        # 普通点击 / 拖拽中途松手：视为选中该笔记
         elif not moved:
             self.select_note(nid)
         self._drag = None
 
     def _drag_start(self, nid):
         n = next((x for x in self.data["notes"] if x["id"] == nid), None)
-        title = self.trunc(self.title_of(n) if n else "备忘录", 16)
+        title = self.trunc(self.title_of(n) if n else "笔记", 16)
         dlg = tk.Toplevel(self.root)
         dlg.overrideredirect(True)
         dlg.configure(bg=self.pal["sel"], bd=1, relief=tk.RAISED)
@@ -3409,24 +5153,19 @@ class NotesApp:
             self._note_sel = {nid}
             self._note_anchor = nid
             self._restyle_notes()
-        m = tk.Menu(self.root, tearoff=0, bg=self.pal["list"], fg=self.pal["text"])
+        m = PopupMenu(self.root, self.pal)
         if len(self._note_sel) > 1:
-            m.add_command(label="删除选中的 %d 条备忘录" % len(self._note_sel),
-                          command=lambda: self._delete_notes(list(self._note_sel)))
-            try:
-                m.tk_popup(event.x_root, event.y_root)
-            finally:
-                m.grab_release()
+            m.add("删除选中的 %d 条笔记" % len(self._note_sel), danger=True,
+                  command=lambda: self._delete_notes(list(self._note_sel)))
+            m.popup(event.x_root, event.y_root)
             return
-        m.add_command(label="置顶" if not n["pinned"] else "取消置顶",
-                      command=lambda: self._popup_pin(nid))
-        m.add_command(label="星标" if not n.get("starred", False) else "取消星标",
-                      command=lambda: self.toggle_star(nid))
-        m.add_command(label="删除备忘录", command=lambda: self._popup_delete(nid))
-        try:
-            m.tk_popup(event.x_root, event.y_root)
-        finally:
-            m.grab_release()
+        m.add("置顶" if not n["pinned"] else "取消置顶",
+              command=lambda: self._popup_pin(nid))
+        m.add("星标" if not n.get("starred", False) else "取消星标",
+              command=lambda: self.toggle_star(nid))
+        m.add_separator()
+        m.add("删除笔记", danger=True, command=lambda: self._popup_delete(nid))
+        m.popup(event.x_root, event.y_root)
 
     def _popup_pin(self, nid):
         self.data["current_note"] = nid
@@ -3450,12 +5189,22 @@ class NotesApp:
             except Exception:
                 pass
         self._checks = []
+        for blk in self._codes:
+            try:
+                blk.destroy()
+            except Exception:
+                pass
+        self._codes = []
         self.text.delete("1.0", tk.END)
         n = self.current_note()
         if not n:
             self.text.config(state=tk.DISABLED)
+            self._sync_jump_nav()
             return
         self._render_content(n["content"])
+        # 换一篇就回到开头，浮动导航同步成「一开始只有向下可用」
+        self.text.yview_moveto(0.0)
+        self._after_idle(self._sync_jump_nav)
         self.text.edit_reset()
         self.text.edit_modified(False)
         self.text.config(state=tk.NORMAL)
@@ -3470,6 +5219,9 @@ class NotesApp:
                     self.text.tag_add(tg, "insert-1c", "insert")
             elif it[0] == "w":
                 self._add_checkbutton(checked=bool(it[1]))
+            elif it[0] == "code":
+                self._add_code_block(lang=(it[1] if len(it) > 1 else ""),
+                                     code=(it[2] if len(it) > 2 else ""))
         # 勾选项整行应用 done（删除线 + 变灰），由勾选态派生
         for cb in self._checks:
             if cb.var.get():
@@ -3555,7 +5307,7 @@ class NotesApp:
         self._update_active_row()
 
     def _update_active_row(self):
-        """编辑时只就地更新当前备忘录那一行的标题/预览/时间，避免整列重建导致闪烁。"""
+        """编辑时只就地更新当前笔记那一行的标题/预览/时间，避免整列重建导致闪烁。"""
         n = self.current_note()
         if not n or not self._active_title:
             return
@@ -3585,6 +5337,9 @@ class NotesApp:
                     out.append(["t", ch, sorted(active)])
             elif key == "window":
                 w = self.text.nametowidget(value)
+                if isinstance(w, CodeBlock):
+                    out.append(["code", w.lang, w.snapshot()])
+                    continue
                 checked = bool(w.var.get()) if hasattr(w, "var") else False
                 out.append(["w", checked, sorted(active)])
         return out
@@ -3695,6 +5450,128 @@ class NotesApp:
         self.text.insert(self.text.index(pos_s + " +1c"), " ")
         self.mark_modified()
 
+    # ---------- 代码块 ----------
+    def code_font(self):
+        """代码块的等宽字体与字号：优先系统里装了的第一款等宽字体，字号比正文小 1 号。"""
+        if not self._code_family:
+            fam = FONT[0]
+            try:
+                import tkinter.font as _f
+                avail = set(x.lower() for x in _f.families())
+                for c in CODE_FONTS:
+                    if c.lower() in avail:
+                        fam = c
+                        break
+            except Exception:
+                pass
+            self._code_family = fam
+        return self._code_family, max(9, int(self.body_size) - 1)
+
+    def _code_width(self):
+        """代码块可用宽度：编辑区宽度减去左右留白。
+
+        右侧要按「滚动条 + 间距 + 浮动导航」的实际占位来留（正文只靠默认右留白，
+        文字行看不出边界；代码块有底色和边框，被浮动导航压住会一眼看到）。
+        """
+        w = self.text.winfo_width()
+        if w <= 1:
+            w = self.editor_frame.winfo_width() or 900
+        right = TEXT_PADX
+        try:
+            sb = self._vscroll.winfo_reqwidth() or 12
+            right = max(right, sb + JUMP_GAP + JUMP_W + 6)
+        except Exception:
+            pass
+        return max(120, w - TEXT_PADX - right - 2)
+
+    def _sync_code_width(self, fit=True):
+        """窗口缩放后让每个代码块重新对齐编辑区宽度（并按新宽度重算高度）。"""
+        if not self._codes:
+            return
+        w = self._code_width()
+        for b in list(self._codes):
+            try:
+                if b.winfo_exists():
+                    b.set_width(w, fit=fit)
+            except Exception:
+                pass
+
+    def _mk_code_ui(self, parent):
+        """工具栏的「代码」按钮：点开选语言，选完在光标处插入代码块。"""
+        b = RoundButton(parent, self.pal, "{} 代码 ▾", command=self._pick_code_lang)
+        b.pack(side=tk.LEFT, padx=3, pady=8)
+        b.bind_events()
+        self.fmt_buttons.append(b)
+        self._code_btn = b
+
+    def _pick_code_lang(self):
+        if not self.current_note():
+            self._show_info("提示", "请先选择一条笔记。")
+            return
+        btn = self._code_btn
+        try:
+            if btn is not None and btn.winfo_exists():
+                x = btn.winfo_rootx()
+                y = btn.winfo_rooty() + btn.winfo_height() + 2
+            else:
+                x, y = self.root.winfo_pointerx(), self.root.winfo_pointery()
+        except Exception:
+            return
+        m = PopupMenu(self.root, self.pal)
+        for label, key in CODE_LANGS:
+            m.add(label, command=lambda k=key: self.insert_code(k))
+        m.popup(x, y)
+
+    def insert_code(self, lang=""):
+        """在当前光标处插入一个代码块：整块独占若干行，插好即把光标放进代码里。
+
+        若当前有选中文字，则把选中的内容直接变成代码（免得先删再粘）。
+        """
+        if not self.current_note():
+            self._show_info("提示", "请先选择一条笔记。")
+            return
+        self.text.config(state=tk.NORMAL)
+        picked = ""
+        sel = self.text.tag_ranges("sel")
+        if sel:
+            picked = self.text.get(sel[0], sel[1]).rstrip("\n")
+            self.text.delete(sel[0], sel[1])
+        # 代码块要独占行：光标不在行首时先补个换行，免得和前面的正文挤在同一行
+        if self.text.index("insert").split(".")[1] != "0":
+            self.text.insert(tk.INSERT, "\n")
+        blk = self._add_code_block(lang=lang, code=picked, index=tk.INSERT)
+        self.text.insert(tk.INSERT, "\n")     # 块后留一行，方便继续写正文
+        self.mark_modified()
+        blk.focus_code()
+
+    def _add_code_block(self, lang="", code="", index=tk.END):
+        blk = CodeBlock(self.text, self, lang=lang, code=code)
+        self._codes.append(blk)
+        self.text.window_create(index, window=blk, padx=0, pady=6)
+        # 宽度必须先定：高度是按「这个宽度下代码的实际显示行数」算出来的
+        blk.set_width(self._code_width(), fit=False)
+        self._after_idle(blk.fit)
+        return blk
+
+    def _remove_code_block(self, blk):
+        """删除一个代码块（连同它后面那个换行，免得留下一整行空白）。"""
+        try:
+            idx = self.text.index(blk)
+        except Exception:
+            return
+        self.text.config(state=tk.NORMAL)
+        self.text.delete(idx)          # 删掉嵌入式窗口本身（Tk 会销毁该控件）
+        try:
+            if self.text.get(idx, "%s +1c" % idx) == "\n":
+                self.text.delete(idx)
+        except Exception:
+            pass
+        try:
+            self._codes.remove(blk)
+        except ValueError:
+            pass
+        self.mark_modified()
+
     def insert_numbered(self):
         if not self.current_note():
             return
@@ -3743,11 +5620,14 @@ class NotesApp:
         if first is None:
             return (None, "")
         if first[0] == "window":
+            # 代码块也是 window，但它不是待办：回车交给默认行为（块内换行由代码区自己处理）
+            if isinstance(self._window_at_line_start(ln), CodeBlock):
+                return (None, "")
             return ("check", "")
         txt = first[1]
         if txt.startswith("•  "):
             return ("bullet", "•  ")
-        # 新符号优先；旧符号（存量备忘录）同样识别为三角列表
+        # 新符号优先；旧符号（存量笔记）同样识别为三角列表
         if txt.startswith(TRI_MARK):
             return ("triangle", TRI_MARK)
         if txt.startswith(TRI_MARK_OLD):
@@ -3817,8 +5697,8 @@ class NotesApp:
     # ---------- 操作 ----------
     def new_note(self):
         f = self.data["current_folder"]
-        # 智能文件夹不能当真实归属：在"星标备忘录"下新建时若记成 f_star，
-        # 这条备忘录会不属于任何真实文件夹（只在"全部"里出现），所以一律落到"工作"。
+        # 智能文件夹不能当真实归属：在"星标笔记"下新建时若记成 f_star，
+        # 这条笔记会不属于任何真实文件夹（只在"全部"里出现），所以一律落到"工作"。
         folder = "f_work" if f in ("f_all", "f_mac", "f_star") else f
         import time
         now = time.strftime("%Y-%m-%d", time.localtime())
@@ -3827,17 +5707,23 @@ class NotesApp:
              "pinned": False, "created": time.time() * 1000,
              "updated": time.time() * 1000}
         self.data["notes"].insert(0, n)
-        if f in ("f_all", "f_mac", "f_star"):
+        switched = f in ("f_all", "f_mac", "f_star")
+        if switched:
             self.data["current_folder"] = folder
             self.refresh_folders()
-        # 新建即选中：同时重置多选集合，否则上一条备忘录仍留在 _note_sel 里，
+        # 新建即选中：同时重置多选集合，否则上一条笔记仍留在 _note_sel 里，
         # _restyle_notes 会把它刷成「多选高亮」，看起来就是"旧的没还原、还是选中"。
         self.data["current_note"] = n["id"]
         self._note_sel = {n["id"]}
         self._note_anchor = n["id"]
         save_data(self.data)
-        self.refresh_notes()
-        # 文件夹行未重建，计数不会自动更新 → 就地刷新（否则新备忘录不计入条数）
+        if switched:
+            # 智能文件夹里新建会切换视图（列表内容整体变了）→ 只能整列重建
+            self.refresh_notes()
+        else:
+            # 普通文件夹：只把新行插到队首，其余笔记原地保留，不再整列重建闪烁
+            self._insert_note_row(n)
+        # 文件夹行未重建，计数不会自动更新 → 就地刷新（否则新笔记不计入条数）
         self._refresh_folder_counts()
         self._restyle_notes()
         self.load_editor()
@@ -3848,14 +5734,24 @@ class NotesApp:
     def delete_note(self):
         n = self.current_note()
         if not n:
-            messagebox.showinfo("提示", "请先在中间列表选择一条备忘录。")
+            self._show_info("提示", "请先在中间列表选择一条笔记。")
             return
-        if not messagebox.askyesno("删除", "确定删除这条备忘录？"):
+        if not self._ask_confirm("删除", "确定删除这条笔记？", ok_text="删除", danger=True):
             return
-        self.data["notes"] = [x for x in self.data["notes"] if x["id"] != n["id"]]
+        nid = n["id"]
+        self.data["notes"] = [x for x in self.data["notes"] if x["id"] != nid]
         self.data["current_note"] = None
+        self._note_sel.discard(nid)
         save_data(self.data)
-        self.refresh_all()
+        # 只移除这一行 + 就地刷新计数：文件夹行与其余笔记都不重建 → 不闪烁
+        if nid in self._rows:
+            self._remove_note_rows([nid])
+        else:
+            self.refresh_notes()
+        self._active_title = self._active_preview = self._active_date = None
+        self._refresh_folder_counts()
+        self._restyle_notes()
+        self.load_editor()
 
     def toggle_pin(self):
         n = self.current_note()
@@ -3871,13 +5767,13 @@ class NotesApp:
         n = self.current_note() if nid is None else next(
             (x for x in self.data["notes"] if x["id"] == nid), None)
         if not n:
-            messagebox.showinfo("提示", "请先选择一条备忘录。")
+            self._show_info("提示", "请先选择一条笔记。")
             return
         n["starred"] = not n.get("starred", False)
         save_data(self.data)
         # 就地更新文件夹计数（不重建文件夹行 → 不闪烁）
         self._refresh_folder_counts()
-        # 在“星标备忘录”文件夹下取消星标 → 该条需移出列表，必须重建
+        # 在“星标笔记”文件夹下取消星标 → 该条需移出列表，必须重建
         if self.data["current_folder"] == "f_star" and not n["starred"]:
             self.refresh_notes()
             return
@@ -3895,7 +5791,7 @@ class NotesApp:
         f = {"id": uid(), "name": name.strip()}
         self.data["folders"].append(f)
         save_data(self.data)
-        # 只追加新行，不整列重建 → 已存在的行（全部备忘录/星标…）不会闪烁
+        # 只追加新行，不整列重建 → 已存在的行（全部笔记/星标…）不会闪烁
         self._make_folder_row(f)
         self.folder_panel.inner.update_idletasks()
         self.folder_panel._update()
@@ -3907,15 +5803,26 @@ class NotesApp:
         target = fid or self.data["current_folder"]
         f = next((x for x in self.data["folders"] if x["id"] == target), None)
         if not f or f.get("smart"):
-            messagebox.showinfo("提示", "智能文件夹「全部备忘录 / 星标备忘录」不能删除。")
+            self._show_info("提示", "智能文件夹「全部笔记 / 星标笔记」不能删除。")
             return
         cnt = len(self.folder_notes(f["id"]))
+        # 提示固定两行：名称按可用宽度截断（过长用省略号），避免折出第三行
+        try:
+            fnt = tkfont.Font(family=FONT[0], size=12)
+            def fit(head, tail):
+                return self._ellipsize(
+                    f["name"], DLG_TEXT_W - fnt.measure(head) - fnt.measure(tail), fnt)[0]
+        except Exception:
+            fnt = None
+            def fit(head, tail):
+                return f["name"]
         if cnt:
-            msg = ("文件夹「%s」下有 %d 条备忘录。\n"
-                   "删除文件夹后，这些备忘录会一起删除，是否继续？" % (f["name"], cnt))
+            head, tail = "文件夹「", "」下有 %d 条笔记。" % cnt
+            msg = "%s%s%s\n连同笔记一起删除，是否继续？" % (head, fit(head, tail), tail)
         else:
-            msg = "确定删除文件夹「%s」？" % f["name"]
-        if not messagebox.askyesno("删除文件夹", msg):
+            head, tail = "确定删除文件夹「", "」？"
+            msg = "%s%s%s" % (head, fit(head, tail), tail)
+        if not self._ask_confirm("删除文件夹", msg, ok_text="删除", danger=True):
             return
         if cnt:
             dropped = {n["id"] for n in self.data["notes"] if n["folder"] == f["id"]}
@@ -3958,41 +5865,39 @@ class NotesApp:
             self._folder_sel = {fid}
             self._folder_anchor = fid
             self._restyle_folders()
-        m = tk.Menu(self.root, tearoff=0, bg=self.pal["list"], fg=self.pal["text"])
+        m = PopupMenu(self.root, self.pal)
         if len(self._folder_sel) > 1:
-            m.add_command(label="删除选中的 %d 个文件夹" % len(self._folder_sel),
-                          command=lambda: self._delete_folders(list(self._folder_sel)))
+            m.add("删除选中的 %d 个文件夹" % len(self._folder_sel), danger=True,
+                  command=lambda: self._delete_folders(list(self._folder_sel)))
         else:
-            m.add_command(label="重命名", command=lambda: self.rename_folder(fid))
+            m.add("重命名", command=lambda: self.rename_folder(fid))
             if not f.get("smart"):
-                m.add_command(label="移动备忘录到…", command=lambda: self._move_notes_out(fid))
-                m.add_command(label="删除文件夹", command=lambda: self.del_folder(fid))
+                m.add("移动笔记到…", command=lambda: self._move_notes_out(fid))
+                m.add_separator()
+                m.add("删除文件夹", danger=True, command=lambda: self.del_folder(fid))
             else:
-                m.add_command(label="删除文件夹（智能文件夹不可删）", state="disabled")
-        try:
-            m.tk_popup(event.x_root, event.y_root)
-        finally:
-            m.grab_release()
+                m.add("删除文件夹（智能文件夹不可删）", enabled=False)
+        m.popup(event.x_root, event.y_root)
 
     def _move_notes_out(self, fid):
-        """右键 → 移动备忘录：把该文件夹下的备忘录全部移到另一个文件夹。"""
+        """右键 → 移动笔记：把该文件夹下的笔记全部移到另一个文件夹。"""
         f = next((x for x in self.data["folders"] if x["id"] == fid), None)
         if not f:
             return
         if f.get("smart"):
-            messagebox.showinfo("提示", "智能文件夹（全部备忘录 / 星标备忘录）不能整体移动。")
+            self._show_info("提示", "智能文件夹（全部笔记 / 星标笔记）不能整体移动。")
             return
         notes = self.folder_notes(fid)
         if not notes:
-            messagebox.showinfo("提示", "文件夹「%s」下没有备忘录。" % f["name"])
+            self._show_info("提示", "文件夹「%s」下没有笔记。" % f["name"])
             return
         targets = [x for x in self.data["folders"] if not x.get("smart") and x["id"] != fid]
         if not targets:
-            messagebox.showinfo("提示", "没有其他文件夹可以移入。")
+            self._show_info("提示", "没有其他文件夹可以移入。")
             return
         tid = self._ask_choose_folder(
-            "移动备忘录",
-            "把「%s」下的 %d 条备忘录全部移动到：" % (f["name"], len(notes)),
+            "移动笔记",
+            "把「%s」下的 %d 条笔记全部移动到：" % (f["name"], len(notes)),
             targets)
         if not tid:
             return
@@ -4048,22 +5953,100 @@ class NotesApp:
         win.transient(self.root)
         return win
 
-    def _dlg_buttons(self, win, ok_cmd, cancel_cmd):
-        """对话框底部的「确定 / 取消」按钮行。"""
+    def _dlg_buttons(self, win, ok_cmd, cancel_cmd=None, ok_text="确定", danger=False):
+        """对话框底部的按钮行；cancel_cmd 为 None 时只显示一个确定按钮。"""
         p = self.pal
         btns = tk.Frame(win, bg=p["top"])
         btns.pack(fill=tk.X, padx=16, pady=(12, 14))
-        tk.Button(btns, text="取消", width=8, bg=p["editor"], fg=p["soft"], bd=1,
-                  relief=tk.FLAT, font=(FONT[0], 11), cursor="hand2",
-                  activebackground=p["hover"], activeforeground=p["selfg"],
-                  command=cancel_cmd).pack(side=tk.RIGHT, padx=(8, 0))
-        # 确定：强调色实底，悬停/按下向深绿递进（未设 activebackground 会闪系统灰）
-        tk.Button(btns, text="确定", width=8, bg=p["accent"], fg="#ffffff", bd=0,
+        if cancel_cmd is not None:
+            tk.Button(btns, text="取消", width=8, bg=p["editor"], fg=p["soft"], bd=1,
+                      relief=tk.FLAT, font=(FONT[0], 11), cursor="hand2",
+                      activebackground=p["hover"], activeforeground=p["selfg"],
+                      command=cancel_cmd).pack(side=tk.RIGHT, padx=(8, 0))
+        # 确定：默认强调色实底（危险操作改红色），悬停/按下向深色递进（不闪系统灰）
+        ok_bg = MENU_DANGER if danger else p["accent"]
+        ok_active = (_mix_hex(ok_bg, "#000000", 0.12) if danger
+                     else _mix_hex(p["accent"], p["selfg"], BTN_PRESS_MIX))
+        tk.Button(btns, text=ok_text, width=8, bg=ok_bg, fg="#ffffff", bd=0,
                   relief=tk.FLAT, font=(FONT[0], 11, "bold"), cursor="hand2",
-                  activebackground=_mix_hex(p["accent"], p["selfg"], BTN_PRESS_MIX),
-                  activeforeground="#ffffff",
+                  activebackground=ok_active, activeforeground="#ffffff",
                   command=ok_cmd).pack(side=tk.RIGHT)
         return btns
+
+    def _ask_confirm(self, title, message, ok_text="确定", danger=False):
+        """主题化确认对话框（替代系统 messagebox.askyesno）。
+
+        与「新建/重命名文件夹」用同一套外壳与按钮样式；Enter 确认、Esc/关窗取消，
+        返回 True/False。
+        """
+        p = self.pal
+        win = self._dlg_body(title)
+        res = {"v": False}
+        # 按最长一行的实际像素宽度设置换行宽度：短提示不会被硬拉宽，
+        # 长提示（名称已按 DLG_TEXT_W 截断）也不会再折出第三行。
+        try:
+            fnt = tkfont.Font(family=FONT[0], size=12)
+            wrap = max([fnt.measure(line) for line in message.split("\n")] + [1])
+        except Exception:
+            wrap = DLG_TEXT_W
+        tk.Label(win, text=message, bg=p["top"], fg=p["text"], anchor="w",
+                 justify="left", font=(FONT[0], 12), wraplength=wrap).pack(
+                     fill=tk.X, padx=16, pady=(16, 6))
+
+        def ok(_=None):
+            res["v"] = True
+            win.destroy()
+
+        def cancel(_=None):
+            res["v"] = False
+            win.destroy()
+
+        self._dlg_buttons(win, ok, cancel, ok_text=ok_text, danger=danger)
+        win.bind("<Return>", ok)
+        win.bind("<Escape>", cancel)
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        self._center_dialog(win)
+        win.grab_set()
+        win.wait_window()
+        return res["v"]
+
+    def _show_alert(self, title, message, kind="info"):
+        """主题化提示 / 错误框（替代 messagebox.showinfo / showerror）。
+
+        单个「确定」按钮；信息用强调色圆标，错误用红色感叹号。正文超过
+        DLG_TEXT_W 时自动换行（备份路径等长文本不会把窗口撑到屏幕外）。
+        """
+        p = self.pal
+        win = self._dlg_body(title)
+        body = tk.Frame(win, bg=p["top"])
+        body.pack(fill=tk.X, padx=16, pady=(16, 6))
+        color = MENU_DANGER if kind == "error" else p["accent"]
+        ic = tk.Canvas(body, width=20, height=20, bd=0,
+                       highlightthickness=0, bg=p["top"])
+        ic.pack(side=tk.LEFT, anchor="n", padx=(0, 10), pady=(1, 0))
+        ic.create_oval(1, 1, 19, 19, fill=color, outline="")
+        ic.create_text(10, 10, text=("!" if kind == "error" else "i"),
+                       fill="#ffffff", font=(FONT[0], 11, "bold"))
+        tk.Label(body, text=message, bg=p["top"], fg=p["text"], anchor="w",
+                 justify="left", font=(FONT[0], 12), wraplength=DLG_TEXT_W).pack(
+                     side=tk.LEFT, fill=tk.X, expand=True)
+
+        def ok(_=None):
+            win.destroy()
+
+        self._dlg_buttons(win, ok)
+        win.bind("<Return>", ok)
+        win.bind("<Escape>", ok)
+        win.protocol("WM_DELETE_WINDOW", ok)
+        self._center_dialog(win)
+        win.grab_set()
+        win.wait_window()
+
+    def _show_info(self, title, message):
+        self._show_alert(title, message, "info")
+
+    def _show_error(self, title, message):
+        self._show_alert(title, message, "error")
 
     def _ask_text(self, title, prompt, initial=""):
         """输入文本对话框；返回去掉首尾空格的字符串，取消返回 None。"""
