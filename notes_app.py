@@ -6,6 +6,7 @@
 """
 import os
 import re
+import sys
 import math
 import json
 import sqlite3
@@ -13,7 +14,24 @@ import unicodedata
 import tkinter as tk
 from tkinter import ttk, filedialog
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+
+def _app_dir():
+    """数据 / 数据库所在目录：打包成 exe 后取 exe 所在目录（数据带得走、易备份），
+    源码运行时取脚本所在目录。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _res_dir():
+    """随程序一起打包的只读资源（图标等）目录：exe 解压目录 / 源码目录。"""
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", _app_dir())
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+BASE = _app_dir()
+_RES = _res_dir()
 # 旧版 JSON 数据文件（仍在：首次运行若发现它会自动迁移进 db，不会丢数据）
 DATA_FILE = os.path.join(BASE, "notes_data.json")
 # 现在的唯一数据源：SQLite 数据库
@@ -3249,7 +3267,7 @@ class NotesApp:
     # ---------- 应用图标 ----------
     def _set_app_icon(self):
         """把窗口/任务栏/弹窗图标换成笔记本+铅笔 PNG（替换 Tk 默认羽毛）。"""
-        path = os.path.join(BASE, "app_icon.png")
+        path = os.path.join(_RES, "app_icon.png")
         if not os.path.exists(path):
             return
         img = None

@@ -80,6 +80,15 @@ python notes_app.py
 
 > 项目图标即仓库中的 [`app_icon.png`](app_icon.png)，同时作为应用窗口 / 任务栏图标（由 `notes_app.py` 启动时加载）。
 
+### 打包成 exe（可选）
+
+`bat/` 目录下已备好打包脚本，无需手写命令：
+
+- 双击 `bat/build.bat`（或命令行 `python bat/build.py`）→ 自动安装 PyInstaller / Pillow 并打包
+- 产物在 `bat/dist/素笺/素笺.exe`，**双击即可打开，目标机器无需再装 Python**
+- `notes_data.db` 会生成在 exe 同目录，整目录拷贝即可带着数据走、方便备份
+- 只想从源码调试运行，可双击 `bat/run.bat`（等同于 `python notes_app.py`）
+
 ## 数据说明
 
 | 项目 | 说明 |
@@ -102,6 +111,7 @@ local-notes/
 ├── notes_app.py     # 全部逻辑：界面、编辑、代码块、数据读写
 ├── app_icon.png     # 项目 / 应用图标
 ├── images/          # README 截图
+├── bat/             # 打包 / 运行脚本（build.bat、run.bat）
 ├── notes_data.db    # 本地数据（首次运行自动生成）
 ├── README.md
 └── LICENSE
