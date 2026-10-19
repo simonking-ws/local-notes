@@ -231,6 +231,12 @@ def _mix_hex(c1, c2, t):
 # 应用中文名（窗口标题 / 示例笔记 / 导出备份文件名统一取这里）
 APP_NAME = "素笺"
 
+# 编辑去抖：连续输入时把「序列化落库」和「列表行刷新」合并成一次，避免每敲一键都
+# 同步做全篇 serialize + SQLite 事务提交（长笔记下可达数百毫秒），把 Tk 的重绘挤到
+# 后面造成打字滞后。内存里的 self.data 仍然每次立即更新，只是落盘延后。
+SAVE_DEBOUNCE_MS = 600          # 停顿这么久没有任何输入就把数据写进数据库
+ROW_REFRESH_DEBOUNCE_MS = 160   # 列表行标题/预览的刷新间隔（仍快到来得及跟手）
+
 # 圆角按钮：hover/pressed 底色由强调色按不同权重混出，跟随任意皮肤自动推导
 BTN_HOVER_MIX = 0.12
 BTN_PRESS_MIX = 0.26
@@ -2734,6 +2740,9 @@ class NotesApp:
         # 延时任务登记表：主窗口销毁时统一取消，否则 Tk 会打印 invalid command name
         self._alive = True
         self._after_jobs = set()
+        # 编辑去抖任务（见 SAVE_DEBOUNCE_MS / ROW_REFRESH_DEBOUNCE_MS）
+        self._save_job = None
+        self._row_job = None
         self._build_ui()
         self.apply_palette()
         if not self.data.get("current_note"):
@@ -2751,6 +2760,12 @@ class NotesApp:
         if getattr(e, "widget", None) is not self.root:
             return
         self._alive = False
+        # 关闭前把还挂在去抖里的改动落库，避免最后一小段输入丢失
+        try:
+            self._save_job = None
+            save_data(self.data)
+        except Exception:
+            pass
         try:
             self._stop_all_marquee()
         except Exception:
@@ -2805,6 +2820,9 @@ class NotesApp:
     def visible_notes(self):
         q = (self.search_var.get() if hasattr(self, "search_var") else "").strip().lower()
         if q:
+            # 搜索读的是库里的 plain 列；还有去抖中的改动就先落库，免得搜不到刚敲的字
+            if self._save_job is not None:
+                self._flush_save()
             # 搜索交给 SQLite：note 表里有 plain 列，直接在 SQL 里过滤 + 排序，
             # 不再把每条笔记的 content 逐字符拼成纯文本再比对（原来每敲一个字都全表扫）。
             idx = {n["id"]: n for n in self.data["notes"]}
@@ -5300,10 +5318,35 @@ class NotesApp:
         n = self.current_note()
         if not n:
             return
+        # 内存立即更新（保证列表标题/预览、切换笔记、导出等都读到最新内容）
         n["content"] = self.serialize()
         n["updated"] = __import__("time").time() * 1000
-        save_data(self.data)
         self.text.edit_modified(False)
+        # 落库与列表行刷新去抖合并：输入连贯时不打断输入，停顿后再做重活
+        self._schedule_save()
+        self._schedule_active_row()
+
+    def _schedule_save(self):
+        """把「写数据库」推迟到输入停顿之后；连续输入只落一次。"""
+        if self._save_job is not None:
+            self._cancel_after(self._save_job)
+        self._save_job = self._after(SAVE_DEBOUNCE_MS, self._flush_save)
+
+    def _flush_save(self):
+        """立刻把内存数据落库（切换笔记 / 搜索 / 退出前调用，确保不丢、不过期）。"""
+        if self._save_job is not None:
+            self._cancel_after(self._save_job)
+            self._save_job = None
+        save_data(self.data)
+
+    def _schedule_active_row(self):
+        """列表行的标题/预览刷新也去抖：不与输入抢主线程，但依然跟手。"""
+        if self._row_job is not None:
+            self._cancel_after(self._row_job)
+        self._row_job = self._after(ROW_REFRESH_DEBOUNCE_MS, self._flush_active_row)
+
+    def _flush_active_row(self):
+        self._row_job = None
         self._update_active_row()
 
     def _update_active_row(self):
