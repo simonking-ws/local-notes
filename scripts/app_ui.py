@@ -4107,6 +4107,10 @@ class UIMixin(object):
         # 切换文件夹时清空笔记多选，并就地更新文件夹行高亮，不重建整列 → 避免“全部/星标”闪烁
         self._note_sel = set()
         self._note_anchor = None
+        # 左栏多选收敛成「只有它」：视图的当前项只有一个，多选是批量操作的残余，
+        # 不能跟着新视图留着（下面 load_editor 顺回标签那一趟已经明确不反写这里）
+        self._folder_sel = {fid}
+        self._folder_anchor = fid
         self._restyle_folders()
         self.refresh_notes()
         self.load_editor()
@@ -4466,13 +4470,22 @@ class UIMixin(object):
         self.note_panel._update()
         self.note_panel.bind_wheel()
 
-    def select_note(self, nid):
+    def select_note(self, nid, sync_folder=True):
+        """选中并装载一条笔记。
+
+        sync_folder=False 是给**不是用户点笔记**的路径用的：切换文件夹时
+        `select_folder` 先把 current_note 清成 None，`_load_editor_body` 发现编辑区
+        空了就把标签条上那一篇顺回来 —— 那一刻并不是「用户点了笔记」，不能反过来
+        把左栏高亮改到它所属的文件夹。否则刚点中的文件夹会被这一篇的文件夹顶掉，
+        而两者用的是同一个选中色，看上去就是「那个文件夹始终选着」。
+        """
         prev = self.data.get("current_note")
         if prev == nid:
             # 点中「已是当前项」的笔记：同样要取消文件夹多选（否则这里直接 return 会漏掉同步）
             self._note_sel = {nid}
             self._note_anchor = nid
-            self._sync_folder_sel_to_note(nid)
+            if sync_folder:
+                self._sync_folder_sel_to_note(nid)
             self._restyle_notes()
             self.load_editor()
             return
@@ -4480,7 +4493,8 @@ class UIMixin(object):
         self._note_sel = {nid}
         self._note_anchor = nid
         # 点单条笔记：取消文件夹 Shift 多选，单独选中其对应文件夹
-        self._sync_folder_sel_to_note(nid)
+        if sync_folder:
+            self._sync_folder_sel_to_note(nid)
         # 先把上一条选中行强制还原为普通底色（防旧高亮残留），再统一刷新当前行
         if prev:
             self._restore_note_row(prev)
@@ -4600,11 +4614,15 @@ class UIMixin(object):
             self.select_note(nid)
         save_data(self.data)
 
-    def _tab_activate(self, nid):
-        """切到某枚标签；None = 全关了，编辑区空着。"""
+    def _tab_activate(self, nid, sync_folder=True):
+        """切到某枚标签；None = 全关了，编辑区空着。
+
+        sync_folder 透传给 `select_note`：由 `_load_editor_body` 自动顺位回标签时
+        传 False（不是用户点的笔记，左栏高亮不该被改写）。
+        """
         self._tab_active = nid
         if nid:
-            self.select_note(nid)
+            self.select_note(nid, sync_folder=sync_folder)
             self._scroll_note_into_view(nid)
             return
         self.data["current_note"] = None
@@ -5003,7 +5021,9 @@ class UIMixin(object):
             # 一枚不剩才摘掉活动态，编辑区空着等新建。
             self._render_tabs()
             if self._tabs and self._tab_active:
-                self._tab_activate(self._tab_active)
+                # 顺位回标签 ≠ 用户点了笔记：左栏高亮留给调用方（切文件夹时是刚点中
+                # 的那一行），这里只把编辑区填上
+                self._tab_activate(self._tab_active, sync_folder=False)
             elif not self._tabs:
                 self._tab_active = None
                 self._render_tabs()
