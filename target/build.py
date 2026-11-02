@@ -16,8 +16,6 @@ TARGET_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TARGET_DIR)              # 项目根目录
 APP = "素笺"
 ENTRY = os.path.join(ROOT, "scripts", "notes_app.py")
-ICON_PNG = os.path.join(ROOT, "icon", "app_icon.png")
-ICON_ICO = os.path.join(ROOT, "icon", "app_icon.ico")
 DIST = os.path.join(TARGET_DIR, "dist")
 WORK = os.path.join(TARGET_DIR, "build")
 VERSION_FILE = os.path.join(TARGET_DIR, "file_version_info.txt")
@@ -75,12 +73,16 @@ def ensure(pkg, module):
 
 
 def make_icon():
-    """把 512×512 的 PNG 转成多尺寸 .ico，用作 exe 的文件图标；失败则用默认图标。"""
+    """生成 exe 图标：逐档取 `icon/px/<size>/app_icon.png` 组装 .ico。
+
+    不再用 `Image.save(sizes=[...])` 让 Pillow 从 512 原图缩出每一档 —— 那样
+    16/24/32 全是拟物图的又一缩影，任务栏上就是一团米色。逐档成品的组装在
+    `gen_icons.build_ico()` 里，这里只负责调用与容错。
+    """
     try:
-        from PIL import Image
-        im = Image.open(ICON_PNG).convert("RGBA")
-        im.save(ICON_ICO, sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
-        return ICON_ICO
+        sys.path.insert(0, TARGET_DIR)
+        import gen_icons
+        return gen_icons.build_ico()
     except Exception as e:                       # noqa: BLE001
         print("生成 exe 图标失败，改用默认图标：", e)
         return None
@@ -89,6 +91,15 @@ def make_icon():
 def main():
     ensure("pyinstaller", "PyInstaller")
     ensure("pillow", "PIL")
+    # 先把图标渲染成各档精确尺寸：运行时就只需要「按尺寸取图」，不必再缩放。
+    # 失败不阻断打包 —— gen_icons 缺产物时运行时会退回原图缩放，只是没那么锐。
+    try:
+        sys.path.insert(0, TARGET_DIR)
+        import gen_icons
+        print("预渲染图标……")
+        gen_icons.generate(verbose=False)
+    except Exception as e:                       # noqa: BLE001
+        print("图标预渲染失败，运行时会退回原图缩放：", e)
     icon = make_icon()
     ver = write_version_file()
 

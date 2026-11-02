@@ -8,14 +8,22 @@
       → app_ui.py / app_actions.py（界面 / 动作） → notes_app.py（入口）
 """
 import os
+
+# ⚠️ DPI 必须在**其它模块导入之前**初始化：
+# ① 声明 DPI 感知要早于任何 Tk 窗口（theme 导入时就会问字体族，可能建隐式 root）；
+# ② widgets / app_ui 里的像素常量是在**导入期**乘 SCALE 的，晚一步就还是旧值。
+import dpi
+dpi.init()
+
 import tkinter as tk
 
 from store import (load_data, save_data, store, plain_of, _fix_sample_note,
                    _mark_sample_note, _upgrade_sample_note, _ensure_smart_folders,
+                   _ensure_system_folder, _ensure_note_colors,
                    normalize_folder_parents, smart_notes, subtree_ids, SMART_FOLDERS,
                    APP_NAME, SEAL_TITLE_MASK, set_save_error_hook,
                    dump_pending, pending_files)
-from theme import PALETTE
+from theme import build_palette, DEFAULT_THEME, THEMES
 from widgets import (SIDEBAR_W, LIST_W, SIDE_MIN, SIDE_MAX, LIST_MIN, LIST_MAX)
 from app_ui import UIMixin
 from app_actions import ActionsMixin
@@ -23,11 +31,33 @@ from md_conv import TODO_MARKS
 import secret
 
 
+def _ensure_default_theme(data):
+    """首次打开：把默认主题（森林绿）写进 settings，返回是否要落库。
+
+    以前只在 `_read_theme()` 里兜底、库里一直是空的 —— 「第一次用的是哪套」
+    没有任何记录，日后改 `DEFAULT_THEME` 连老用户都会被一起换掉。首次运行就
+    把选择写死，之后只认用户自己换过的主题；已下线的 id（skin）也归位默认。
+    纯数据函数，不碰 tkinter，方便单测。
+    """
+    settings = data.get("settings")
+    if not isinstance(settings, dict):
+        settings = {}
+        data["settings"] = settings
+    tid = settings.get("theme")
+    if tid in (None, "") or tid not in THEMES:
+        settings["theme"] = DEFAULT_THEME
+        return True
+    return False
+
+
 class NotesApp(UIMixin, ActionsMixin):
-    ROW_H = 66
+    ROW_H = dpi.px(66)
 
     def __init__(self, root):
         self.root = root
+        # 字体（点值）的像素换算要在建任何控件之前对齐 DPI 层：控件一建好，
+        # 字体对象就把像素高度定死了，之后再改 tk scaling 不会回溯生效。
+        dpi.apply_tk_scaling(root)
         # 保存失败的处理状态。钩子必须先注册：下面几处「兼容旧数据」的 save_data
         # 都在界面建好之前执行，那时出错同样不能静默。
         self._save_error = None
@@ -52,11 +82,23 @@ class NotesApp(UIMixin, ActionsMixin):
         # 兼容旧数据：给内置示例笔记补上 sample 标记 → UI 里不可删除
         if _mark_sample_note(self.data):
             save_data(self.data)
-        # 兼容旧数据：内置说明笔记补上「快捷键」一节（幂等：已有这一节就跳过）
+        # 兼容旧数据：内置说明笔记与当前版本的正文对齐（整篇替换，幂等）
         if _upgrade_sample_note(self.data):
             save_data(self.data)
-        # 配色：优先 WorkBuddy 皮肤（PALETTE），解析失败时 PALETTE 即内置浅灰 LIGHT
-        self.pal = PALETTE
+        # 兼容旧数据：补上「系统」文件夹，并把内置说明笔记收进去（幂等）。
+        # ⚠️ 必须排在 _mark_sample_note **之后**：很老的库里说明笔记还没有 sample
+        # 标记，先跑这里会认不出它，说明就留在「工作」里了（要等下次启动才搬）。
+        if _ensure_system_folder(self.data):
+            save_data(self.data)
+        # 兼容旧数据：给还没有色条的笔记补颜色（老库升级 / 导入后第一次启动）
+        if _ensure_note_colors(self.data):
+            save_data(self.data)
+        # 配色：多主题，读 settings["theme"]（首次打开默认森林绿 = 中性浅灰底 +
+        # WorkBuddy 当前主题色）。首次运行把这个默认写进库，已下线的「跟随 WorkBuddy
+        # 外观（skin）」也归位默认；用户自己选过的主题不动。
+        if _ensure_default_theme(self.data):
+            save_data(self.data)
+        self.pal = build_palette(self._read_theme())
         self._codes = []          # 正文里的代码块（换笔记时连同 Text 里的窗口一起销毁）
         self._hrs = []            # 正文里的分割线（同上）
         self._md_pending = None   # 空行刚转成标题/引用时记下的待补样式
@@ -86,8 +128,7 @@ class NotesApp(UIMixin, ActionsMixin):
         self._folder_anchor = None
         self._note_sel = set()
         self._note_anchor = None
-        # 全局设置（正文字号等），持久化在 notes_data.json 的 settings 里
-        self.data.setdefault("settings", {})
+        # 全局设置（正文字号等）持久化在 settings 里；主题那一项已在上文归位
         self.body_size = self._read_body_size()
         self.ui_font = self._read_ui_font()
         # 工具栏横向滑动状态（窗口变窄时按钮展示不全）
@@ -267,9 +308,70 @@ class NotesApp(UIMixin, ActionsMixin):
                                      self.folder_subtree(self.data["current_folder"]))
             return [idx[i] for i in ids if i in idx]
         lst = self.folder_notes(self.data["current_folder"])
-        return sorted(lst, key=lambda n: (0 if n.get("pinned") else 1,
-                                          0 if n.get("starred", False) else 1,
-                                          -n["updated"]))
+        return sorted(lst, key=self.note_sort_key)
+
+    @staticmethod
+    def _note_order(n):
+        """笔记的手动顺序值；没设过（老数据 / 从未拖过）返回 None。"""
+        v = n.get("order")
+        return v if isinstance(v, (int, float)) else None
+
+    def note_sort_key(self, n):
+        """笔记列表的排序键：置顶 > 手动顺序 > 星标 > 更新时间。
+
+        `order` 是用户拖拽 / 新建时定下的位置：设过的排在前面（组内按它升序），
+        没设过的排后面、仍按「最近修改」倒序 —— 所以老库在第一次拖拽之前，
+        看到的顺序和以前完全一样，升级不会让整列跳一下。
+
+        ⚠️ 「星标」排在「手动顺序」**之后**（2026-11-04 用户要求「新建的笔记要
+        在列表第一个」）：星标是自动分组，手动顺序是用户的显式意图，显式意图该
+        优先。否则新建的笔记（既没置顶也没星标）永远被几条星标笔记压在下面，
+        用户看到的是「新建完出现在列表中间」。置顶仍然是第一位 —— 那是用户
+        亲手钉上去的，不该被新建动作顶掉。
+        没设过 order 的老数据仍然「星标优先」，这一支的行为一点没变。
+        """
+        o = self._note_order(n)
+        return (0 if n.get("pinned") else 1,
+                0 if o is not None else 1,
+                o if o is not None else 0.0,
+                0 if n.get("starred", False) else 1,
+                -n["updated"])
+
+    def ensure_note_order(self):
+        """第一次拖拽前，把所有笔记的当前顺序固化成 `order` 值。
+
+        只给「当前视图」里的笔记编号是不够的：换到「全部笔记」时，编过号的会
+        整体排到没编号的前面。这里按**全库**的现有排序一次编完，任何一个视图
+        看到的相对顺序都不会变。
+        """
+        notes = self.data["notes"]
+        if notes and all(self._note_order(n) is not None for n in notes):
+            return
+        for i, n in enumerate(sorted(notes, key=self.note_sort_key)):
+            n["order"] = float(i * 1024)
+
+    def top_note_order(self, n, folder=None):
+        """让一条笔记排到「同置顶分组最前面」时该用的 order 值。
+
+        新建 / 挪文件夹 / 改置顶星标都走这里：不这么做的话，会沿用旧位置的
+        顺序值，新笔记可能凭空出现在列表中间。
+
+        ⚠️ 只按 pinned 分组，不再按 starred：排序键里「手动顺序」已经压在星标
+        之上（见 note_sort_key），这里若还按星标分组，新建的笔记只会和同样没星标
+        的比，算出来的值不一定压得过星标笔记 —— 那正是用户报的「新建不在第一个」。
+        """
+        best = None
+        for x in self.data["notes"]:
+            if x is n:
+                continue
+            if bool(x.get("pinned")) != bool(n.get("pinned")):
+                continue
+            if folder and x.get("folder") != folder:
+                continue
+            o = self._note_order(x)
+            if o is not None and (best is None or o < best):
+                best = o
+        return (best - 1024.0) if best is not None else 0.0
 
     def plain(self, n):
         return plain_of(n)
@@ -381,10 +483,17 @@ class NotesApp(UIMixin, ActionsMixin):
         return self._read_col_w("list_w", LIST_W)
 
     def _read_col_w(self, key, default):
-        """读一栏宽度并夹进允许范围 —— 手改过 notes_data.json 也不会把界面撑坏。"""
+        """读一栏宽度并夹进允许范围 —— 手改过 notes_data.json 也不会把界面撑坏。
+
+        存的是**设计稿像素**（见 `_save_split_widths`），读出来要乘当前 DPI：
+        100% 下存的 216，在 150% 的机器上应该是 324 物理像素，而不是 216。
+        """
         lo, hi = (SIDE_MIN, SIDE_MAX) if key == "side_w" else (LIST_MIN, LIST_MAX)
+        raw = self.data.get("settings", {}).get(key)
+        if raw is None:
+            return min(hi, max(lo, default))
         try:
-            w = int(self.data.get("settings", {}).get(key, default))
+            w = dpi.px(int(raw))
         except Exception:
             w = default
         return min(hi, max(lo, w))
@@ -430,6 +539,12 @@ class NotesApp(UIMixin, ActionsMixin):
     # 行级（整行生效）样式标签。quote 也算行级：它同样是"这一整行属于某种块"，
     # 加入这里才能被 _sync_line_tags 补齐（在引用行末尾继续打字不会掉成正文）。
     LINE_TAGS = ("title", "h2", "body", "quote")
+
+
+    # ⚠️ 第 1 行**不再**需要专属排版标签：title 的 spacing1/3 完整生效，多出来的
+    # 那 8px 由 TEXT_PADY（12）让出来，离顶仍是 20（见 widgets.TEXT_PADY 的注释）。
+    # 别再加回旧的 "firstline"（把首行 spacing1 压成 0）—— 那正是标题选中后
+    # 上下间距不对称的根因。_is_ephemeral_tag 里保留该名字只为过滤旧库残留。
 
 
     EMPH_TAGS = ("bold", "italic", "bold_italic")

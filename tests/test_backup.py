@@ -181,6 +181,23 @@ class EncodeDecodeTest(unittest.TestCase):
         self.assertEqual(d["prefs"]["toolbar"], {"hidden": ["bold"]})
         self.assertEqual(d["styles"], {"c_ff0000": {"fg": "#ff0000"}})
 
+    def test_sample_note_is_not_exported(self):
+        """内置说明笔记不进备份：它是程序自带的说明书，不是用户的内容。
+
+        判据只认 `sample` 标记 —— 用户自己写的一篇标题恰好也叫「欢迎使用素笺」，
+        没打标记就照常导出（改名 = 收下它，保护解除）。
+        """
+        d = dict(self.data)
+        d["notes"] = list(self.data["notes"]) + [
+            {"id": "s1", "folder": "f_work", "sample": True, "content": _t("说明")},
+            {"id": "u1", "folder": "f_work", "content": _t("欢迎使用素笺")},
+        ]
+        payload = backup.encode(d)
+        ids = [n["id"] for n in payload["notes"]]
+        self.assertNotIn("s1", ids)
+        self.assertIn("u1", ids)          # 标题一样但没标记 → 照常导出
+        self.assertEqual(ids, ["n1", "n2", "u1"])
+
     def test_dump_is_byte_stable(self):
         """同一份数据导出两次，字节必须完全一致。
 
@@ -399,9 +416,34 @@ class OverwriteTest(unittest.TestCase):
                                       "sec": blob}],
              "prefs": {}, "styles": {}}
         out = backup.overwrite(d)
-        n = out["notes"][0]
+        n = [x for x in out["notes"] if x["id"] == "n1"][0]
         self.assertEqual(n["content"], [])       # 以密文为准
         self.assertEqual(n["sec"], blob)
+
+    def test_overwrite_rebuilds_sample_note(self):
+        """备份里没有说明笔记（新格式一律如此）→ 覆盖导入后按当前版本补一篇。
+
+        这篇是唯一的使用说明，缺了就再也找不回来；而它又必须跟着程序版本走，
+        不能从旧备份里带一张过时的快捷键表过来。
+        """
+        d = {"folders": [{"id": "f_work", "name": "工作"}],
+             "notes": [note("n1", "x")], "prefs": {}, "styles": {}}
+        out = backup.overwrite(d)
+        samples = [n for n in out["notes"] if n.get("sample")]
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0]["id"] not in ("n1",), True)
+        self.assertTrue(samples[0]["content"])     # 正文是本程序当前那份
+        self.assertEqual(samples[0]["folder"], "f_system")
+
+    def test_overwrite_keeps_sample_note_from_old_backup(self):
+        """老备份里带着说明笔记 → 原样用它，不能再补出第二篇。"""
+        d = {"folders": [{"id": "f_work", "name": "工作"}],
+             "notes": [note("n1", "x"),
+                       {"id": "s1", "folder": "f_work", "sample": True,
+                        "content": _t("旧版说明")}],
+             "prefs": {}, "styles": {}}
+        out = backup.overwrite(d)
+        self.assertEqual([n["id"] for n in out["notes"] if n.get("sample")], ["s1"])
 
 
 if __name__ == "__main__":

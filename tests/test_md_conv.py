@@ -21,6 +21,7 @@ import md_conv                                                  # noqa: E402
 from md_conv import (detect_prefix, is_hr, find_urls,           # noqa: E402
                      parse_fence, split_list_prefix, find_time_call, MD_LINK_RE,
                      LI_INDENT, BULLET_MARK, NUM_MARK, TRI_MARK,
+                     LIST_KINDS, list_marker, renumber_prefix,
                      BULLET_GLYPH, TODO_OFF, TODO_ON, TODO_GAP)
 
 
@@ -210,6 +211,47 @@ class ListPrefixTest(unittest.TestCase):
     def test_todo_not_converted_by_markdown(self):
         # "☐ 内容" 不能被当成 markdown 前缀再转一次
         self.assertIsNone(detect_prefix(TODO_OFF + "\u00a0待办")[0])
+
+    def test_allow_empty(self):
+        """工具栏的切换 / 重编号要认出「只有标记没有正文」的空项。
+
+        默认（回车续接用）不认：空列表项再按回车就是结束列表；但工具栏再点一次
+        应当取消，而不是在空项上再叠一个标记。
+        """
+        self.assertEqual(split_list_prefix("　　1.  "), (None, ""))
+        self.assertEqual(split_list_prefix("　　1.  ", allow_empty=True),
+                         ("numbered", "　　1.\u00a0\u00a0"))
+        self.assertEqual(split_list_prefix(BULLET_MARK), (None, ""))
+        self.assertEqual(split_list_prefix(BULLET_MARK, allow_empty=True),
+                         ("bullet", BULLET_MARK))
+        # 只有序号、后面没有空格：仍是正文，不是列表
+        self.assertEqual(split_list_prefix("　　1.", allow_empty=True), (None, ""))
+
+    def test_list_marker_matches_constants(self):
+        """工具栏插入 / 列表互转共用 list_marker，形态必须与旧常量逐字符一致。"""
+        self.assertEqual(LIST_KINDS, ("bullet", "numbered", "triangle", "check"))
+        self.assertEqual(list_marker("bullet"), BULLET_MARK)
+        self.assertEqual(list_marker("numbered"), NUM_MARK)
+        self.assertEqual(list_marker("triangle"), TRI_MARK)
+        self.assertEqual(list_marker("check"), LI_INDENT + TODO_OFF + TODO_GAP)
+        with self.assertRaises(ValueError):
+            list_marker("quote")
+
+    def test_list_marker_keeps_indent(self):
+        # 嵌套列表互转时缩进不能丢：标记里的缩进原样带过去，前缀仍能被完整识别
+        indent = LI_INDENT + LI_INDENT
+        for kind in LIST_KINDS:
+            mark = list_marker(kind, indent)
+            self.assertTrue(mark.startswith(indent), kind)
+            self.assertEqual(split_list_prefix(mark + "文字"), (kind, mark), kind)
+
+    def test_renumber_prefix(self):
+        """自动重编号只换序号，缩进与标记后的空白原样保留。"""
+        p = LI_INDENT + "12." + TODO_GAP
+        self.assertEqual(renumber_prefix(p, 3), LI_INDENT + "3." + TODO_GAP)
+        p2 = LI_INDENT + LI_INDENT + "7.  "
+        self.assertEqual(renumber_prefix(p2, 10),
+                         LI_INDENT + LI_INDENT + "10.  ")
 
     def test_not_a_list(self):
         for s in ("", "普通正文", "  •没有空格", "1.没有空格", "\u3000\u3000正文"):

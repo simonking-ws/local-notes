@@ -12,12 +12,21 @@ import unicodedata
 import tkinter as tk
 import tkinter.font as tkfont
 
+# DPI 缩放：下面的像素常量都要经过 dpi.px()，否则 125% / 150% 下容器不动、
+# 字体却按系统比例变大，整排控件会互相挤。SCALE 在 notes_app.py 导入本模块
+# **之前**就由 dpi.init() 定好，所以这里写 `dpi.px(30)` 是安全的一次性换算。
+import dpi
+import win_frame
+
 # 颜色运算与表面色统一在 theme 里（纯函数，测试不建 GUI 也能断言）。
 # 其中下划线那批是转出口：app_ui 从 widgets 这里引它们（历史沿革），别顺手删。
 from theme import (FONT, _RES, _mix_hex, _hex_rgb, _contrast_ratio, _ink_target,
                    _luminance, _hover_bg, _press_bg,
                    _sel_bg, _quote_bg, _icode_bg,
-                   _search_hit_bg, _popover_bg, _popover_border)
+                   _search_hit_bg, _popover_bg, _popover_border,
+                   TOOL_BG_MIX, _toolbar_bg, _tab_idle_bg,
+                   _readonly_bar_bg, _status_bar_bg, _status_bar_rule,
+                   _status_bar_fg, on_accent)
 
 # 列表标记 / 缩进常量在 md_conv 里（纯字符串逻辑，不依赖 tkinter，能直接测）——
 # 谁要用就 `from md_conv import`，这里不再代转。
@@ -31,8 +40,8 @@ SMART_ICON_STAR = "f_star"   # 星标笔记 → 五角星（金色）
 SMART_ICON_LOCK = "f_lock"   # 加密笔记 → 挂锁
 
 # 文件夹图标画布尺寸（原 16x14 偏小，圆角细节放不下）
-FOLDER_ICON_W = 18
-FOLDER_ICON_H = 16
+FOLDER_ICON_W = dpi.px(18)
+FOLDER_ICON_H = dpi.px(16)
 
 
 def _round_rect_points(x1, y1, x2, y2, r, seg=4):
@@ -63,9 +72,206 @@ def _star_points(cx, cy, r_out, r_in, n=5):
     return pts
 
 
+# ---------- 抗锯齿栅格化（Tk Canvas 走 GDI，完全没有 AA） ----------
+# `create_oval` / `create_arc` 在几十像素的小圆上必然是硬边台阶，椭圆描边更会被
+# 光栅掰成一圈粗细不均的方块 —— 全局设置里六张主题色卡的「毛刺」就是这个。
+# 项目里 ≤18px 的小图标早改成整数矩形拼，但「圆」拼不出圆滑边缘，所以这里换一条
+# 路：自己按像素算覆盖率，最后一次性写进 PhotoImage 贴到 Canvas。
+#
+# 形状统一用**有符号距离函数** sdf(x, y) 描述（负 = 内部，|∇sdf| ≤ 1）。
+# 这样内部 / 外部像素可以用「中心距离 ±0.707」一次判定跳过，只有边界一圈像素
+# 才做 4×4 子采样 —— 一张 76×60 的卡约两万次判定，换肤时重算也不卡。
+AA_SS = 4
+_AA_OFF = tuple((i + 0.5) / AA_SS for i in range(AA_SS))
+_AA_DIAG = math.sqrt(0.5)          # 像素中心到角 ≈ 0.7071
+_AA_SS2 = float(AA_SS * AA_SS)
+
+
+class AAImage(object):
+    """一张按覆盖率混色的 RGB 位图；画完用 `to_photo()` 交给 Tk。
+
+    逐层 `fill()` 用 painter 模型叠加：`底色 → 形状色`，边缘像素按覆盖率混色。
+    整个过程纯 Python + Tk，不依赖 Pillow（文档承诺零依赖）；颜色都是运行时的
+    主题色，换主题 / 悬停能即时重算，不用预渲染一套资源。
+    """
+
+    def __init__(self, w, h, bg):
+        self.w, self.h = int(w), int(h)
+        self.rows = [[bg] * self.w for _ in range(self.h)]
+
+    @classmethod
+    def from_rows(cls, w, h, rows):
+        """复用一份已栅格化的行数据（纯字符串，不绑定 Tk 解释器）。
+
+        色卡的悬停 / 换主题状态是有限组合，把栅格化结果按状态缓存起来，
+        高频的 `<Enter>/<Leave>` 就只剩一次 `to_photo()` 的像素写入。
+        """
+        obj = cls.__new__(cls)
+        obj.w, obj.h, obj.rows = int(w), int(h), rows
+        return obj
+
+    def fill(self, color, sdf, bbox=None):
+        """把 sdf < 0 的区域涂成 color；bbox 只用来少遍历，不必精确。"""
+        x0, y0, x1, y1 = bbox if bbox else (0, 0, self.w, self.h)
+        xa, xb = max(0, int(math.floor(x0))), min(self.w, int(math.ceil(x1)))
+        ya, yb = max(0, int(math.floor(y0))), min(self.h, int(math.ceil(y1)))
+        for y in range(ya, yb):
+            row = self.rows[y]
+            py = y + 0.5
+            for x in range(xa, xb):
+                d = sdf(x + 0.5, py)
+                if d >= _AA_DIAG:
+                    continue                       # 整像素都在形状外
+                if d <= -_AA_DIAG:
+                    row[x] = color                  # 整像素都在形状内
+                    continue
+                hit = 0
+                for oy in _AA_OFF:
+                    yy = y + oy
+                    for ox in _AA_OFF:
+                        if sdf(x + ox, yy) < 0.0:
+                            hit += 1
+                if hit:
+                    a = hit / _AA_SS2
+                    row[x] = color if a >= 1.0 else _mix_hex(row[x], color, a)
+        return self
+
+    def to_photo(self, master, target=None):
+        """一次性写入 PhotoImage。target 复用时只清空重填，不新建对象。"""
+        data = " ".join("{" + " ".join(row) + "}" for row in self.rows)
+        if target is None:
+            target = tk.PhotoImage(width=self.w, height=self.h, master=master)
+        else:
+            target.blank()
+        target.put(data, to=(0, 0))
+        return target
+
+
+def aa_disc(cx, cy, r):
+    """圆盘。返回 (sdf, bbox)。半径用浮点，不再交给 Tk 的整数包围盒。"""
+    r = float(r)
+
+    def sdf(x, y):
+        return math.hypot(x - cx, y - cy) - r
+
+    return sdf, (cx - r - 1, cy - r - 1, cx + r + 1, cy + r + 1)
+
+
+def aa_ring(cx, cy, r_outer, width):
+    """圆环：外半径 r_outer，向内占 width（与 Tk 描边向内的行为一致）。"""
+    ro, ri = float(r_outer), max(0.0, float(r_outer) - float(width))
+    mid, half = (ro + ri) / 2.0, (ro - ri) / 2.0
+
+    def sdf(x, y):
+        return abs(math.hypot(x - cx, y - cy) - mid) - half
+
+    return sdf, (cx - ro - 1, cy - ro - 1, cx + ro + 1, cy + ro + 1)
+
+
+def aa_left_half(cx, cy, r):
+    """左半圆：圆内且 x < cx。用来画色卡里顶栏色的那一半。"""
+    disc, bb = aa_disc(cx, cy, r)
+
+    def sdf(x, y):
+        return max(disc(x, y), x - cx)
+
+    return sdf, (bb[0], bb[1], cx + 1, bb[3])
+
+
+def aa_round_rect(x0, y0, x1, y1, radius):
+    """圆角矩形的精确 SDF（四个角是圆，直身段是矩形）。"""
+    cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+    hw, hh = (x1 - x0) / 2.0 - radius, (y1 - y0) / 2.0 - radius
+
+    def sdf(x, y):
+        dx, dy = abs(x - cx) - hw, abs(y - cy) - hh
+        return (min(max(dx, dy), 0.0)
+                + math.hypot(max(dx, 0.0), max(dy, 0.0)) - radius)
+
+    return sdf, (x0 - 1, y0 - 1, x1 + 1, y1 + 1)
+
+
+def aa_outline(sdf, width):
+    """把任意形状的 SDF 变成「沿边界一圈」的带状 SDF，用于描边。"""
+    half = float(width) / 2.0
+    return lambda x, y: abs(sdf(x, y)) - half
+
+
+def aa_segment(x0, y0, x1, y1, width):
+    """圆头线段（点到线段的距离 - 半线宽），用来画对勾这类折线。"""
+    vx, vy = x1 - x0, y1 - y0
+    seg2, half = vx * vx + vy * vy, float(width) / 2.0
+
+    def sdf(x, y):
+        t = 0.0 if seg2 == 0 else max(
+            0.0, min(1.0, ((x - x0) * vx + (y - y0) * vy) / seg2))
+        return math.hypot(x - (x0 + t * vx), y - (y0 + t * vy)) - half
+
+    return sdf, (min(x0, x1) - half - 1, min(y0, y1) - half - 1,
+                 max(x0, x1) + half + 1, max(y0, y1) + half + 1)
+
+
 # 颜色运算与状态色（_mix_hex / _shade / _hover_bg / _quote_bg / _popover_bg ...）
 # 全部在 theme 里实现：纯函数、不依赖 tkinter，测试可以直接断言色差。
 # 这里只是 import 进来 re-export，调用方（widgets / app_ui）的写法不用变。
+
+
+# ---------- 弹窗就地换肤 ----------
+# 模态弹窗（全局设置 / 数据管理 / 关于）的底色 / 字色都是**建窗时**逐控件写死的，
+# 主窗的 apply_palette 管不到它们。以前在弹窗里换主题只能 destroy + 重建整张窗，
+# 窗口消失又出现的那一帧正是用户说的「闪一下」。下面两个函数让这类弹窗能留着
+# 窗口原地重刷：把每个颜色 option 按「旧色 → 调色板角色 → 新色」翻译一遍即可，
+# 勾选、字号、焦点、滚动位置全都在控件身上，自然一个都不丢。
+DIALOG_COLOR_OPTS = (
+    "background", "foreground", "activebackground", "activeforeground",
+    "selectcolor", "selectbackground", "selectforeground",
+    "disabledforeground", "insertbackground", "readonlybackground",
+    "highlightbackground", "highlightcolor", "troughcolor",
+)
+
+
+def remap_palette_color(color, old_pal, new_pal, keys=None):
+    """把「按旧调色板写死的颜色」翻译成新调色板里的对应色。
+
+    `keys` 可以限定参与翻译的键，避开 top / side 这类同色键的歧义；不在旧板里的
+    颜色（系统色、由底色现推的派生色、空值）一律原样返回 —— 别把控件自己的
+    状态色误当成主题色改掉。
+    """
+    if not color or not isinstance(color, str):
+        return color
+    low = color.lower()
+    for k in (keys if keys is not None else old_pal.keys()):
+        v = old_pal.get(k)
+        if isinstance(v, str) and v.lower() == low:
+            return new_pal.get(k, color)
+    return color
+
+
+def repaint_widget_colors(root, old_pal, new_pal, keys=None):
+    """就地重刷一棵控件树的颜色 option；**不销毁、不重建**任何控件。
+
+    只认 remap_palette_color 认得出来的颜色，所以 ttk 控件、系统默认色会自动跳过
+    （控件不支持的选项也一样）。Canvas 上的图元不归这里管 —— 自绘控件各自有
+    apply_theme / build，由调用方在重刷控件之后再调一次，把笔画也画成新色。
+    """
+    todo = [root]
+    while todo:
+        w = todo.pop()
+        try:
+            todo.extend(w.winfo_children())
+        except tk.TclError:
+            pass
+        for opt in DIALOG_COLOR_OPTS:
+            try:
+                cur = w.cget(opt)
+            except (tk.TclError, AttributeError):
+                continue
+            new = remap_palette_color(cur, old_pal, new_pal, keys)
+            if new != cur:
+                try:
+                    w.configure(**{opt: new})
+                except tk.TclError:
+                    pass
 
 
 # 应用中文名 APP_NAME 已随数据层迁到 store.py（窗口标题 / 示例笔记 / 导出文件名共用）
@@ -75,80 +281,112 @@ def _star_points(cx, cy, r_out, r_in, n=5):
 # 后面造成打字滞后。内存里的 self.data 仍然每次立即更新，只是落盘延后。
 SAVE_DEBOUNCE_MS = 600          # 停顿这么久没有任何输入就把数据写进数据库
 ROW_REFRESH_DEBOUNCE_MS = 160   # 列表行标题/预览的刷新间隔（仍快到来得及跟手）
-READONLY_BAR_H = 26             # 「内置示例笔记 · 不可编辑」提示条的高度
+READONLY_BAR_H = dpi.px(26)     # 「内置示例笔记 · 不可编辑」提示条的高度
 
 # 主按钮（实心强调色）往深色压多少。普通按钮的悬停/按下没有固定权重了：
 # 由 theme._hover_bg / _press_bg 从「按钮所在区域的底色」推（HLS 里只动明度），
 # 绿工具带悬停就还是绿、灰侧栏悬停就还是灰，换皮肤也不用逐处调。
 BTN_PRESS_MIX = 0.18
-BTN_RADIUS = 6              # 圆角收小一档：更接近编辑器工具条的「方中带圆」
-TOOLBAR_H = 36          # 工具栏高度；下方还有 1px 分隔线
+BTN_RADIUS = dpi.px(6)      # 圆角收小一档：更接近编辑器工具条的「方中带圆」
+TOOLBAR_H = dpi.px(36)      # 工具栏高度；下方还有 1px 分隔线
 # 工具栏内分隔线：底色向次级文字色混合的比例。工具带本身压得很轻，分区感主要交给
 # 这条线和底部的收口线来交代，所以线要够实，不能跟着底色一起变淡。
 TOOL_LINE_MIX = 0.42
-# 工具栏底色 = 侧栏色朝稿纸色提亮这个比例（0 = 完全是侧栏色，1 = 完全是稿纸色）。
-# 方向是「提亮」而不是「压暗」：工具带排版的是正文，语义上属于编辑区，底色该站在
-# 「侧栏 → 工具带 → 稿纸」这条渐亮序列的中间。压暗这条路试过两版——0.10 在浅绿
-# 皮肤下被压成一条深色横杠，0.05 用户仍反馈偏暗——因为浅色皮肤里任何压暗都显脏。
-# 0.55 时与稿纸差 1.07、与侧栏差 1.09，两边都刚好分得开，观感是「近乎白的浅色条」。
-TOOL_BG_MIX = 0.55
+# 工具带底色 = 侧栏色朝稿纸色提亮 TOOL_BG_MIX（常量与推导都在 theme 里，
+# 这里 re-export 只是让 app_ui 沿用的老写法不动）。方向是「提亮」而不是「压暗」：
+# 工具带排版的是正文，底色该站在「侧栏 → 工具带 → 稿纸」这条渐亮序列的中间。
+# 压暗这条路试过两版——0.10 在浅绿皮肤下被压成一条深色横杠，0.05 用户仍反馈偏暗。
+# TOOL_BG_MIX 由上面的 theme import 提供（转出口，别在这里另写一份 0.55）。
+
+# 编辑区右侧竖向滚动条的宽度（place 时显式给宽，不取 ttk 默认值）。
+# 浮动导航要靠它算自己的右边界，所以抽成常量 —— 两处必须同源。
+VSCROLL_W = dpi.px(17)
 
 # 编辑区右侧居中的浮动导航（回顶部 / 回底部）
-JUMP_W = 26             # 胶囊宽度（连同与滚动条的间隙，正好落在正文右侧留白里）
-JUMP_H = 62             # 胶囊高度（上下各一枚双箭尖）
-JUMP_GAP = 8            # 与右侧滚动条之间留出的间隙
-# 正文左右留白：右侧要容下浮动导航（JUMP_W + JUMP_GAP），所以比默认略宽
-TEXT_PADX = JUMP_W + JUMP_GAP + 8
+JUMP_W = dpi.px(26)     # 胶囊宽度
+JUMP_H = dpi.px(62)     # 胶囊高度（上下各一枚双箭尖）
+JUMP_GAP = dpi.px(2)    # 胶囊与竖向滚动条之间的间隙（胶囊在滚动条**左侧**，不压滚动条）
+# 正文左右留白：对称的 25（设计稿口径）。滚动条（17）和浮动导航胶囊都摆在这条留白里，
+# 留白**不给它们划车位** —— 它只服务正文的行宽和观感，所以胶囊会压到行尾一个字。
+# ⚠️ 别改回 `JUMP_W + JUMP_GAP + px(8)`：那版为了让胶囊不压字，把右留白撑到 42，
+# 左右不对称。用户明确要求「胶囊悬浮、不受边距限制」，2026-11-05 又确认接受压字。
+TEXT_PADX = dpi.px(25)
+# 正文上下留白。顶部口径：「正文区上沿 → 首行字盒顶」= TEXT_PADY + title 的
+# spacing1(8) = 12 + 8 = 20，与 2026-11-05 改版前（20 + 0）**完全一致**。
+# ⚠️ 首行现在完整保留 title 的 8/8 段间距：旧版挂 firstline 把 spacing1 压成 0，
+# 于是选中标题时色块上方 0、下方 8，上下看着不一致。改成「让内边距让出这 8px」后，
+# 行距属性对称、离顶距离又没变。别再退回 firstline，更别把 title 的 spacing1
+# 直接改成 0 —— 那会连全文所有 H1 的段前距一起砍掉（见 app_ui._config_tags）。
+# 底部留白 = TEXT_PADY(12) + Text 的 pack 外边距 FOOTER_GAP(8) = 20，与改版前
+# 一致；状态条高度 FOOTER_H 已从这里解耦（见 app_ui 顶部），别再把两者绑在一起。
+TEXT_PADY = dpi.px(12)
+
+
+def line_spacing(up, down, wrap=None):
+    """行级标签的 spacing1/2/3 —— 三件套必须一起给，缺一件行距就不齐。
+
+    Tk 的语义：`spacing1` 加在**逻辑行**（一个 \\n 结尾的段落）首条显示行的上方，
+    `spacing3` 加在末条显示行的下方，两条逻辑行之间的基线差因此是「行高 + 上 + 下」；
+    而段内**自动折行**的显示行之间吃的是 `spacing2`（默认 0），基线差只有行高。
+    结果就是「回车换行比自动折行松 (上+下)」—— 用户 2026-11-05 反馈的正是这个。
+
+    所以默认让 `spacing2 = up + down`：折行与回车的行距完全一致（正文实测 24 vs 24）。
+    `wrap` 用来给标题类开小灶 —— H1 的段间距是 8+8，两行标题之间塞 16 会像两个段落，
+    给一半（wrap=8）就够了。
+    """
+    wrap = up + down if wrap is None else wrap
+    return {"spacing1": dpi.px(up), "spacing2": dpi.px(wrap), "spacing3": dpi.px(down)}
 
 # 列表圆角卡片：左右留白 + 行间留白，选中/悬停时行会浮起成一张卡片
-CARD_RADIUS = 9
-CARD_PADX = 8
-CARD_GAP = 2
+CARD_RADIUS = dpi.px(9)
+CARD_PADX = dpi.px(8)
+CARD_GAP = dpi.px(2)
 
 # 多级文件夹：每深一层整张卡片往右挪这么多像素（层级靠缩进读出来）。
 # 14 是「比文件夹图标窄一点」的量：缩进一眼可见，又不至于把深层的名字挤到没处站。
-FOLDER_TREE_INDENT = 14
+FOLDER_TREE_INDENT = dpi.px(14)
 # 树节点前面的展开箭头所占的一格（**点击区**，不是箭头本身的宽度）。
 # 原来这里是 13（宽度）：画布只有 13×16、箭头是 8px 的实心三角，用户反馈
 # 「太小、不知道哪儿能点」。先放到 18×18，后又反馈「还是不好点」—— 现在
 # 高 28（= 左栏一行的可点高度，行高 38~39 由文字撑起来，这一格正好填满）、宽 24，
-# 面积是 18×18 时的两倍多。箭头本身只占 8px（视觉很轻、全靠 hover 底片交代可点）。
-# 叶子这一列留空占位，名字起点才对齐。
-FOLDER_TWISTY_W = 24
-FOLDER_TWISTY_H = 28
+# 面积是 18×18 时的两倍多。⚠️ 点击区**不许缩回去**（两次反馈都指向「不好点」）。
+# 箭头本身是 9px 填充实心三角（2026-11-06 方案 C），常态就看得出可点，
+# 不再全靠 hover 底片交代。叶子这一列留空占位，名字起点才对齐。
+FOLDER_TWISTY_W = dpi.px(24)
+FOLDER_TWISTY_H = dpi.px(28)
 
 # 「移动笔记到…」的选择树：一行 28px（比左栏卡片矮一档，弹窗里更紧凑），
 # 每层缩进 18px —— 要同时容下「竖引导线 + 三角 + 图标」，比左栏的 14 宽一点才不挤。
-PICK_ROW_H = 28
-PICK_INDENT = 18
+PICK_ROW_H = dpi.px(28)
+PICK_INDENT = dpi.px(18)
 
 # 左侧两栏宽度：文件夹列 + 分隔线 + 笔记列表列
-SIDEBAR_W = 216         # 文件夹列
-LIST_W = 300            # 笔记列表列
+SIDEBAR_W = dpi.px(216)     # 文件夹列
+LIST_W = dpi.px(300)        # 笔记列表列
 # 搜索框：住在**文件夹列表顶部**（不再是顶栏），宽度跟着文件夹列走。
 # 左右留白 12 与列表内容对齐 —— 上下同宽，侧栏看起来才是一条直上直下的竖边。
-SEARCH_PADX = 12
+SEARCH_PADX = dpi.px(12)
 # 两栏折叠时整列（含搜索框）一起收起，顶栏不留搜索入口，所以没有「折叠态宽度」。
-SEARCH_H = 32
+SEARCH_H = dpi.px(32)
 
 # 两栏可拖拽调宽：分隔线不再只是一根 1px 的装饰，而是一条 5px 的「抓取带」。
 # 视觉上仍只画中间那 1px（粗细语言不变），两侧各 2px 是留给鼠标的余量 ——
 # 纯 1px 的线在 125% 缩放下基本点不中，5px 是「够粗好抓、又看不出来」的折中。
-SEP_HIT_W = 5
+SEP_HIT_W = dpi.px(5)
 # 可拖范围。上限还得再受「编辑区至少留 EDITOR_MIN」约束（见 _split_limits），
 # 否则两栏都拉满时正文会被挤成一条缝。下限取「名字还能读出来」的宽度。
-SIDE_MIN, SIDE_MAX = 150, 360
-LIST_MIN, LIST_MAX = 180, 520
-EDITOR_MIN = 320
+SIDE_MIN, SIDE_MAX = dpi.px(150), dpi.px(360)
+LIST_MIN, LIST_MAX = dpi.px(180), dpi.px(520)
+EDITOR_MIN = dpi.px(320)
 
 # 主题化确认对话框正文的最大行宽（像素），超出则截断名称，避免多折一行
-DLG_TEXT_W = 360
+DLG_TEXT_W = dpi.px(360)
 
 # 工具栏图标按钮：图标画在 16x16 的方格内，四周留同样的内边距 → 约 34px 见方
-ICON_SIZE = 16
-ICON_STROKE = 1.7       # 图标线宽（像素）；太细在高分屏上会糊，太粗显笨
+ICON_SIZE = dpi.px(16)
+ICON_STROKE = dpi.fx(1.7)   # 图标线宽（像素）；太细在高分屏上会糊，太粗显笨
 ICON_TAIL_RATIO = 0.62  # 「文字 + 下拉箭头」组合里箭头相对图标方格的占比
-ICON_TEXT_GAP = 5       # 组合按钮中文字与小箭头之间的间隙
+ICON_TEXT_GAP = dpi.px(5)   # 组合按钮中文字与小箭头之间的间隙
 
 # 文字按钮的垂直定位：大写字母墨迹半高 / ascent。
 # 微软雅黑 12pt（em 16px）的 ascent 是 17px，B/I/S 的墨迹（cap 高）都是 12px，
@@ -178,11 +416,57 @@ def _draw_icon(cv, name, cx, cy, s, color, stroke=ICON_STROKE):
                                       fill=color, outline=""))
             line(x0 + s * 0.42, yy, x0 + s, yy)
     elif name == "numbered":
-        # 有序列表：左侧 1/2/3 小字 + 右侧三条横线
-        for i, ch in enumerate(("1", "2", "3")):
-            yy = y0 + s * (0.22 + 0.28 * i)
-            ids.append(cv.create_text(x0 + 1.4, yy, text=ch, fill=color,
-                                      font=(FONT[0], 7, "bold"), anchor="w"))
+        # 有序列表：左侧**两个序号 1 / 2** + 右侧两条横线（A 方案）。
+        #
+        # 为什么只画两个：16px 的格子里，三条横线的行距只有 0.28s ≈ 4.5px。
+        # 要在每行塞一个可辨认的数字，最多只能分到 4~5px 高 —— 三个数字挤在
+        # 一起时（上一版）每个只有 4 行、还首尾相接，1x 下就是一根竖虫。
+        # 砍掉 "3" 之后每个数字能长到 5 行（16px 档 5px 高、4px 宽），中间还
+        # 留得下 2px 的缝，1x 下也能一眼读出「1、2」。
+        #
+        # 数字是**手绘点阵字形**，不是 create_text：7pt 雅黑的行框有 14px，
+        # 比行距还大，缩到 5/4/3pt 墨迹仍有 4px，ClearType 还会把 1.2px 的
+        # 竖杆摊成浅黄/浅蓝的虚杆。整像素方块在 Tk 里是纯色实心，深浅与旁边
+        # 1.7px 的横线一致。
+        #
+        # 高度跟邻居对齐：数字列总高取 round(0.75*s)，16px 档正好 12px ——
+        # 和「项目符号」三条横线的墨迹同高，四个列表图标看上去一样大。
+        #
+        # 高 DPI 档按 s/16 放大点阵像素 p：16/20px 档 p=1、24px 起 p=2、
+        # 48px 起 p=3、64px 起 p=4；数字之间的空行数由目标高度反推，整列
+        # 永不超出格子。
+        #
+        # ⚠️ 行距必须用**整数算术**（top0 + i*pitch），不能逐行 round()：
+        #     Python 的 round() 是银行家舍入（round(11.5)=12、round(16.5)=16），
+        #     高 DPI 下会把两个数字算到同一行、粘成一块。
+        _OL_GLYPHS = {
+            "1": ("..#.", ".##.", "..#.", "..#.", ".###"),
+            "2": ("###.", "..#.", ".#..", "#...", "###."),
+        }
+        ROWS = 5
+        # 不用 round()：它是银行家舍入（round(2.5)=2），40px 档会停在 p=2、
+        # 数字偏小。+0.5 再取整才是「四舍五入」。
+        p = max(1, int(s / 16.0 + 0.5))                  # 点阵像素边长（整像素）
+        target = max(ROWS * 2, int(round(0.75 * s)))     # 数字列总高（像素）
+        gap = max(0, (target - p * ROWS * 2) // p)       # 数字之间的空行数
+        if p > 1:
+            gap = max(1, gap)                            # 高 DPI 下两个数字不能贴脸
+        pitch = (ROWS + gap) * p                         # 相邻数字单元的间距
+        total = p * (ROWS * 2 + gap)                     # 整列高度
+        top0 = int(cy) - total // 2                      # 整列在图标里垂直居中
+        dx0 = int(round(x0))                             # 数字列左沿（整像素）
+        for i, ch in enumerate(("1", "2")):
+            top = top0 + i * pitch
+            for r, row in enumerate(_OL_GLYPHS[ch]):
+                for c, cell in enumerate(row):
+                    if cell == "#":
+                        bx = dx0 + c * p
+                        by = top + r * p
+                        ids.append(cv.create_rectangle(bx, by, bx + p - 1,
+                                                      by + p - 1,
+                                                      fill=color, outline=""))
+            # 横线与该行数字的行中心对齐；起点仍是 0.42s，和 ● / ➤ 保持一致
+            yy = top + 2 * p
             line(x0 + s * 0.42, yy, x0 + s, yy)
     elif name == "todo":
         # 待办：空心方框 + 内嵌对勾。
@@ -205,7 +489,7 @@ def _draw_icon(cv, name, cx, cy, s, color, stroke=ICON_STROKE):
                x0 + s * 0.02, y0 + s * 0.76]
         ids.append(cv.create_polygon(pts, fill=color, outline=""))
         for i in range(3):
-            yy = y0 + s * (0.22 + 0.28 * i)
+            yy = int(y0 + s * (0.22 + 0.28 * i) + 0.5)
             line(x0 + s * 0.54, yy, x0 + s, yy)
     elif name == "more":
         # 更多：水平三个点
@@ -271,6 +555,17 @@ def _draw_icon(cv, name, cx, cy, s, color, stroke=ICON_STROKE):
              x0 + s * 0.40, y0 + s * 0.24, x0 + s * 0.50, y0 + s * 0.34,
              x0 + s * 0.86, y0 + s * 0.34, x0 + s * 0.86, y0 + s * 0.80,
              x0 + s * 0.14, y0 + s * 0.80)
+    elif name == "move":
+        # 移动到文件夹：一根右箭头 + 右端开口向左的方盒（→ ]）。
+        # 菜单里「跳到所属文件夹」已经用了 folder 图标，同一张菜单不能两项同图标；
+        # 这里也不硬塞「箭头 + 完整文件夹」——16px 里两个形状会黏成一团墨块，
+        # 用「去别处 + 落进某个容器」这个更简的符号反而一眼能读。
+        line(x0 + s * 0.06, cy, x0 + s * 0.56, cy)
+        line(x0 + s * 0.36, y0 + s * 0.28, x0 + s * 0.58, cy,
+             x0 + s * 0.36, y0 + s * 0.72)
+        line(x0 + s * 0.66, y0 + s * 0.22, x0 + s * 0.92, y0 + s * 0.22,
+             x0 + s * 0.92, y0 + s * 0.78,
+             x0 + s * 0.66, y0 + s * 0.78)
     elif name == "quote":
         # 引用块：左侧一条竖线 + 右侧三条横线。竖线必须够高（满格），
         # 否则在 16px 里会被读成「字母 I」。
@@ -370,6 +665,51 @@ def _draw_icon(cv, name, cx, cy, s, color, stroke=ICON_STROKE):
         ids.append(cv.create_rectangle(x0 + s * 0.16, y0 + s * 0.44,
                                        x0 + s * 0.76, y0 + s * 0.90,
                                        outline=color, width=stroke))
+    elif name == "gutter":
+        # 行号：左边竖排两个数字（1、2）+ 右边一条通高栏线。
+        #
+        # 按用户给的两张参考图取的折中：参考图一是「文档 + 折角 + 123 + 两条横线」，
+        # 参考图二是「纯 123 竖排」。前者 16px 里画不下 —— 实测「外框 + 两数字 +
+        # 两条横线」四个元素挤在一格里，框内净空只有 11px，数字和横线糊成一团黑点
+        # （A 案）；去掉横线只剩「框 + 数字」（B 案），框里两个 4x5 的点阵数字也认
+        # 不出来。所以取后者的数字排布，用一条**栏线**代替参考图一的「右边内容区」：
+        # 数字列 + 边界线，就是编辑器左边那条行号栏。
+        #
+        # ⚠️ 栏线只能用**竖线**。用横线就变成 numbered（有序列表 = 两个数字 + 两条
+        # 横线）的翻版，两个图标并排会直接混淆。
+        # ⚠️ 数字只有两个：16px 里三个 5 行点阵 = 17px，超出格子，挤成「竖虫」
+        # （numbered 早踩过这个坑）。两个数字 + 1 行缝 = 11px，正好。
+        # ⚠️ 两个字模必须**同宽（3 列）且左右边缘对齐**。早先写成 4 列的
+        # `..#. / .##. / ..#. / ..#. / .###`（1）和 `###. / ..#. / .#.. / #... / ###.`（2）：
+        # 数字 1 整体偏右一列、数字 2 偏左，竖排下来就成了「1 靠右、2 靠左」，
+        # 用户一眼看出没对齐。现在两枚都占第 0~2 列，上下左右都齐。
+        _G = {"1": (".#.", "##.", ".#.", ".#.", "###"),
+              "2": ("###", "..#", ".#.", "#..", "###")}
+        p = max(1, int((s * 0.78) / 11.0))          # 点阵像素边长（整像素）
+        top = cy - (11 * p) / 2.0                   # 两个数字整体在图标里居中
+        dx = x0 + s * 0.16
+        for i, ch in enumerate(("1", "2")):
+            for r, row in enumerate(_G[ch]):
+                for col, cell in enumerate(row):
+                    if cell == "#":
+                        bx = dx + col * p
+                        by = top + (i * 6 + r) * p
+                        ids.append(cv.create_rectangle(bx, by, bx + p - 1,
+                                                      by + p - 1,
+                                                      fill=color, outline=""))
+        line(x0 + s * 0.66, y0 + s * 0.10, x0 + s * 0.66, y0 + s * 0.90)
+    elif name == "check":
+        # 菜单里的「已选中」对勾。**不用文字 ✓**：雅黑那个 ✓ 字形偏窄、起笔带一段
+        # 细拖尾，11pt 下歪在标题后面，和菜单右缘怎么摆都对不齐；勾的字面对齐基准
+        # 也和旁边的中文不一样，整行看着像贴了个错位的贴纸。矢量勾三段等长、
+        # 线宽与菜单里其它图标同档（1.7px），还能随 DPI 一起放大。
+        #
+        # 几何：落点压到 cy+0.30s（勾底），起笔 0.14s、收笔 0.86s。长臂短臂比约
+        # 1:1.4 是「一眼认出是勾」的下限；拐点再往下（0.38s 以下）短臂就缩成一点，
+        # 12px 档会读成一条斜线。
+        line(x0 + s * 0.14, cy + s * 0.04,
+             x0 + s * 0.40, cy + s * 0.30,
+             x0 + s * 0.86, cy - s * 0.26)
     return ids
 
 
@@ -427,7 +767,7 @@ class Tooltip(object):
             if not self.widget.winfo_exists() or not self.widget.winfo_viewable():
                 return
             x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2
-            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + dpi.px(6)
         except Exception:
             return
         p = self.pal
@@ -438,13 +778,16 @@ class Tooltip(object):
             win.configure(bg=_popover_border(p))
             lbl = tk.Label(win, text=self.text, bg=_popover_bg(p),
                            fg=p.get("text", "#222222"), font=(FONT[0], 10),
-                           bd=0, padx=8, pady=4, justify="left")
-            lbl.pack(padx=1, pady=1)
+                           bd=0, padx=dpi.px(8), pady=dpi.px(4), justify="left")
+            lbl.pack(padx=dpi.px(1), pady=dpi.px(1))
             win.update_idletasks()
             w = win.winfo_reqwidth()
-            # 居中在控件下方，但别越出屏幕右缘
-            sw = win.winfo_screenwidth()
-            x = min(max(0, x - w // 2), max(0, sw - w - 4))
+            h = win.winfo_reqheight()
+            # 居中在控件下方，但别越出**控件所在那块屏**的边（多屏时 Tk 的
+            # winfo_screenwidth 只报主屏，副屏上的气泡会被拽到 x=0）
+            area = win_frame.work_area_at(x, y, fallback=win)
+            x, y = win_frame.clamp_pos(area, x - w // 2, y, w, h,
+                                       pad=dpi.px(4))
             win.wm_geometry("+%d+%d" % (x, y))
             # 主窗口若开了置顶（自绘标题栏拖动时会临时置顶），气泡是它的子 Toplevel，
             # 不跟着置顶就会被自家窗口盖住 —— 只在这一种情况下跟着置顶，平时不抢焦点。
@@ -522,18 +865,18 @@ class LinkEditor(object):
             pass
         win.configure(bg=border)
         body = tk.Frame(win, bg=shell)
-        body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        body.pack(fill=tk.BOTH, expand=True, padx=dpi.px(1), pady=dpi.px(1))
 
         def field(label, first=False):
             tk.Label(body, text=label, bg=shell, fg=soft,
-                     font=(FONT[0], 9)).pack(anchor="w", padx=9,
-                                             pady=(6, 0) if first else (4, 0))
+                     font=(FONT[0], 9)).pack(anchor="w", padx=dpi.px(9),
+                                             pady=(dpi.px(6), 0) if first else (dpi.px(4), 0))
             e = tk.Entry(body, bg=ed, fg=p.get("text", "#222222"),
                          insertbackground=accent, relief=tk.FLAT,
-                         font=(FONT[0], 10), width=42, highlightthickness=1,
+                         font=(FONT[0], 10), width=42, highlightthickness=dpi.px(1),
                          highlightbackground=_mix_hex(ed, border, 0.7),
                          highlightcolor=accent)
-            e.pack(fill=tk.X, padx=9, pady=(3, 0), ipady=3)
+            e.pack(fill=tk.X, padx=dpi.px(9), pady=(dpi.px(3), 0), ipady=dpi.px(3))
             e.bind("<Return>", self._commit)
             e.bind("<Escape>", lambda _e: self.hide())
             e.bind("<FocusIn>", self._on_focus_in)
@@ -544,7 +887,7 @@ class LinkEditor(object):
         self.entry = field("链接地址")
         tk.Label(body, text="回车保存 · 清空地址取消链接 · Esc 关闭",
                  bg=shell, fg=soft, font=(FONT[0], 9)).pack(
-                     anchor="w", padx=9, pady=(4, 6))
+                     anchor="w", padx=dpi.px(9), pady=(dpi.px(4), dpi.px(6)))
         for w in (win, body):
             w.bind("<Enter>", self._cancel_hide, add="+")
             w.bind("<Leave>", self._on_leave, add="+")
@@ -567,14 +910,15 @@ class LinkEditor(object):
             ent.delete(0, tk.END)
             ent.insert(0, val)
         win.update_idletasks()
-        w = max(win.winfo_reqwidth(), 300)
+        w = max(win.winfo_reqwidth(), dpi.px(300))
         h = win.winfo_reqheight()
-        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        px = min(max(0, int(x)), max(0, sw - w - 8))
-        # 指针下方优先；贴底了翻到指针上方，别让弹窗跑到屏幕外
+        # 边界取**指针所在那块屏**的工作区：多屏时 winfo_screenwidth 只报主屏，
+        # 副屏上（坐标为负）弹这一层会被夹到 x=0，也就是跑到主屏最左边去
+        area = win_frame.work_area_at(x, y, fallback=win)
         py = int(y)
-        if py + h > sh - 8:
-            py = max(0, sh - h - 8)
+        if py + h > area[1] + area[3] - dpi.px(8):
+            py = area[1] + area[3] - h - dpi.px(8)   # 贴底了翻到指针上方
+        px, py = win_frame.clamp_pos(area, x, py, w, h, pad=dpi.px(8))
         win.geometry("%dx%d+%d+%d" % (w, h, px, py))
         win.deiconify()
         try:
@@ -688,9 +1032,9 @@ class RoundButton(tk.Canvas):
     """
 
     def __init__(self, master, pal, text, command=None, font=None,
-                 padx=11, pady=6, radius=BTN_RADIUS, primary=False,
+                 padx=dpi.px(11), pady=dpi.px(6), radius=BTN_RADIUS, primary=False,
                  base=None, fg=None, cursor="hand2", stretch=False, outline=None,
-                 icon=None, icon_size=ICON_SIZE, tail=None):
+                 icon=None, icon_size=ICON_SIZE, tail=None, icon_img=None):
         # Canvas 自身的底色必须等于按钮所在区域的底色：圆角矩形的四个尖角之外
         # 是画布本底，一旦两者不同（画布默认是系统灰），每个按钮外面就会多出一圈
         # 刺眼的亮方块——工具栏底色越深，这圈方块越显眼。
@@ -713,6 +1057,11 @@ class RoundButton(tk.Canvas):
         self._stretch = stretch
         self._icon = icon
         self._icon_size = icon_size
+        # icon_img：主图标的**位图**版本（`icon/px/<size>/<name>`）。给了就贴图，
+        # 没给（或那一档成品缺失）就退回 `_draw_icon` 的矢量画法。
+        # 为什么要有这条路：Tk 8.6 的 canvas 线条没有抗锯齿，带弧线的图形在 16px
+        # 上只能一个像素一个像素地爬台阶（花括号就是这么被报「不圆滑」的）。
+        self._icon_img = icon_img
         # tail：主图标右侧再挂一枚小图标（如代码块的「[ ] + ▾」下拉箭头）。
         # 与「文字 + chevron」同构，但主元素是矢量图标 —— 与其它纯图标按钮
         # 共用同一套线条语言和 16px 方格，垂直对齐由同一中心保证。
@@ -795,18 +1144,18 @@ class RoundButton(tk.Canvas):
         self._drawn_w = w
         self.delete("all")
         self.create_polygon(_round_rect_points(1, 1, w - 1, h - 1, self._radius, 6),
-                            fill=self._cur_fill(), outline=self._cur_outline(), width=1)
+                            fill=self._cur_fill(), outline=self._cur_outline(),
+                            width=dpi.fx(1))
         if self._icon and not self._text:
             if self._tail:
                 # 主图标在左、小箭头在右：两者同中心线（h/2），与纯图标按钮一致
                 iw = self._icon_size * ICON_TAIL_RATIO
-                _draw_icon(self, self._icon, self._padx + self._icon_size / 2.0,
-                           h / 2.0, self._icon_size, self._cur_fg())
+                self._paint_icon(self._padx + self._icon_size / 2.0,
+                                 h / 2.0, self._icon_size)
                 _draw_icon(self, self._tail, w - self._padx - iw / 2.0,
                            h / 2.0, iw, self._cur_fg())
             else:
-                _draw_icon(self, self._icon, w / 2.0, h / 2.0, self._icon_size,
-                           self._cur_fg())
+                self._paint_icon(w / 2.0, h / 2.0, self._icon_size)
         elif self._icon:
             iw = self._icon_size * ICON_TAIL_RATIO
             tw = f.measure(self._text)
@@ -814,10 +1163,30 @@ class RoundButton(tk.Canvas):
             cx_icon = w - self._padx - iw / 2.0
             self.create_text(cx_text, self._text_y(h, f), text=self._text, font=f,
                              fill=self._cur_fg())
-            _draw_icon(self, self._icon, cx_icon, h / 2.0, iw, self._cur_fg())
+            self._paint_icon(cx_icon, h / 2.0, iw)
         else:
             self.create_text(w / 2.0, self._text_y(h, f), text=self._text, font=f,
                              fill=self._cur_fg())
+
+    def _paint_icon(self, cx, cy, size):
+        """画主图标：有预渲染位图就贴图（带抗锯齿），否则退回矢量线条。
+
+        贴图坐标取整：Tk 放图时按整像素落位，留个 .5 会让图标相对同排矢量
+        图标偏半像素 —— 一排看过去就是「这枚好像歪了一点」。
+        """
+        if self._icon_img:
+            img = _icon_photo(self, self._icon_img, size, self._cur_fg())
+            if img is not None:
+                # 引用必须留着：PhotoImage 被回收后画布上的图会变白
+                self._photo = img
+                # 自己算左上角再按 nw 放：按钮高度常是奇数，图标中心落在 .5 上。
+                # 用「四舍五入」（不是 Python 的银行家舍入：round(6.5)=6，会比
+                # 同排复选框高 1px），路线和 Tk 画矢量时一致。
+                self.create_image(int(cx - size / 2.0 + 0.5),
+                                  int(cy - size / 2.0 + 0.5),
+                                  image=img, anchor="nw")
+                return
+        _draw_icon(self, self._icon, cx, cy, size, self._cur_fg())
 
     @staticmethod
     def _text_y(h, f):
@@ -873,14 +1242,16 @@ class RoundButton(tk.Canvas):
     def _cur_fg(self):
         p = self._pal
         if self._primary:
-            return "#ffffff" if self._enabled else _mix_hex(p["accent"], p["selfg"], 0.45)
+            # 主按钮文字：accent 底色上按对比度取白 / 墨（金色 accent 上白字会糊）
+            return on_accent(p["accent"]) if self._enabled else _mix_hex(p["accent"], p["selfg"], 0.45)
         if not self._enabled:
             # 禁用态：同一个墨色只混一点点，图标淡到「看得出来但明显不可用」。
             # 不能再淡——工具带本身很浅，再淡就彻底看不见，反而像没画出来。
             base = self._base
             return _mix_hex(base, _ink_target(base), 0.30)
         if self._state == "normal":
-            # 显式指定的字色只用于常态（比如「A 颜色」按钮永远是强调色）。
+            # 显式指定的字色只用于常态；工具栏按钮一律不传，走下面那套推导，
+            # 换肤时才能和其它按钮一起按新板重算。
             # 没指定时取「次级文字向主文字靠一大半」的墨色：比纯 soft 更实，
             # 工具条上的 B/I/U 这类小字才压得住底色（掘金的工具图标也接近主文字色）。
             if self._fg:
@@ -892,12 +1263,20 @@ class RoundButton(tk.Canvas):
     def redraw(self):
         self.build()
 
-    def apply_theme(self, pal, base=None):
+    def apply_theme(self, pal, base=None, old_pal=None):
         """换肤。传 base 时同步更新「按钮所在区域的底色」——否则换肤后按钮的正常态
-        仍停在旧底色上，会显出一块洗不掉的色斑（工具栏按钮尤其明显）。"""
+        仍停在旧底色上，会显出一块洗不掉的色斑（工具栏按钮尤其明显）。
+
+        `old_pal` 给「建窗时显式传了 fg / outline」的按钮用：那两个值是写死在
+        实例上的旧板色，不是 tk option，通用重刷够不着；不翻译就会在换肤后留下
+        一圈旧描边 / 旧字色。主窗工具栏按钮没传这两项，走默认路径即可。
+        """
         self._pal = dict(pal)
         if base is not None:
             self._base = base
+        if old_pal is not None:
+            self._fg = remap_palette_color(self._fg, old_pal, pal)
+            self._outline = remap_palette_color(self._outline, old_pal, pal)
         try:
             # 圆角外的画布本底也要跟上，否则换肤后每个按钮留一圈旧色的方框
             self.configure(bg=self._base)
@@ -964,12 +1343,12 @@ class FontSizeSlider(tk.Canvas):
     取值 1pt 连续步进，不再有预设字号。
     """
 
-    HEIGHT = 70
-    PAD = 12              # 轨道两端留白，正好容纳滑钮半径
-    TRACK_Y = 38
+    HEIGHT = dpi.px(70)
+    PAD = dpi.px(12)              # 轨道两端留白，正好容纳滑钮半径
+    TRACK_Y = dpi.px(38)
 
     def __init__(self, master, pal, variable, minimum=8, maximum=25,
-                 command=None, command_end=None, width=340):
+                 command=None, command_end=None, width=dpi.px(340)):
         tk.Canvas.__init__(self, master, width=width, height=self.HEIGHT,
                            bd=0, highlightthickness=0, bg=pal["editor"],
                            cursor="hand2", takefocus=1)
@@ -1087,46 +1466,59 @@ class FontSizeSlider(tk.Canvas):
         x0, x1, cy = self.PAD, w - self.PAD, self.TRACK_Y
         tx = self._x_for(v)
 
-        self.create_polygon(_round_rect_points(x0, cy - 3, x1, cy + 3, 3, 6),
+        self.create_polygon(_round_rect_points(x0, cy - dpi.px(3), x1, cy + dpi.px(3), dpi.px(3), 6),
                             fill=p["line"], outline="")
         if tx > x0 + 1:
-            self.create_polygon(_round_rect_points(x0, cy - 3, tx, cy + 3, 3, 6),
+            self.create_polygon(_round_rect_points(x0, cy - dpi.px(3), tx, cy + dpi.px(3), dpi.px(3), 6),
                                 fill=p["accent"], outline="")
 
-        self.create_text(x1, 10, anchor="ne", text="%d pt" % v,
+        self.create_text(x1, dpi.px(10), anchor="ne", text="%d pt" % v,
                          font=self._font_val, fill=p["accent"])
-        self.create_text(x0, self.HEIGHT - 10, anchor="w", text=str(self._min),
+        self.create_text(x0, self.HEIGHT - dpi.px(10), anchor="w", text=str(self._min),
                          font=self._font_small, fill=p["soft"])
-        self.create_text(x1, self.HEIGHT - 10, anchor="e", text=str(self._max),
+        self.create_text(x1, self.HEIGHT - dpi.px(10), anchor="e", text=str(self._max),
                          font=self._font_small, fill=p["soft"])
 
         if self._bubble:
             text = "%d pt" % v
-            bw = self._font_bub.measure(text) + 16
-            bh = 20
+            bw = self._font_bub.measure(text) + dpi.px(16)
+            bh = dpi.px(20)
             bx = min(max(tx, self.PAD + bw / 2.0), w - self.PAD - bw / 2.0)
-            by = cy - 12
+            by = cy - dpi.px(12)
             self.create_polygon(
                 _round_rect_points(bx - bw / 2.0, by - bh, bx + bw / 2.0, by,
                                    bh / 2.0, 6),
                 fill=p["accent"], outline="")
             self.create_text(bx, by - bh / 2.0, text=text,
-                             font=self._font_bub, fill="#ffffff")
+                             font=self._font_bub, fill=on_accent(p["accent"]))
 
-        r = 9 if self._state == "normal" else 10
+        r = dpi.px(9) if self._state == "normal" else dpi.px(10)
         if self._state == "drag":
             fill, outline = p["accent"], _mix_hex(p["accent"], p["selfg"], 0.2)
         else:
             fill, outline = p["editor"], p["accent"]
         if self.focus_get() is self and self._state != "drag":
-            self.create_oval(tx - r - 3, cy - r - 3, tx + r + 3, cy + r + 3,
+            self.create_oval(tx - r - dpi.px(3), cy - r - dpi.px(3),
+                             tx + r + dpi.px(3), cy + r + dpi.px(3),
                              outline=_mix_hex(p["editor"], p["accent"], 0.25),
-                             width=1)
+                             width=dpi.px(1))
         self.create_oval(tx - r, cy - r, tx + r, cy + r,
-                         fill=fill, outline=outline, width=2)
+                         fill=fill, outline=outline, width=dpi.px(2))
         if self._state == "drag":
-            self.create_oval(tx - 3, cy - 3, tx + 3, cy + 3,
-                             fill="#ffffff", outline="")
+            self.create_oval(tx - dpi.px(3), cy - dpi.px(3), tx + dpi.px(3), cy + dpi.px(3),
+                             fill=on_accent(fill), outline="")
+
+    def apply_theme(self, pal):
+        """换肤：轨道 / 滑钮 / pt 数值 / 气泡全是 Canvas 图元，改完 _pal 要整条重画。
+
+        画布本底也在构造时写死了，得一起换，否则圆角之外留一块旧色方块。
+        """
+        self._pal = dict(pal)
+        try:
+            self.configure(bg=pal["editor"])
+        except tk.TclError:
+            pass
+        self.build()
 
 
 def _scroll_chip_geom(size):
@@ -1135,7 +1527,7 @@ def _scroll_chip_geom(size):
     return 3.0 * k, 4.6 * k, 3.2 * k, (2.0 if size >= 20 else 1.8)
 
 
-def _draw_scroll_chip(cv, pal, base, cx, cy, direction, state, size=24):
+def _draw_scroll_chip(cv, pal, base, cx, cy, direction, state, size=dpi.px(24)):
     """圆角小片 + 双箭尖：工具栏滑动箭头、列表折叠按钮共用同一套画法与三态配色。
 
     常态是比底色略深的浅灰片，悬停/按下同样从**这块底**推（`_hover_bg` / `_press_bg`），
@@ -1158,12 +1550,12 @@ def _draw_scroll_chip(cv, pal, base, cx, cy, direction, state, size=24):
     cv.create_polygon(
         _round_rect_points(cx - size / 2.0, cy - size / 2.0,
                            cx + size / 2.0, cy + size / 2.0, radius, 6),
-        fill=fill, outline=outline, width=1)
+        fill=fill, outline=outline, width=dpi.fx(1))
     a, b, gap, lw = _scroll_chip_geom(size)
     for off in (-gap, gap):
         ax = cx + off
         cv.create_line(ax - a * direction, cy - b, ax + a * direction, cy,
-                       ax - a * direction, cy + b, fill=fg, width=lw,
+                       ax - a * direction, cy + b, fill=fg, width=dpi.fx(lw),
                        capstyle=tk.ROUND, joinstyle=tk.ROUND)
 
 
@@ -1175,8 +1567,8 @@ class ArrowButton(tk.Canvas):
     窗口变小、箭头出现时也能稳稳落在垂直中线上。
     """
 
-    def __init__(self, master, pal, direction, command=None, size=26, base=None,
-                 chip=24):
+    def __init__(self, master, pal, direction, command=None, size=dpi.px(26),
+                 base=None, chip=dpi.px(24)):
         tk.Canvas.__init__(self, master, width=size, height=size, bd=0,
                            highlightthickness=0, cursor="hand2")
         self._pal = dict(pal)
@@ -1239,22 +1631,22 @@ class TabStrip(tk.Frame):
     用 Frame 比每次重画一堆图元省事，观感也和列表行是一套。
     """
 
-    H = 25              # 条高：只有一行短标题，压矮一点把正文的地还回来
+    H = dpi.px(25)          # 条高：只有一行短标题，压矮一点把正文的地还回来
     TITLE_DPT = -2      # 标题字号相对正文（FONT[1]=13）的偏移 → 11pt
     CLOSE_DPT = -2      # × 与「+」跟标题同号：条只有 25 高，大一号就顶出去了
-    TAB_MIN = 64
-    TAB_MAX = 176
-    TAB_PAD = 7         # 标题左右留白
-    CLOSE_W = 16        # × 占的宽度（含右侧留白）
-    ICON_W = 14         # 加密笔记的小挂锁
-    SEP_W = 1           # 相邻标签之间的竖分隔线
-    ARROW = 22
-    NOTE_ICON_H = 12    # 每枚标签左侧那枚「笔记」标记（icon/note.png）的高度
-    NOTE_PAD_L = 6      # 标记离标签左边缘的留白
-    NOTE_GAP = 3        # 标记与标题之间的间距
-    DRAG_TOL = 4        # 拖拽判定阈值（px）：位移小于它就是「点击」
-    DRAG_LINE_W = 2     # 拖拽时插入位那条竖线的宽度
-    DRAG_EDGE = 26      # 指针离画布左右边缘多近开始自动横向滚
+    TAB_MIN = dpi.px(64)
+    TAB_MAX = dpi.px(176)
+    TAB_PAD = dpi.px(7)         # 标题左右留白
+    CLOSE_W = dpi.px(16)        # × 占的宽度（含右侧留白）
+    ICON_W = dpi.px(14)         # 加密笔记的小挂锁
+    SEP_W = dpi.px(1)           # 相邻标签之间的竖分隔线
+    ARROW = dpi.px(22)
+    NOTE_ICON_H = dpi.px(12)    # 每枚标签左侧那枚「笔记」标记（icon/note.png）的高度
+    NOTE_PAD_L = dpi.px(6)      # 标记离标签左边缘的留白
+    NOTE_GAP = dpi.px(3)        # 标记与标题之间的间距
+    DRAG_TOL = dpi.px(4)        # 拖拽判定阈值（px）：位移小于它就是「点击」
+    DRAG_LINE_W = dpi.px(2)     # 拖拽时插入位那条竖线的宽度
+    DRAG_EDGE = dpi.px(26)      # 指针离画布左右边缘多近开始自动横向滚
 
     def __init__(self, master, pal, on_select=None, on_close=None, on_new=None,
                  on_menu=None, on_reorder=None, base=None, height=None):
@@ -1322,6 +1714,14 @@ class TabStrip(tk.Frame):
         self.canvas.bind("<Configure>", lambda e: self._sync_scroll())
         for w in (self.canvas, self.inner):
             w.bind("<MouseWheel>", self._wheel)
+        # 右键：标签**本体**上的菜单在 _make_tab 里绑；条底那一大片空白区（最后
+        # 一枚标签右边）、两端箭头、「+」以前右键毫无反应 —— 而「关闭所有标签」
+        # 这种不针对某一枚的动作，恰恰是点空白时想找的。统一走 on_menu，tid=None
+        # 表示「没有锚点」。
+        # ⚠️ 这里**不能**把 inner 也绑上：inner 是标签的父容器，标签的 bindtags 里
+        # 带着 inner（见 _bubble），绑了会在同一击里先弹标签菜单、再弹空白菜单。
+        for w in (self, self.canvas, self.new_btn, self.arrow_l, self.arrow_r):
+            w.bind("<Button-3>", self._blank_menu)
 
     # ---------- 外部接口 ----------
 
@@ -1433,7 +1833,7 @@ class TabStrip(tk.Frame):
         if rec is None or rec.get("top") is not None:
             return
         f = rec["frame"]
-        top = tk.Frame(f, height=2, bg=self.pal.get("accent", "#2f7cf6"))
+        top = tk.Frame(f, height=dpi.px(2), bg=self.pal.get("accent", "#2f7cf6"))
         try:
             top.pack(side=tk.TOP, fill=tk.X, before=f.winfo_children()[0])
         except Exception:
@@ -1540,15 +1940,16 @@ class TabStrip(tk.Frame):
         if tid == self.active:
             # 活动标签顶部一条 2px 强调线：和「下方就是白稿纸」一起，把它点出来。
             # 记进 rec：切活动态时是「摘掉旧的 / 挂到新的」差量刷，不重建整条。
-            top = tk.Frame(f, height=2, bg=self.pal.get("accent", "#2f7cf6"))
+            top = tk.Frame(f, height=dpi.px(2), bg=self.pal.get("accent", "#2f7cf6"))
             top.pack(side=tk.TOP, fill=tk.X)
             rec["top"] = top
         if locked:
             # 加密且还没解锁：挂锁 —— 这一栏本来就是「锁着的」，用挂锁才说得清
-            ic = tk.Canvas(f, width=self.ICON_W, height=self.h - 2, bd=0,
+            ic = tk.Canvas(f, width=self.ICON_W, height=self.h - dpi.px(2), bd=0,
                            highlightthickness=0, bg=bg)
             ic.pack(side=tk.LEFT)
-            _draw_icon(ic, "lock", self.ICON_W / 2.0, (self.h - 2) / 2.0, 10,
+            _draw_icon(ic, "lock", self.ICON_W / 2.0,
+                       (self.h - dpi.px(2)) / 2.0, dpi.px(10),
                        self.pal.get("soft", "#76767e"))
             rec["icon"] = ic
             rec["icon_w"] = self.ICON_W
@@ -1580,7 +1981,7 @@ class TabStrip(tk.Frame):
         cl = tk.Label(f, text="×", bg=bg, fg=self.pal.get("soft", "#76767e"),
                       bd=0, pady=0,
                       font=(FONT[0], FONT[1] + self.CLOSE_DPT), cursor="hand2")
-        cl.pack(side=tk.RIGHT, padx=(0, 5))
+        cl.pack(side=tk.RIGHT, padx=(0, dpi.px(5)))
         rec["label"] = lbl
         rec["close"] = cl
         # 事件：点标签切换、**按住拖拽换位置**、中键关闭、右键菜单。这几样绑在 Frame 上，
@@ -1589,7 +1990,10 @@ class TabStrip(tk.Frame):
         f.bind("<B1-Motion>", lambda e, t=tid: self._on_tab_drag(e, t))
         f.bind("<ButtonRelease-1>", lambda e, t=tid: self._on_tab_release(e, t))
         f.bind("<Button-2>", lambda e, t=tid: self.on_close and self.on_close(t))
-        f.bind("<Button-3>", lambda e, t=tid: self.on_menu and self.on_menu(e, t))
+        # 右键：标签本体弹「这一枚」的菜单。必须 break —— 标签的 bindtags 里还排着
+        # inner（`_bubble`），不拦住会在同一击里再弹一次空白区菜单。
+        f.bind("<Button-3>", lambda e, t=tid: (self.on_menu and
+                                               self.on_menu(e, t), "break")[1])
         f.bind("<Enter>", lambda e, t=tid: self._set_hover(t))
         # 离开：在标题与 × 之间挪动也会各来一次 Leave，照单全收会把高亮闪掉，
         # 所以先看清指针到底还在不在这一枚上（见 _leave_tab）。
@@ -1600,6 +2004,10 @@ class TabStrip(tk.Frame):
             if w is not None:
                 self._bubble(w, f)
         cl.bind("<Button-1>", lambda e, t=tid: self.on_close and self.on_close(t))
+        # × 故意不进 _bubble（否则点关闭会顺带触发「切换」），但它也得能右键：
+        # 指针停在标签最右端时右键，落在的就是这枚 16px 的 ×。
+        cl.bind("<Button-3>", lambda e, t=tid: (self.on_menu and
+                                                self.on_menu(e, t), "break")[1])
         cl.bind("<Enter>", lambda e, c=cl: c.configure(
             fg=self.pal.get("text", "#1f1f24")))
         cl.bind("<Leave>", lambda e, c=cl: c.configure(
@@ -1623,9 +2031,10 @@ class TabStrip(tk.Frame):
             return p.get("editor", "#ffffff"), p.get("text", "#1f1f24")
         if tid == self.hover:
             return _hover_bg(self.base), p.get("text", "#1f1f24")
-        # 常态底色只比条底深一点（0.06）：深了会把「悬停再暗一档」的层次吃掉，
-        # 边界交给下面的 1px 分隔线去讲。
-        return _mix_hex(self.base, _ink_target(self.base), 0.06), p.get("soft", "#76767e")
+        # 常态底色只比条底深一点（TAB_IDLE_MIX）：深了会把「悬停再暗一档」的层次吃掉，
+        # 边界交给下面的 1px 分隔线去讲。⚠️ 口径与 theme._tab_idle_bg 同源 ——
+        # 只读提示条要拿它当「不许撞色」的参照，两处写死 0.06 迟早分叉。
+        return _tab_idle_bg(self.base), p.get("soft", "#76767e")
 
     def _sep_color(self):
         """标签之间的竖分隔线颜色。
@@ -1694,7 +2103,7 @@ class TabStrip(tk.Frame):
         w = icon_w + self._measure(text) + self.CLOSE_W + sep_w
         try:
             rec["frame"].configure(
-                width=max(self.TAB_MIN, min(self.TAB_MAX, int(w) + 8)))
+                width=max(self.TAB_MIN, min(self.TAB_MAX, int(w) + dpi.px(8))))
         except Exception:
             pass
         self._sync_scroll()
@@ -1711,6 +2120,17 @@ class TabStrip(tk.Frame):
                     rec["icon"].configure(bg=bg)
             except Exception:
                 pass
+
+    def _blank_menu(self, event):
+        """条底空白处的右键：交给 on_menu，且 tid=None（没有锚定某一枚标签）。
+
+        ⚠️ 必须 `return "break"`：TabStrip 自己、canvas、inner 是嵌套的，事件虽然
+        不冒泡，但 `inner` 排在标签子控件的 bindtags 里（`_bubble`）—— 只在
+        「标签没接住」时才会走到这里，正常点标签不会误触。
+        """
+        if self.on_menu:
+            self.on_menu(event, None)
+        return "break"
 
     def _bubble(self, w, frame):
         """把 frame（连同 inner，为的是滚轮）排进子控件的 bindtags。
@@ -2114,38 +2534,59 @@ def _draw_chevron_pair(cv, cx, cy, size, color, inward=False, stroke=ICON_STROKE
                           fill=color, outline="")
 
 
-def _draw_chevron(cv, cx, cy, size, color, down=False, stroke=ICON_STROKE):
-    """单个折线箭头（chevron）：`down=False` 是 `>`，`True` 是它的 `v`（转 90°）。
+def _draw_chevron(cv, cx, cy, size, color, down=False):
+    """单个**填充实心三角**：`down=False` 是 ▶，`True` 是 ▼（转 90°）。
 
-    size 是它的**墨迹外接边长**（不是线长，含线宽与圆角）。路径半宽 = 半高 =
-    0.42·size，两条臂夹角 90°，实测墨迹恰好落在 size×size 上（12 → 12×12、
-    8 → 8×8）。圆头圆角，与双箭尖、齿轮那批图标同一套观感。
+    名字沿用折线年代（现在画的不是 chevron），只为不改调用点。size 是墨迹的
+    外接边长，两态共用同一个正方形外接框：收起态底边在左、顶点在右；展开态
+    底边在上、顶点在下。
 
-    ⚠️ **对称居中时只能得到偶数边长**：墨迹以像素中心（如 11.5）为准两头对称，
-    光栅出来必然是 4、6、8 这样的偶数档，想要 7×7 只会跳到 6 或 8（且 7 宽
-    的像素中心必是整数，与画布中心差半像素、左右留白一大一小）。要 7 这个
-    量级就取 8，肉眼跟 7 没差；再小到 6 时 1.7px 的笔画会把中间那点空隙吃掉，
-    两个形态就认不出了。
+    ⚠️ 「半宽 = 半高」仍是硬约束：两态只差一次 90° 旋转，只有外接方框是正方形，
+    它们才在像素上互为转置、看起来一样大。早先按 `>` 在常见 UI 里的比例取
+    0.28 / 0.42（宽高比 0.66），实测收起 7×11、展开 11×7 —— 展开时箭头明显
+    矮一截，收/放之间像「箭头缩了」。别回退。
 
-    ⚠️ 「半宽 = 半高」是硬约束，不是随手取的：`>` 与 `v` 之间只差一次 90° 旋转，
-    只有外接方框是正方形时，两种形态才在像素上互为转置、看起来一样大。早先按
-    `>` 在常见 UI 里的比例取 0.28 / 0.42（宽高比 0.66），实测收起那枚是 7×11、
-    展开那枚只有 11×7 —— 展开时箭头明显矮一截，收/放之间像是「箭头缩了」。
+    ⚠️ 画**填充多边形**而不是 `create_line(width=…)`：Tk Canvas 不抗锯齿，
+    1.7px 的描线在 8~9px 格子里，圆帽 / 圆角会把端点撑成方角、两臂不等粗
+    （2026-11-06 八倍放大图：收起态右端多出一块、V 两臂粗细不一），两个形态
+    还容易读成「噪点」和「对勾」。块面同时和「文件夹」标题右侧的
+    `_draw_chevron_pair`（全部展开 / 收起）是同一套图标语言；⚠️ 小图标别用
+    oval / arc，顶点一律落在整数上。
 
-    ⚠️ cx / cy 请给**像素中心**（如 SIZE_W/2、SIZE_H/2 − 0.5）：Tk 的 Canvas 不做
-    抗锯齿，偏半个像素，整条就会往一侧挪一行，上和下、左和右的留白差出 1px。
+    ⚠️ cx / cy 请给**像素中心**（SIZE_W/2 − 0.5、SIZE_H/2 − 0.5），GLYPH 取
+    **奇数**：画布宽高是偶数时中心落在 .5，size 为奇数则 size/2 也是 .5，
+    两者相减才是整数顶点；偏半像素会让两态各自朝一侧多出 1px，转置关系就破了。
+    ⚠️ 高 DPI 下画布边长可能是**奇数**（125% / 175% / 225% 档的 px(28) =
+    35 / 49 / 63），此时中心会落到整数上，函数内部统一规整回 .5 尾数；取整一律
+    `int(v + 0.5)`，**不能用 round()**（银行家舍入把 .5 往偶数拽，平头会偏 1px）。
 
     ⚠️ 和 `_draw_chevron_pair` 不是一回事：那是两枚并排（翻页/滚动/整组收放），
     这是单枚（树节点收放）。单枚才能和「点这一行前面的箭头」对上。
     """
-    a = size * 0.42          # 半宽
-    b = size * 0.42          # 半高（必须与半宽相等，见上）
+    # 中心必须是 .5 尾数：奇数边长的画布会让调用方传进整数中心，与 h(.5)
+    # 相减就成半像素，round 之后三角高比宽少/多 1px —— 两态转置关系随之破掉。
+    if cx % 1 == 0:
+        cx += 0.5
+    if cy % 1 == 0:
+        cy += 0.5
+    # ⚠️ int(v + 0.5) 而不是 round()：Python 3 的 round(14.5) = 14（银行家
+    # 舍入），会把 .5 往偶数拽；平头是按 mx / my 定的，一拽就偏 1px。
+    def _i(v):
+        return int(v + 0.5)
+
+    h = size / 2.0
+    x0, x1 = _i(cx - h), _i(cx + h)
+    y0, y1 = _i(cy - h), _i(cy + h)
+    mx, my = _i(cx), _i(cy)
+    # 尖端截成 **2px 平头**：等腰三角收窄到 1px 时，Tk 的光栅会把最后两行
+    # 画成一根 1px 的细「尾巴」（八倍图里像水滴 / 定位针）。平头跨在中心线
+    # 两侧（x: mx−1..mx，y: my−1..my），方向感不变，两态仍互为 90° 转置。
+    # ⚠️ 平头取偶数宽：中心落在 .5 上，奇数宽会让平头偏半像素、转置关系破掉。
     if down:
-        pts = (cx - b, cy - a, cx, cy + a, cx + b, cy - a)
+        pts = ((x0, y0), (x1, y0), (mx, y1), (mx - 1, y1))
     else:
-        pts = (cx - a, cy - b, cx + a, cy, cx - a, cy + b)
-    cv.create_line(*pts, fill=color, width=stroke,
-                   capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        pts = ((x0, y0), (x1, my - 1), (x1, my), (x0, y1))
+    cv.create_polygon([v for xy in pts for v in xy], fill=color, outline="")
 
 
 # ---------- 文件夹行首的「>」展开箭头 ----------
@@ -2165,13 +2606,19 @@ class TwistyButton(tk.Canvas):
 
     尺寸 24×28 是刻意取的：原来是 13×16 的实心小三角，用户反馈「太小、不知道能点」，
     先放到 18×18 后仍嫌不好点 —— 现在高度直接顶到左栏一行的可点高度（行高 38~39
-    由行里的字撑起，这一个 28 高正好填满），宽度 24。箭头本身只占 8px（先是 12，
-    用户看后觉得还是太大），视觉分量很轻，可点面积却大了一倍多。
+    由行里的字撑起，这一个 28 高正好填满），宽度 24。⚠️ 点击区只放大过、不许缩回去。
+
+    箭头是 9px **填充实心三角**（2026-11-06 方案 C）：此前是 8px 细描线折线、
+    常态 `soft` 色、只有 hover 才浮底片，实景里小得像噪点，收起态 `>` 还常被
+    读成勾号。现在常态就用 `text` 色，静态也看得出「这里能点」；hover 底片从
+    20×24 收到 16×16 贴着箭头，不再冒出一大片色块、中间只有一丁点墨迹。
     """
 
-    SIZE_W = FOLDER_TWISTY_W     # 点击区宽
+    SIZE_W = FOLDER_TWISTY_W     # 点击区宽（不许缩）
     SIZE_H = FOLDER_TWISTY_H     # 点击区高（= 左栏一行的可点高度）
-    GLYPH = 8                    # 箭头墨迹边长（8×8；见上「只能是偶数档」那条）
+    # 奇数 → 顶点落在整像素，两态才严格互为 90° 转置（见 _draw_chevron）
+    GLYPH = dpi.px(9) | 1
+    PLATE = dpi.px(16)           # hover / press 圆角底片边长（居中贴着箭头）
 
     def __init__(self, master, pal, collapsed=False, available=True, command=None,
                  base=None):
@@ -2200,13 +2647,19 @@ class TwistyButton(tk.Canvas):
         if self._state in ("hover", "press"):
             fill = _press_bg(bg) if self._state == "press" else _hover_bg(bg)
             fg = p.get("selfg", p.get("text", "#1f1f24"))
-            # 底片比点击区四周各内缩 2px：24×28 的整块圆角片在 39 高的行里太显眼，
-            # 内缩之后仍看得出「这一整格能点」，又不抢行里的字。
+            # 底片 16×16 居中：旧版按点击区四周内缩 2px（20×24）配 8px 箭头，
+            # 鼠标一停就冒出一大片色块、中间只有一丁点墨迹。现在底片贴着箭头，
+            # 「哪儿能点」仍由整格 24×28 兜着（只是不画出来），点击区一个像素没动。
+            s = self.PLATE
+            x0 = (self.SIZE_W - s) / 2.0
+            y0 = (self.SIZE_H - s) / 2.0
             self.create_polygon(
-                _round_rect_points(2, 2, self.SIZE_W - 2, self.SIZE_H - 2, 6, 5),
+                _round_rect_points(x0, y0, x0 + s, y0 + s, dpi.px(5), 5),
                 fill=fill, outline="")
         else:
-            fg = p.get("soft", "#76767e")
+            # 常态用正文色：文件夹图标 / 名字都是这个色系，箭头不该比它们还淡；
+            # 静态下就要看得出这里有个能点的东西（不再只靠 hover 底片）。
+            fg = p.get("text", "#1f1f24")
         # cx / cy 取像素中心（SIZE_W/2 − 0.5、SIZE_H/2 − 0.5）：24 列是 0..23、
         # 28 行是 0..27，真中心是 11.5 / 13.5 而不是 12 / 14。差这半像素，墨迹
         # 会整体向右下沉一行，四边留白从对称变成一侧多 1px。
@@ -2294,8 +2747,8 @@ class IconButton(tk.Canvas):
     拿不到当前底色就会在 hover 时留一块方底色。
     """
 
-    SIZE = 18            # 画布边长（顶栏 30 高，上下各留 6px）
-    GLYPH = 13           # 图形边长
+    SIZE = dpi.px(18)            # 画布边长（顶栏 30 高，上下各留 6px）
+    GLYPH = dpi.px(13)           # 图形边长
     TIP = ""
 
     def __init__(self, master, pal, command=None, base=None, tip=None):
@@ -2364,7 +2817,7 @@ class SidebarToggle(IconButton):
     图标照 icon/sz.svg 折算：原样＝点击收起（三角朝左），水平镜像＝点击展开。
     """
 
-    GLYPH = 13           # 图形边长（四根 2px 杠 + 2px 缝刚好整除）
+    GLYPH = dpi.px(13)           # 图形边长（四根 2px 杠 + 2px 缝刚好整除）
     TIP = "收起左侧两栏"
 
     def __init__(self, master, pal, command=None, base=None):
@@ -2396,7 +2849,7 @@ class TreeFoldButton(IconButton):
 
     # 12 而不是继承来的 13：多边形画法下箭尖会再向外延伸约半个线宽
     # （t/sin 半角 ≈ 1.28），12 正好让墨迹占满 y2..y15，上下各留 2px
-    GLYPH = 12
+    GLYPH = dpi.px(12)
     INWARD = False
     TIP = "全部展开"
 
@@ -2466,6 +2919,90 @@ def _draw_gear_icon(cv, cx, cy, size, color, bg):
     cv.create_oval(cx - ri, cy - ri, cx + ri, cy + ri, fill=bg, outline="")
 
 
+# ---------- 全局设置弹窗里的小节图标 ----------
+# 全部按 **16×16 网格**设计，再按目标尺寸等比换算成像素；一律用**块面**
+# （矩形 / 正交多边形）拼，不用 oval / arc / 1px 描线 —— Tk Canvas 不做抗锯齿，
+# 小尺寸下弧线的边缘会毛刺、细线会被光栅掰成深浅不一的两行（同 _draw_chevron）。
+# 共同语言：外框 + 内部实心块。缩到 14px 也还读得出来。
+def _draw_section_icon(cv, kind, cx, cy, size, color, bg):
+    """设置窗小节图标。
+
+    kind: settings(齿轮) / font(字形 A) / theme(四格色板) / toolbar(工具条) / tab(标签页)。
+    """
+    if kind == "settings":
+        _draw_gear_icon(cv, cx, cy, size, color, bg)
+        return
+
+    s = float(size)
+    left, top = cx - s / 2.0, cy - s / 2.0
+    u = s / 16.0                      # 一个网格单位等于多少像素
+    mid_x, mid_y = left + s / 2.0, top + s / 2.0
+
+    def px(n):
+        """网格 x -> 像素。n > 8 的一侧按中线镜像算，保证左右严格对称。
+
+        直接 `left + n*u` 取整会让两侧各自舍入：125% 缩放下 px(2)=3 / px(14)=18，
+        左边距 3px、右边距 2px，四格色板就变成「左边三块宽、右边两块窄」。
+        镜像后 px(14) = 2*中心 - px(2)，两边永远一样。
+        """
+        if n > 8:
+            return int(2 * mid_x - px(16 - n) + 0.5)
+        return int(left + n * u + 0.5)
+
+    def py(n):
+        if n > 8:
+            return int(2 * mid_y - py(16 - n) + 0.5)
+        return int(top + n * u + 0.5)
+
+    w = max(1, int(2 * u + 0.5))      # 框线宽（网格 2 格）
+
+    def rect(x0, y0, x1, y1, col=None):
+        cv.create_rectangle(px(x0), py(y0), px(x1), py(y1),
+                            fill=col or color, outline="")
+
+    def ring(x0, y0, x1, y1):
+        """矩形描边 = 四条实心矩形。
+
+        不用 create_line(width=…)：Tk 的线居中在坐标上，宽 2 时左右各吃半像素，
+        光栅后一条边 2px、另一条 1px（八倍图里两边不等宽）。四条矩形则各边都
+        正好 w 像素，且左右 / 上下对称。
+        """
+        X0, Y0, X1, Y1 = px(x0), py(y0), px(x1), py(y1)
+        cv.create_rectangle(X0, Y0, X1, Y0 + w, fill=color, outline="")
+        cv.create_rectangle(X0, Y1 - w, X1, Y1, fill=color, outline="")
+        cv.create_rectangle(X0, Y0, X0 + w, Y1, fill=color, outline="")
+        cv.create_rectangle(X1 - w, Y0, X1, Y1, fill=color, outline="")
+
+    def poly(pts, col=None):
+        cv.create_polygon([v for p in pts for v in (px(p[0]), py(p[1]))],
+                          fill=col or color, outline="")
+
+    if kind == "font":
+        # 字形 A：「字体 / 文字样式」最省事也最认得出的符号。
+        # 两条 2 格宽的斜腿共用一个平顶（顶点不削尖 —— 16px 下尖端只会糊成一个点），
+        # 再加一道横杠。横杠两端各伸进腿里 1 格，光栅后不会在接缝处露底色。
+        poly(((7, 1), (9, 1), (3, 15), (1, 15)))       # 左腿
+        poly(((7, 1), (9, 1), (15, 15), (13, 15)))     # 右腿
+        rect(4, 9, 12, 11)                             # 横杠
+    elif kind == "theme":
+        # 配色盘：2×2 四个色块（每块 5×5、缝 2）—— 「这套应用用哪套配色」
+        for x0 in (2, 9):
+            for y0 in (2, 9):
+                rect(x0, y0, x0 + 5, y0 + 5)
+    elif kind == "toolbar":
+        # 工具条 + 条上三枚按钮：画实心条再挖三条底色缝，比「细框 + 小点」更结实。
+        # 条高 9 格（4..13）：横条本来就扁，再矮就和旁边 12 格高的图标明显不齐。
+        rect(1, 4, 15, 13)
+        for x0 in (3, 7, 11):
+            rect(x0, 7, x0 + 2, 10, bg)
+    elif kind == "tab":
+        # 两张标签页叠放：后面那张描边、前面那张实心带**明显凸起**。
+        # 凸起是「标签页」唯一的辨识点，矮了（2 格）就退化成「两个错位方块」，
+        # 所以留 3 格高、并且比后页窄一截，轮廓才读得出 tab 形。
+        ring(6, 2, 14, 11)
+        poly(((1, 15), (1, 6), (3, 6), (3, 3), (8, 3), (8, 6), (11, 6), (11, 15)))
+
+
 class SettingsButton(IconButton):
     """顶栏上的「全局设置」入口（齿轮），排在侧栏开关右侧。
 
@@ -2474,7 +3011,7 @@ class SettingsButton(IconButton):
     数据导出导入清空已单独搬到 DataButton（顶栏再往右一枚）。
     """
 
-    GLYPH = 15           # 齿轮细节多，比侧栏开关大 2px 才看得出齿
+    GLYPH = dpi.px(16)           # 齿轮细节多，和旁边几枚位图图标同档才看得出齿
     TIP = "全局设置（Ctrl+,）"
 
     def _paint(self, fg, bg):
@@ -2582,83 +3119,111 @@ def _draw_db_icon(cv, cx, cy, size, color, bg):
         cv.create_polygon(flat, fill=(color if kind == "fg" else bg), outline="")
 
 
-def _png_icon_photo(master, name, size=25):
-    """载入 `icon/<name>`（200×200 RGBA）并整数倍降采样到约 size 见方。
+# ---------- 图标位图：只从「预渲染好的精确尺寸」取，运行时零缩放 ----------
+# target/gen_icons.py 会把每张源图分别渲染成 icon/px/<size>/<name>：线条图先裁掉
+# 四周透明边，缩放后按 alpha 补一次墨（不然细线会被平均成灰雾），需要染色的四张
+# 输出成白色掩膜。运行时这里只做两件事 —— 按名字取对应尺寸、按皮肤上色。
+#
+# 为什么不在运行时缩：Tk 只有**整数倍最近邻**采样，200px 的图缩到 16px 会丢掉
+# 绝大部分像素，一条 16px 宽的线缩完只剩 1.2px，再被最近邻采样一次就断成灰点。
+# PIL 虽然有 LANCZOS，但源码运行不保证装得上 Pillow（文档承诺零依赖）。预渲染把
+# 「质量」固定在生成那一步，运行环境有没有 PIL 都是同一张图。
+_PHOTO_CACHE = {}
 
-    Tk 只能**整数倍**降采样（最近邻），所以先按 200/size 四舍五入出倍数 k，
-    再 subsample(k)：k=12 时出来 16px，正好是顶栏要的档。不需要 PIL。
 
-    图形带 alpha，贴到任何底色上都会自己合成，换肤不用重新生成。
-    ⚠️ 与自绘版的两点差别：①颜色是图里烤死的（`#323333`），不跟皮肤的
-    `soft` / `selfg` 变，hover 时只有圆角底变色；②缩放是最近邻，边缘没有
-    抗锯齿。文件不在（裁过的最小包）时返回 None，调用方退回自绘。
+def _icon_asset(name, size):
+    """返回 (路径, 是否精确尺寸)。精确尺寸的图可以直接贴，不需要任何采样。"""
+    exact = os.path.join(_RES, "px", str(int(size)), name)
+    if os.path.exists(exact):
+        return exact, True
+    return os.path.join(_RES, name), False
+
+
+def _tint_photo(master, path, size, color, exact, by_height=False):
+    """把图按 alpha 刷成 color。有 PIL 用 PIL（半透明边保留），没有就逐点 put。
+
+    `by_height` 只影响**回退路径**（没有预渲染成品时）：note.png 是一张宽图，
+    按「最长边」缩会把铅笔压扁，得按高度对齐。精确尺寸的成品不做任何缩放。
     """
-    path = os.path.join(_RES, name)
-    if not os.path.exists(path):
-        return None
-    try:
-        img = tk.PhotoImage(file=path, master=master)
-    except Exception:
-        return None
-    k = max(1, int(round(max(img.width(), img.height()) / float(size))))
-    return img.subsample(k) if k > 1 else img
-
-
-def _db_icon_photo(master, size=25):
-    """`icon/db.png`（数据库圆柱 + 齿轮）的位图版本。"""
-    return _png_icon_photo(master, "db.png", size)
-
-
-def _note_icon_photo(master, height=14, color=None):
-    """`icon/note.png`（367×200 的一支斜铅笔）→ 按高度缩放、保持宽高比的位图。
-
-    前头那两套都不适用：`_png_icon_photo` 按「缩成 size 见方」算降采样倍数，
-    `_tinted_png_photo` 也是裁 bbox 后重采样成正方形 —— 367×200 的宽图压成 1:1
-    会把铅笔拉变形。
-
-    有 PIL：按高度等比缩放（LANCZOS，边缘有抗锯齿），再按 alpha 染色成 color
-    （位图颜色是烤死的，不染就跟皮肤脱节）；没有 PIL：退回 PhotoImage 整数倍
-    降采样（最近邻、原色直出）。
-    """
-    path = os.path.join(_RES, "note.png")
-    if not os.path.exists(path):
-        return None
     try:
         from PIL import Image, ImageTk
         im = Image.open(path).convert("RGBA")
-        bb = im.split()[3].getbbox()
-        if bb:
-            im = im.crop(bb)                 # 裁掉四周透明边
-        w, h = im.size
-        nw = max(1, int(round(height * w / float(h))))
-        resample = getattr(Image, "LANCZOS", getattr(Image, "BICUBIC", None))
-        im = im.resize((nw, max(1, height)), resample)
-        if color:
-            r, g, b = _hex_rgb(color)
-            out = Image.new("RGBA", im.size, (r, g, b, 255))
-            out.putalpha(im.split()[3])       # alpha 原样保留 → 抗锯齿边还在
-            im = out
-        return ImageTk.PhotoImage(im, master=master)
+        if not exact:
+            bb = im.split()[3].getbbox()
+            if bb:
+                im = im.crop(bb)
+            w0, h0 = im.size
+            # 高度对齐 size、宽度等比：宽图（note）不会被拉成正方形
+            im = im.resize((max(1, int(round(size * w0 / float(h0)))),
+                            max(1, int(size))),
+                           getattr(Image, "LANCZOS", Image.BICUBIC))
+        r, g, b = _hex_rgb(color)
+        out = Image.new("RGBA", im.size, (r, g, b, 255))
+        out.putalpha(im.split()[3])       # alpha 原样保留 → 抗锯齿边还在
+        return ImageTk.PhotoImage(out, master=master)
     except Exception:
         pass
     try:
         img = tk.PhotoImage(file=path, master=master)
     except Exception:
         return None
-    k = max(1, int(round(img.height() / float(height))))
-    if k > 1:
-        img = img.subsample(k)
-    if color:
-        # 没有 PIL 时的染色：逐点 put（半透明边缘会被压实，20px 上下只差一圈像素）
-        try:
-            for y in range(img.height()):
-                for x in range(img.width()):
-                    if img.transparency_get(x, y):
-                        continue
-                    img.put(color, to=(x, y, x + 1, y + 1))
-        except Exception:
-            pass
+    if not exact:
+        ref = img.height() if by_height else max(img.width(), img.height())
+        k = max(1, int(round(ref / float(size))))
+        if k > 1:
+            img = img.subsample(k)
+    # 没有 PIL 时的染色：逐点 put（半透明边会被压实，只差一圈像素）
+    try:
+        for y in range(img.height()):
+            for x in range(img.width()):
+                if img.transparency_get(x, y):
+                    continue
+                img.put(color, to=(x, y, x + 1, y + 1))
+    except Exception:
+        pass
     return img
+
+
+def _icon_photo(master, name, size, color=None, by_height=False):
+    """取 `icon/<name>` 在 size 这一档的位图（带缓存，全程序共用同一张）。
+
+    · `icon/px/<size>/<name>` 在 → 原样加载，零缩放（没装 Pillow 也清晰）；
+    · 不在（裁过的最小包 / 没跑生成脚本）→ 退回原图缩放，行为同改版前；
+    · color 不为 None → 按 alpha 染色（create / github / issue / note 走这条）；
+    · by_height=True → 回退路径按高度对齐 size（note.png 是宽图）。
+    """
+    size = int(size)
+    key = (name, size, color, bool(by_height))
+    hit = _PHOTO_CACHE.get(key)
+    if hit is not None:
+        return hit
+    path, exact = _icon_asset(name, size)
+    if not os.path.exists(path):
+        return None
+    if color:
+        img = _tint_photo(master, path, size, color, exact, by_height)
+    else:
+        try:
+            img = tk.PhotoImage(file=path, master=master)
+        except Exception:
+            return None
+        if not exact:
+            ref = img.height() if by_height else max(img.width(), img.height())
+            k = max(1, int(round(ref / float(size))))
+            img = img.subsample(k) if k > 1 else img
+    if img is not None:
+        _PHOTO_CACHE[key] = img       # 必须持引用：PhotoImage 被回收后图会白掉
+    return img
+
+
+def _png_icon_photo(master, name, size=dpi.px(25)):
+    """`icon/<name>` 的原色版本（db / about / notice 这类颜色已经烤在图里的）。"""
+    return _icon_photo(master, name, size)
+
+
+def _note_icon_photo(master, height=dpi.px(14), color=None):
+    """标签页左侧那支斜铅笔：按**高度**取档（icon/px/12/note.png 是 12 高的横图）。"""
+    return _icon_photo(master, "note.png", height, color, by_height=True)
 
 
 class DataButton(IconButton):
@@ -2667,21 +3232,18 @@ class DataButton(IconButton):
     原来埋在全局设置弹窗下半部分的三件事搬到了这里：导出备份 / 导入数据 /
     清空所有数据。设置弹窗因此只剩「正文长什么样」这类外观项。
 
-    图形直接用 `icon/db.png` 的位图（整数倍降采样到 16px），不走自绘；
-    `DB_PARTS` 只在图片缺失时兜底。
+    图形用 `icon/px/16/db.png`（预渲染的精确尺寸），不走自绘；`DB_PARTS` 只在
+    图片缺失时兜底。
     """
 
     # 画布 18 与其它四枚图标一致（顶栏 30 高，上下各留 6px）—— 这一排的高度
     # 必须齐，否则三枚按钮的视觉外框会一个比一个大。
-    SIZE = 18
-    GLYPH = 15           # 200 / 13 ≈ 15.4 → subsample(13,13) 得 15px
+    SIZE = dpi.px(18)
+    GLYPH = dpi.px(16)           # 偶数：18 画布里 (18-16)/2 = 1，图像正好落在整像素上
     TIP = "数据管理"
 
     def _paint(self, fg, bg):
-        img = getattr(self, "_photo", None)
-        if img is None:
-            img = _db_icon_photo(self, self.GLYPH)
-            self._photo = img        # 必须留着：PhotoImage 被回收后画布上的图会白掉
+        img = _icon_photo(self, "db.png", self.GLYPH, fg)
         if img is None:
             _draw_db_icon(self, self.SIZE / 2.0, self.SIZE / 2.0,
                           self.GLYPH - 1, fg, bg)
@@ -2711,23 +3273,18 @@ class AboutButton(IconButton):
     「这是谁做的、代码在哪」和导出/清空一样都属于「关于这个应用」的事，
     各给一枚图标，点开就是一张只读的小窗。
 
-    图形直接用 `icon/about.png` 的位图（整数倍降采样到 16px），
-    `_draw_info_icon` 只在图片缺失时兜底。
+    图形用 `icon/px/16/about.png`（预渲染的精确尺寸），`_draw_info_icon` 只在
+    图片缺失时兜底。
     """
 
-    SIZE = 18            # 与其它四枚同一档画布，这一排的外框才对得齐
-    # 位图目标 18px（= 整块画布），不是图形 18px：about.png 的内容只有 176/200，
-    # 四周留着 12px 透明边 —— 按 15 取值只会拿到 subsample(13) 的 15px 图，
-    # 圆环实际只有 13.2px，比齿轮和数据库都小一圈。
-    # GLYPH=18 → k=round(200/18)=11 → 18px 图、圆环 15.8px，和旁边两枚齐平。
-    GLYPH = 18
+    SIZE = dpi.px(18)            # 与其它四枚同一档画布，这一排的外框才对得齐
+    # 生成脚本已经按 alpha 包围盒裁掉了四周 12px 透明边，所以这里直接要 16 ——
+    # 不再是改版前那种「图 18px、圆环其实只有 15.8px」的凑法。
+    GLYPH = dpi.px(16)
     TIP = "关于"
 
     def _paint(self, fg, bg):
-        img = getattr(self, "_photo", None)
-        if img is None:
-            img = _png_icon_photo(self, "about.png", self.GLYPH)
-            self._photo = img        # 必须留着：PhotoImage 被回收后画布上的图会白掉
+        img = _icon_photo(self, "about.png", self.GLYPH, fg)
         if img is None:
             _draw_info_icon(self, self.SIZE // 2, self.SIZE // 2,
                             self.GLYPH, fg)
@@ -2735,66 +3292,13 @@ class AboutButton(IconButton):
         self.create_image(self.SIZE // 2, self.SIZE // 2, image=img)
 
 
-# 没 PIL 时的回退表：图标名 -> 图形占整图的比例（按 alpha 包围盒量出来的）。
-# 只对需要精确对齐的图登记；没登记的按 _CONTENT_RATIO 兜底。
-_CONTENT_RATIOS = {
-    "create.png": 0.79,      # 158 / 200
-    "github.png": 1.00,      # 200×196，几乎铺满，没有透明边
-    "issue.png": 0.74,       # 148 / 200
-}
-_CONTENT_RATIO = 0.79        # 未登记图标的默认占比（create.png 那一档）
+def _tinted_png_photo(master, name, size, color):
+    """`icon/<name>` 的染色版本 —— 直接取预渲染好的 `icon/px/<size>/<name>`。
 
-
-def _tinted_png_photo(master, name, size, color, ratio=None):
-    """载入 `icon/<name>`、按 alpha 包围盒裁边、缩到 size 见方，并把图形染成 color。
-
-    与 `_png_icon_photo` 的分工：那个是「原色直出」（db / about 两张本身就烤好了
-    颜色），这个要**换色**，所以优先走 PIL —— 除了染色还能顺手按 bbox 裁掉四周的
-    透明边，图形正好铺满 size（这几张 200px 图标普遍留了 10% 边）。
-
-    没有 PIL 时退回 PhotoImage：整数倍降采样 + 逐点 `put` 上色。降采样前先按
-    `ratio`（图形占整图的比例）把目标放大，抵消掉不掉的透明边，图形仍是 size 见方；
-    `put` 不能带 alpha，半透明边缘会被压成实心 —— 20px 上下只差一圈像素，认了。
+    这几张（create / github / issue / note）在 icon/px 下存的是**白色掩膜**：
+    形状和抗锯齿边都在 alpha 里，运行时只换 RGB，不再重采样。
     """
-    path = os.path.join(_RES, name)
-    if not os.path.exists(path):
-        return None
-
-    try:
-        from PIL import Image, ImageTk
-        resample = getattr(Image, "LANCZOS", getattr(Image, "BICUBIC", None))
-        im = Image.open(path).convert("RGBA")
-        bb = im.split()[3].getbbox()
-        if bb:
-            im = im.crop(bb)              # 裁掉四周透明边，图形铺满
-        im = im.resize((max(1, size), max(1, size)), resample)
-        r, g, b = _hex_rgb(color)
-        out = Image.new("RGBA", im.size, (r, g, b, 255))
-        out.putalpha(im.split()[3])       # alpha 原样保留 → 抗锯齿边还在
-        return ImageTk.PhotoImage(out, master=master)
-    except Exception:
-        pass
-
-    try:
-        img = tk.PhotoImage(file=path, master=master)
-    except Exception:
-        return None
-    # 位图目标按「图形占整图的比例」反推：k=11 时 18px 图、图形 14.2px，
-    # 居中画到 18px 画布上被裁掉的正是那圈透明边。
-    if ratio is None:
-        ratio = _CONTENT_RATIOS.get(name, _CONTENT_RATIO)
-    k = max(1, int(round(img.width() * ratio / float(size))))
-    if k > 1:
-        img = img.subsample(k)
-    try:
-        for y in range(img.height()):
-            for x in range(img.width()):
-                if img.transparency_get(x, y):
-                    continue
-                img.put(color, to=(x, y, x + 1, y + 1))
-    except Exception:
-        return img
-    return img
+    return _icon_photo(master, name, size, color)
 
 
 
@@ -2815,21 +3319,17 @@ class CreateButton(IconButton):
     别的图标是皮肤的 soft 灰，这枚是 accent，一眼就能认出「这是要动手的那一枚」。
 
     图形取自 `icon/create.png`（黑色线条图），运行时染成 accent —— 位图颜色改不了，
-    所以在 `_tinted_png_photo` 里按 alpha 重新上色，并缓存「图 + 当时用的颜色」，
-    换肤后颜色一变就重新生成。
+    所以在 `_tinted_png_photo` 里按 alpha 重新上色。染色结果按「图 + 颜色」缓存在
+    `_icon_photo` 里，换肤后颜色一变，下一次重绘自然会拿到新的一张。
     """
 
-    SIZE = 18
-    GLYPH = 15           # 与齿轮同档：内容裁边后正好 15px
+    SIZE = dpi.px(18)
+    GLYPH = dpi.px(16)           # 与齿轮 / 数据库同档；icon/px/16/create.png 是预渲染好的
     TIP = "新建笔记（Ctrl+N）"
 
     def _paint(self, fg, bg):
         color = self._pal.get("accent", "#2f7cf6")
-        img = getattr(self, "_photo", None)
-        if img is None or getattr(self, "_photo_color", None) != color:
-            img = _tinted_png_photo(self, "create.png", self.GLYPH, color)
-            self._photo = img        # 必须留着：PhotoImage 被回收后画布上的图会白掉
-            self._photo_color = color
+        img = _tinted_png_photo(self, "create.png", self.GLYPH, color)
         if img is None:
             _draw_create_icon(self, self.SIZE // 2, self.SIZE // 2,
                               self.GLYPH, color)
@@ -2841,9 +3341,60 @@ class CreateButton(IconButton):
 # 改这一处就够了（win_frame 的客户区重算不关心高度，它只负责去掉系统那条）。
 #
 # 30 = Windows 10/11 在 100% 缩放下的标准标题栏高度，窗口键、应用图标、标题基线
-# 都按它对齐。这一排图标缩小后（画布 18 / 齿轮 15 / 数据库 15 / 字号 9pt bold）在 30
-# 里上下各留 6px，整条比原来松一档 —— 高度不跟着缩，缩的只是里面的东西。
+# 都按它对齐。这一排图标缩到画布 18 / 图形 16（字号 9pt bold）后，在 30 里上下
+# 各留 6px，整条比原来松一档 —— 高度不跟着缩，缩的只是里面的东西。
 TOP_BAR_H = 30
+
+# 编辑器左侧行号栏固定预留几位数字。4 位 = 9999 行，够任何一条笔记用；
+# 关键是**不跟当前内容走**，见 gutter_width()。
+GUTTER_DIGITS = 4
+
+
+def gutter_width(unit, total=1, digits=GUTTER_DIGITS):
+    """行号栏宽度（像素）：只由字号和**固定位数预算**决定，不跟当前内容走。
+
+    为什么不用「当前总行数的位数」：9→10、99→100、999→1000 每跨一档，整列就变宽
+    一截，正文跟着往右挪一次 —— 读到一半被推一下，比常年多留几像素烦得多。
+    栏宽一稳，行号也就成了「不动的尺子」。
+
+    `unit` 是数字「0」的像素宽（由行号字体量出来），`total` 是当前总行数。
+    只有真超过预算位数才让位：再不让就得把数字裁掉，显示一个错的行号比挪一下更糟。
+    """
+    d = max(int(digits), len(str(max(1, int(total)))))
+    return unit * d + dpi.px(13)
+
+
+def gutter_slots(v0, unit, height):
+    """等距行号「该画哪几格」：返回 (k0, k1) 闭区间，数字 = k + 1。
+
+    行号是一把**刻度尺**：一格的高度固定是正文行高 `unit`，`v0` 是第 1 格顶端
+    在视口里的 y（往下滚就是负数）。只要格子和视口有交集就算 —— 上沿滚出去
+    半格的那一格、下沿补到画面之外的那几格都算，因此：
+
+    * 空行、正文末尾以下的空白区都有号（一直填满画面，不会数到一半就断）；
+    * 数字永远等距，敲字 / 插代码块 / 换字号都不会让某一段挤紧或拉开。
+
+    ⚠️ 别改回「按每行的 dlineinfo 逐行贴齐」：标题、内嵌代码块的行高与正文
+    行高差很多，贴齐的结果是 63 / 29 / 67 / 18×9 这种毫无规律的间距。
+    """
+    unit = max(1, int(unit))
+    v0 = int(v0)
+    k0 = max(0, int(-v0 // unit))
+    k1 = max(k0, int((int(height) - v0 - 1) // unit))
+    return k0, k1
+
+
+def gutter_hit_at(hits, y):
+    """行号栏 y 处是哪个号：(目标行, 图元 id)；落在所有区间之外给 (None, None)。
+
+    ⚠️ 必须按**区间**查，不能按「显示号 → 图元」的字典查：号是标尺数出来的，
+    一个号未必等于一个逻辑行（代码块那一格占两百多像素，底下几行的号就差了
+    八九个），按号查会把点击目标算到别的行去。
+    """
+    for top, bottom, line, item in hits or ():
+        if top <= y < bottom:
+            return line, item
+    return None, None
 
 
 class WindowButton(tk.Canvas):
@@ -2857,7 +3408,7 @@ class WindowButton(tk.Canvas):
     最大化之后中间那枚要换成「还原」的双叠框，由 set_maximized() 切换。
     """
 
-    W, H = 36, TOP_BAR_H
+    W, H = dpi.px(36), TOP_BAR_H
     CLOSE_BG = "#e81123"          # 关闭键悬停：Windows 的红，不参与换肤
     CLOSE_BG_PRESS = "#c50f1f"
 
@@ -2891,17 +3442,30 @@ class WindowButton(tk.Canvas):
 
         if self._kind == "min":
             # 最小化：一条居中的横线（Windows 上它比正中略低 1px）
-            self.create_line(cx - 5, cy, cx + 5, cy, fill=fg, width=1)
+            self.create_line(cx - dpi.px(5), cy, cx + dpi.px(5), cy, fill=fg,
+                             width=dpi.px(1))
         elif self._kind == "close":
-            self.create_line(cx - 4, cy - 4, cx + 5, cy + 5, fill=fg, width=1)
-            self.create_line(cx - 4, cy + 5, cx + 5, cy - 4, fill=fg, width=1)
+            self.create_line(cx - dpi.px(4), cy - dpi.px(4),
+                             cx + dpi.px(5), cy + dpi.px(5), fill=fg,
+                             width=dpi.px(1))
+            self.create_line(cx - dpi.px(4), cy + dpi.px(5),
+                             cx + dpi.px(5), cy - dpi.px(4), fill=fg,
+                             width=dpi.px(1))
         elif self._maximized:
             # 还原：两个错开的方框（前框右下少一条边，像 Windows 的还原键）
-            self.create_rectangle(cx - 5, cy - 2, cx + 3, cy + 6, outline=fg, width=1)
-            self.create_line(cx - 2, cy - 6, cx + 6, cy - 6, fill=fg, width=1)
-            self.create_line(cx + 6, cy - 6, cx + 6, cy + 1, fill=fg, width=1)
+            self.create_rectangle(cx - dpi.px(5), cy - dpi.px(2),
+                                  cx + dpi.px(3), cy + dpi.px(6),
+                                  outline=fg, width=dpi.px(1))
+            self.create_line(cx - dpi.px(2), cy - dpi.px(6),
+                             cx + dpi.px(6), cy - dpi.px(6), fill=fg,
+                             width=dpi.px(1))
+            self.create_line(cx + dpi.px(6), cy - dpi.px(6),
+                             cx + dpi.px(6), cy + dpi.px(1), fill=fg,
+                             width=dpi.px(1))
         else:
-            self.create_rectangle(cx - 5, cy - 5, cx + 5, cy + 5, outline=fg, width=1)
+            self.create_rectangle(cx - dpi.px(5), cy - dpi.px(5),
+                                  cx + dpi.px(5), cy + dpi.px(5),
+                                  outline=fg, width=dpi.px(1))
 
     # ---------------------------------------------------------------- 状态
     def set_maximized(self, flag):
@@ -2966,12 +3530,15 @@ class ScrollJumpNav(tk.Canvas):
     def build(self):
         self.delete("all")
         self.create_polygon(
-            _round_rect_points(0.5, 0.5, JUMP_W - 0.5, JUMP_H - 0.5, JUMP_W / 2.0, 8),
+            _round_rect_points(0.5, 0.5, JUMP_W - 0.5, JUMP_H - 0.5,
+                               JUMP_W / 2.0, dpi.px(8)),
             fill=_mix_hex(self._base, self._pal["line"], 0.30),
-            outline=_mix_hex(self._base, self._pal["line"], 0.55), width=1)
+            outline=_mix_hex(self._base, self._pal["line"], 0.55),
+            width=dpi.px(1))
         # 两枚图标之间的细分隔线
-        self.create_line(7, JUMP_H / 2.0, JUMP_W - 7, JUMP_H / 2.0,
-                         fill=_mix_hex(self._base, self._pal["line"], 0.5), width=1)
+        self.create_line(dpi.px(7), JUMP_H / 2.0, JUMP_W - dpi.px(7), JUMP_H / 2.0,
+                         fill=_mix_hex(self._base, self._pal["line"], 0.5),
+                         width=dpi.px(1))
         self._draw_half("top", JUMP_H * 0.25)
         self._draw_half("bottom", JUMP_H * 0.75)
 
@@ -2994,11 +3561,14 @@ class ScrollJumpNav(tk.Canvas):
         if fill:
             cx = JUMP_W / 2.0
             self.create_polygon(
-                _round_rect_points(cx - 11, cy - 11, cx + 11, cy + 11, 8, 6),
-                fill=fill, outline=outline, width=1)
+                _round_rect_points(cx - dpi.px(11), cy - dpi.px(11),
+                                   cx + dpi.px(11), cy + dpi.px(11),
+                                   dpi.px(8), 6),
+                fill=fill, outline=outline, width=dpi.px(1))
         up = (part == "top")
         # 上下箭尖自成一档：比左右滑动箭头更宽、更平，小尺寸下也看得清朝向
-        a, b, gap, lw = 4.6, 3.1, 3.2, 2.0
+        a, b = dpi.fx(4.6), dpi.fx(3.1)
+        gap, lw = dpi.fx(3.2), dpi.fx(2.0)
         for off in (-gap, gap):
             apex = cy + off - (b / 2.0 if up else -b / 2.0)
             wing = b if up else -b
@@ -3064,7 +3634,7 @@ class MarqueeLabel(tk.Canvas):
     参考接口刻意与 Label 保持相似（set_text / set_style），便于替换。
     """
 
-    def __init__(self, master, bg, fg, font, gap=48):
+    def __init__(self, master, bg, fg, font, gap=dpi.px(48)):
         tk.Canvas.__init__(self, master, bd=0, highlightthickness=0, bg=bg)
         self._fg = fg
         self._font = font
@@ -3154,14 +3724,134 @@ class MarqueeLabel(tk.Canvas):
         self._dirty = False
 
 
+def badge_text(count, cap=99):
+    """数量徽章上显示的文字：超过 cap 一律写「99+」，否则原样。
+
+    抽成模块级纯函数是为了能测：三类边界（cap-1 / cap / cap+1）和四位数，
+    建 GUI 才能验的话这几条永远没人跑。
+    """
+    return "%d+" % cap if int(count) > cap else str(int(count))
+
+
+def badge_size(text_w, linespace, pad_x=6, grow=2):
+    """徽章画布尺寸：`(宽, 高)`。
+
+    高度 = 字体行高 + grow（数字四周留一点白，不顶到圆边）；
+    宽度**至少等于高度**，所以一两位数字是正圆，三位「99+」才长成胶囊。
+    形状规则只写在这一个地方 —— 首建与改数字时都走它，否则两处各算一遍，
+    迟早出现「新建时是圆、删到 9 之后变成扁的」。
+    """
+    h = int(linespace + grow)
+    return max(h, int(text_w + pad_x)), h
+
+
+class CountBadge(tk.Canvas):
+    """文件夹行右侧的条数徽章：数字装在一枚小圆里，位数多了自动长成胶囊。
+
+    为什么不用 tk.Label：Tk 的控件全是方的，画不出圆底；而这枚数字要的就是
+    「一个小圆点」。Canvas 自绘才有圆。
+
+    形状规则（宽高全由字号推，不写死像素，换字号/换 DPI 都跟着走）：
+      * 一位、两位数字：宽度不够撑满就取圆的直径 → 正圆；
+      * 三位（「99+」）：左右各接一段直边 → 胶囊。
+    超过 99 一律显示「99+」：三位以上的精确个位没有信息价值，还会把文件夹名
+    往左挤掉一截。
+
+    底色**从行底色推**（`_mix_hex(bg, 墨色, 0.14)`）而不是固定色：这一行会被
+    悬停 / 选中整行换底，徽章若用死色，选中行上就浮出一块别色的圆 —— 与图标
+    挖孔、箭头底片踩的是同一个坑。`refresh_bg()` 由 `_row_hover` 调用。
+    """
+
+    FONT_SIZE = 10           # 比文件夹名（12）小两档：数字是辅助信息，不跟名字争
+    PAD_X = dpi.px(6)        # 文字左右合计留白
+    CAP = 99                 # 超过它就显示「99+」
+
+    def __init__(self, master, count=0, bg="#e8f0e9", fg="#76767e",
+                 ink="#1f1f24", font=None):
+        self._fg = fg
+        self._ink = ink
+        self._count = int(count)
+        if font is None:
+            font = tkfont.Font(root=master, family=FONT[0], size=self.FONT_SIZE)
+        elif not isinstance(font, tkfont.Font):
+            font = tkfont.Font(root=master, family=font[0], size=font[1])
+        self._font = font
+        # 高度 = 字体行高 + 2：圆略大于字身，数字四周都有留白，不会顶到圆边。
+        # 宽度至少要等于高度（= 圆），文字更宽时才往外长。
+        self._badge_w, self._badge_h = badge_size(
+            self._font.measure(self.text()), self._font.metrics("linespace"),
+            self.PAD_X, dpi.px(2))
+        tk.Canvas.__init__(self, master, width=self._badge_w, height=self._badge_h,
+                           bd=0, highlightthickness=0, bg=bg)
+        self._paint()
+
+    # ---------- 数据 ----------
+    def text(self):
+        return badge_text(self._count, self.CAP)
+
+    def set_count(self, n):
+        """改数字（新建/删除/移动笔记时由 _refresh_folder_counts 调用）。"""
+        n = int(n)
+        if n == self._count:
+            return
+        self._count = n
+        self._resize()
+        self._paint()
+
+    def set_style(self, fg=None):
+        if fg is not None and fg != self._fg:
+            self._fg = fg
+            self._paint()
+
+    def refresh_bg(self):
+        """行底色变了（悬停 / 选中）→ 只重画，尺寸不变。"""
+        self._paint()
+
+    # ---------- 画 ----------
+    def _resize(self):
+        w, h = badge_size(self._font.measure(self.text()),
+                          self._font.metrics("linespace"), self.PAD_X, dpi.px(2))
+        if (w, h) != (self._badge_w, self._badge_h):
+            self._badge_w, self._badge_h = w, h
+            self.configure(width=w, height=h)
+
+    def _paint(self):
+        """圆底 + 数字。全整数坐标：Tk 的填充是半开区间，`0..h` 正好 h 像素。
+
+        ⚠️ 不用 `width=` 描边画圆环（会得到粗细不匀的一圈台阶），这里是**实心填充**，
+        边缘只有一圈像素台阶，没有半调、也没有断口 —— 之前「毛刺」是细描边 + 非整数
+        坐标 + 直径只有 9px 三者叠加，这里一个都不占。
+        """
+        self.delete("all")
+        w, h = self._badge_w, self._badge_h
+        pill = _mix_hex(self["bg"], self._ink, 0.14)
+        if w > h:
+            # 胶囊 = 左右两个半圆 + 中间一块矩形（三者重叠，不会露缝）
+            self.create_oval(0, 0, h, h, fill=pill, outline="")
+            self.create_oval(w - h, 0, w, h, fill=pill, outline="")
+            self.create_rectangle(h / 2.0, 0, w - h / 2.0, h, fill=pill, outline="")
+        else:
+            self.create_oval(0, 0, w, h, fill=pill, outline="")
+        # +0.5：anchor="center" 居中用的是「行盒」（ascent+descent），而数字没有
+        # 降部，行盒底部那一条空白会把字形整体推到偏上 1px。半像素补齐后
+        # 上下留白相等（实测 100% 与 166% 下都是上 1 / 下 1）。
+        self.create_text(w / 2.0, h / 2.0 + 0.5, text=self.text(), fill=self._fg,
+                         font=self._font, anchor="center")
+
+
 # 自绘右键菜单的尺寸与配色
-MENU_ROW_H = 30         # 单项高度
-MENU_SEP_H = 9          # 分隔线占高
-MENU_PAD_X = 14         # 卡片内左右留白
-MENU_GUTTER = 22        # 有图标时的文字左缩进 = 16px 图标 + 6px 间隙（图标恰好占满这 22px，
-                        # 菜单宽度一个像素都不用加）
-MENU_GUTTER_MIN = 6     # 纯文字菜单的缩进。没有图标就别留那一列空位——1px 到 22px 的
-                        # 空缩进在实机里就是每行左边一条死白。
+MENU_ROW_H = dpi.px(30)         # 单项高度
+MENU_SEP_H = dpi.px(9)          # 分隔线占高
+MENU_PAD_X = dpi.px(14)         # 卡片内左右留白
+MENU_GUTTER = dpi.px(22)        # 有图标时的文字左缩进 = 16px 图标 + 6px 间隙（图标恰好占满这 22px，
+                                # 菜单宽度一个像素都不用加）
+MENU_GUTTER_MIN = dpi.px(6)     # 纯文字菜单的缩进。没有图标就别留那一列空位——1px 到 22px 的
+                                # 空缩进在实机里就是每行左边一条死白。
+# 勾选列：菜单里有开关项时，在最右端留出这一条给对勾。勾 14px（比左边 16px 的
+# 图标小一档、比 11pt 文字的 x 高大一点），右端点离菜单右缘 12px —— 与左侧 14px
+# 的留白基本对称，勾不会像贴在边上的一个点。
+MENU_CHECK_SIZE = dpi.px(14)
+MENU_CHECK_W = dpi.px(18)
 MENU_DANGER = "#e5484d"  # 危险项（删除）红色
 
 # ---------- 代码块 ----------
@@ -3445,6 +4135,7 @@ def _format_json(code):
         obj = json.loads(code)
     except Exception as e:
         raise _FormatError("JSON 解析失败：%s" % e)
+    # indent 是**空格个数**，不是像素 —— 不要过 dpi.px()，否则高 DPI 下缩进莫名变深
     return json.dumps(obj, indent=4, ensure_ascii=False)
 
 
@@ -3552,7 +4243,7 @@ class PopupMenu(object):
     def __init__(self, master, pal):
         self.master = master
         self.pal = dict(pal)
-        # {"label","command","danger","enabled","icon"}；label 为 None 表示分隔线
+        # {"label","command","danger","enabled","icon","checked"}；label 为 None 表示分隔线
         self._items = []
         self._hit = []       # 可点击行 (y0, y1, index)
         self._seps = []      # 分隔线纵坐标
@@ -3568,14 +4259,20 @@ class PopupMenu(object):
             self._font = None
 
     # ---------- 组装 ----------
-    def add(self, label, command=None, danger=False, enabled=True, icon=None):
+    def add(self, label, command=None, danger=False, enabled=True, icon=None,
+            checked=False):
         """icon 取 _draw_icon 的名字；给了图标的菜单会自动把左侧缩进撑到 22px。
 
         缩进按「整张菜单有没有图标」统一决定，不是逐行：混排时没图标的那几行也
         留同样的空位，否则文字起点参差不齐。所以图标要么配齐、要么一个都别给。
+
+        checked 是「这是一个开关 / 当前生效的是这一项」——**别把 ✓ 拼进 label**：
+        字体勾在中文行里对不齐（见 _draw_icon 的 check），而且拼进去的一瞬间
+        菜单会跟着变宽、整个卡片左右跳一下。勾走右侧固定列，宽度一次算好。
         """
         self._items.append({"label": label, "command": command,
-                            "danger": danger, "enabled": enabled, "icon": icon})
+                            "danger": danger, "enabled": enabled, "icon": icon,
+                            "checked": bool(checked)})
         return self
 
     def add_separator(self):
@@ -3598,7 +4295,11 @@ class PopupMenu(object):
         has_icon = any(it.get("icon") for it in self._items)
         self._gutter = MENU_GUTTER if has_icon else MENU_GUTTER_MIN
         self._width = MENU_PAD_X * 2 + self._gutter + text_w
-        y = 6
+        # 勾列按「整张菜单」加，不逐行加：某一行带勾、别的行不带时宽度若跟着变，
+        # 菜单右缘就成了锯齿。多数菜单没有勾，所以只在该用的时候才多这 20px。
+        if any(it.get("checked") for it in self._items if it["label"] is not None):
+            self._width += MENU_CHECK_W
+        y = dpi.px(6)
         self._hit = []
         self._seps = []
         for idx, it in enumerate(self._items):
@@ -3608,7 +4309,7 @@ class PopupMenu(object):
             else:
                 self._hit.append((y, y + MENU_ROW_H, idx))
                 y += MENU_ROW_H
-        self._height = y + 6
+        self._height = y + dpi.px(6)
 
     # ---------- 绘制 ----------
     def _render(self):
@@ -3618,12 +4319,13 @@ class PopupMenu(object):
         line = p.get("line", "#cfcfd6")
         c.delete("all")
         # 卡片底：直角矩形 + 1px 描边，与无边框窗口严丝合缝（圆角会露出窗口直角底色）
-        c.create_rectangle(1, 1, w - 1, h - 1,
-                           fill=p.get("editor", "#ffffff"), outline=line, width=1)
+        c.create_rectangle(dpi.px(1), dpi.px(1), w - dpi.px(1), h - dpi.px(1),
+                           fill=p.get("editor", "#ffffff"), outline=line, width=dpi.px(1))
         for y0, y1, idx in self._hit:
             it = self._items[idx]
             if idx == self._hover and it["enabled"]:
-                c.create_rectangle(4, y0 + 1, w - 4, y1 - 1,
+                c.create_rectangle(dpi.px(4), y0 + dpi.px(1), w - dpi.px(4),
+                                   y1 - dpi.px(1),
                                    fill=(MENU_DANGER if it["danger"] else p.get("sel", "#cfe0fb")),
                                    outline="")
                 fg = "#ffffff" if it["danger"] else p.get("selfg", p.get("text", "#1f1f24"))
@@ -3641,13 +4343,29 @@ class PopupMenu(object):
             if it.get("icon"):
                 _draw_icon(c, it["icon"], MENU_PAD_X + ICON_SIZE / 2.0,
                            (y0 + y1) // 2.0, ICON_SIZE, fg)
+            if it.get("checked"):
+                # 勾也用强调色：未悬停时它是整行唯一一处彩色，扫一眼就知道「现在
+                # 是这一项」；悬停时底色是 sel（淡蓝），强调色压在上面会糊，改跟 fg。
+                # 线宽比别的图标粗 0.2px：勾只有一笔，1.7px 在 14px 的格子里偏单薄，
+                # 1x 下会显得若即若离，和右边一整块实底高亮不成比例。
+                chk_fg = fg if (idx == self._hover or not it["enabled"]) else \
+                    p.get("accent", fg)
+                _draw_icon(c, "check",
+                           w - MENU_PAD_X - MENU_CHECK_SIZE / 2.0 + dpi.px(2),
+                           (y0 + y1) // 2.0, MENU_CHECK_SIZE, chk_fg,
+                           stroke=dpi.fx(1.9))
         # 分隔线：左右缩进，比通栏更克制
         for y in self._seps:
             c.create_line(MENU_PAD_X, y, w - MENU_PAD_X, y, fill=line)
 
     # ---------- 弹出 / 关闭 ----------
     def popup(self, x, y):
-        """在屏幕坐标 (x, y) 弹出菜单；贴近屏幕边缘时自动内收，保证整框可见。"""
+        """在屏幕坐标 (x, y) 弹出菜单；贴近边缘时自动内收，保证整框可见。
+
+        内收的边界取**鼠标所在那块显示器的工作区**，不是 Tk 的屏幕尺寸：
+        `winfo_screenwidth()/screenheight()` 只报主屏，副屏坐标又常是负数，
+        多屏机器上在副屏右键，菜单会被夹到 x=0，直接跨到主屏最左边去。
+        """
         self._layout()
         p = self.pal
         win = tk.Toplevel(self.master)
@@ -3663,9 +4381,12 @@ class PopupMenu(object):
         c.pack()
         self._canvas = c
         self._render()
-        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        px = max(0, min(int(x), sw - self._width))
-        py = max(0, min(int(y), sh - self._height))
+        area = win_frame.work_area_at(x, y, fallback=win)
+        if area is None:                      # 非 Windows 又拿不到窗口时按主屏算
+            area = (0, 0, win.winfo_screenwidth(), win.winfo_screenheight())
+        px, py = win_frame.clamp_pos(area, x, y, self._width, self._height)
+        # 必须带 "+" 前缀：负坐标（副屏在主屏左侧/上方时）写成 "+-1000"，
+        # 少了这个加号，Tk 会把 "-1000" 当成「距右边缘 1000」。
         win.geometry("+%d+%d" % (px, py))
         c.bind("<Motion>", self._on_motion)
         c.bind("<Button-1>", self._on_click)
@@ -3747,9 +4468,9 @@ class SlimScrollbar(tk.Canvas):
     （CARD_PADX）里，拇指是圆角小条，颜色随皮肤由面板底色向次级文字色混合而来。
     """
 
-    W = 8          # 占位宽度（画 6px 拇指，两侧各留 1px，不压到卡片）
-    INSET = 4      # 上下留白，拇指不贴面板边缘
-    THUMB_MIN = 26
+    W = dpi.px(8)          # 占位宽度（画 6px 拇指，两侧各留 1px，不压到卡片）
+    INSET = dpi.px(4)      # 上下留白，拇指不贴面板边缘
+    THUMB_MIN = dpi.px(26)
 
     def __init__(self, master, bg, palette, target):
         tk.Canvas.__init__(self, master, width=self.W, bd=0, highlightthickness=0,
@@ -4003,6 +4724,120 @@ class ScrollPanel(tk.Frame):
         self.canvas.yview_scroll(-direction * 3, "units")
 
 
+class ScrollBody(tk.Frame):
+    """对话框里的可滚动内容区：装得下就不滚，装不下才出现右侧那根细滚动条。
+
+    为什么不直接用 `ScrollPanel`：那个是给侧栏/列表写的，两处差得不小。
+
+    1. **它用 `bind_all` 兜底滚轮**。`bind_all` 在 Tk 里是**替换**不是追加，
+       弹窗里再造一个就会把侧栏的兜底抢走（关掉弹窗后侧栏滚不动）。这里改由
+       宿主 Toplevel 转发（见 `bind_wheel`）—— 弹窗带 grab，滚轮本来就只落在它身上。
+    2. **高度由内容决定**。侧栏是铺满的，弹窗不是：内容矮时画布高度得收到内容高，
+       下面不能留一片空白；内容超高时才由 `fit()` 钉到可用高，多出来的滚动看。
+
+    为什么需要它：全局设置窗内容原本 735px，加 31px 系统标题栏 = 766px，而 768 高的屏
+    扣掉任务栏只剩 738（副屏）—— 底缘连「确定 / 取消」一起被推出屏幕。
+    压间距只能省下 30px 左右，换台 125% 缩放的笔记本就彻底救不回来，所以改成能滚。
+    现在设置窗更进了一步：整窗固定到「数据管理」窗的高度（见 app_ui._panel_height），
+    内容一律滚动查看，矮屏再由 fit() 按屏幕可用高压一道。
+    """
+
+    def __init__(self, parent, bg, palette):
+        tk.Frame.__init__(self, parent, bg=bg)
+        self.canvas = tk.Canvas(self, bg=bg, highlightthickness=0, bd=0,
+                                yscrollincrement=dpi.px(20))
+        self.inner = tk.Frame(self.canvas, bg=bg)
+        self._iid = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # 细滚动条自己 place 在右侧、内容没溢出时自动隐藏（见 SlimScrollbar.sync）
+        self.sb = SlimScrollbar(self, bg, palette, self.canvas)
+        self.canvas.configure(yscrollcommand=self._on_yscroll)
+        self.inner.bind("<Configure>", lambda e: self._sync())
+        self.canvas.bind("<Configure>", self._on_cfg)
+
+    # ---------- 对外 ----------
+    def fit(self, avail_h):
+        """把可视区高度定成 min(内容高, avail_h)，返回最终占用的高度。
+
+        必须在 `wm geometry` **之前**调：弹窗高度是按 reqheight 算的，这里改了
+        画布高度，reqheight 才会跟着变（`_center_dialog` 的 fit_body 就是这么用的）。
+        """
+        self.update_idletasks()
+        h = self.content_height()
+        h = max(dpi.px(120), min(h, int(avail_h)))
+        w = max(self.canvas.winfo_width(), self.content_width(), dpi.px(320))
+        self.canvas.configure(width=w, height=h)
+        self.update_idletasks()
+        self._sync()
+        return h
+
+    def bind_wheel(self, top):
+        """让整个弹窗（含所有子控件）的滚轮都滚这块内容。
+
+        绑在 Toplevel 上而不是逐个控件：Tk 的事件**不向父控件冒泡**，但顶层窗口
+        始终在 bindtags 里（[自己, 类, 顶层, all]），子控件上的滚轮一定会经过它。
+        返回 "break" 是为了拦住 "all" 那一级 —— 侧栏的 bind_all 兜底就挂在那儿，
+        不拦的话弹窗里滚一下，背后的笔记列表也跟着滚。
+        """
+        def _wheel(e):
+            d = int(getattr(e, "delta", 0)) // 40
+            if d:
+                self.canvas.yview_scroll(-d, "units")
+            return "break"
+
+        top.bind("<MouseWheel>", _wheel, add="+")
+        top.bind("<Button-4>",
+                 lambda e: self.canvas.yview_scroll(-3, "units"), add="+")
+        top.bind("<Button-5>",
+                 lambda e: self.canvas.yview_scroll(3, "units"), add="+")
+
+    def apply_theme(self, pal, bg=None):
+        """换肤：外框 / 内容画布 / 内框 / 右侧细滚动条四层底色一起换。
+
+        不重建画布，所以 scrollregion、yview、已经滚到的位置都原样保留 —— 弹窗
+        换主题时用户不会被甩回顶部，也不用拿快照把位置搬来搬去。
+        """
+        bg = bg or pal["editor"]
+        self.configure(bg=bg)
+        self.canvas.configure(bg=bg)
+        self.inner.configure(bg=bg)
+        self.sb.apply_theme(pal, bg)
+
+    # ---------- 内部 ----------
+    def content_height(self, settle=True):
+        if settle:
+            try:
+                self.inner.update_idletasks()
+            except Exception:
+                pass
+        h = self.inner.winfo_reqheight()
+        if h <= 1:                      # 还没布局：退回图元包围盒
+            b = self.canvas.bbox("all")
+            h = (b[3] - b[1]) if b else 0
+        return h
+
+    def content_width(self):
+        w = self.inner.winfo_reqwidth()
+        if w <= 1:
+            b = self.canvas.bbox("all")
+            w = (b[2] - b[0]) if b else 0
+        return w
+
+    def _on_yscroll(self, first, last):
+        self.sb.sync(first, last)
+
+    def _on_cfg(self, e):
+        self.canvas.itemconfigure(self._iid, width=e.width)
+        self._sync()
+
+    def _sync(self):
+        """刷新可滚区域；内容没溢出时区域锁成可视高（滚轮就完全不动）。"""
+        w = self.canvas.winfo_width() or self.content_width() or 200
+        h = max(self.content_height(settle=False), self.canvas.winfo_height())
+        self.canvas.configure(scrollregion=(0, 0, w, h))
+        self.sb.sync(*self.canvas.yview())
+
+
 def _has_cjk(s):
     """是否含中日韩字符 / 全角符号（这些字走中文字体，行高比等宽字体高）。"""
     for ch in s:
@@ -4053,14 +4888,14 @@ class HRule(tk.Frame):
     宽度跟随编辑区，删除是整块删除，不会在数据里留下任何字符。
     """
 
-    PAD_Y = 9            # 线上下留白（线本身 1px）
+    PAD_Y = dpi.px(9)            # 线上下留白（线本身 1px）
 
     def __init__(self, parent, app):
         tk.Frame.__init__(self, parent, bd=0, highlightthickness=0, cursor="arrow")
         self.app = app
         self._width = 0
         self._color = "#c9c9d1"
-        self._cv = tk.Canvas(self, height=self.PAD_Y * 2 + 1, bd=0,
+        self._cv = tk.Canvas(self, height=self.PAD_Y * 2 + dpi.px(1), bd=0,
                              highlightthickness=0)
         self._cv.pack(fill=tk.X)
         self.apply_theme(app.pal)
@@ -4081,7 +4916,7 @@ class HRule(tk.Frame):
         """宽度由编辑区决定（Text 按 window 的请求宽度摆放）。"""
         self._width = max(1, int(w))
         try:
-            self._cv.configure(width=self._width, height=self.PAD_Y * 2 + 1)
+            self._cv.configure(width=self._width, height=self.PAD_Y * 2 + dpi.px(1))
         except Exception:
             pass
         self._redraw()
@@ -4093,7 +4928,8 @@ class HRule(tk.Frame):
         if w <= 1:
             return
         y = self.PAD_Y
-        cv.create_line(4, y, w - 4, y, fill=self._color, width=1)
+        cv.create_line(dpi.px(4), y, w - dpi.px(4), y, fill=self._color,
+                       width=dpi.px(1))
 
     def _focus_text(self):
         """点一下线，焦点要回到正文——否则接着打字全都打不进去。"""
@@ -4133,13 +4969,13 @@ class CodeBlock(tk.Frame):
     细滚动条），宽度跟随编辑区宽度，窗口缩放时不跑版。
     """
 
-    HEADER_H = 26
-    PADX = 10
-    PADY = 7
-    MAX_H = 560             # 代码区最高像素（约 33 行）；超过就内部滚动 + 右侧细滚动条
+    HEADER_H = dpi.px(26)
+    PADX = dpi.px(10)
+    PADY = dpi.px(7)
+    MAX_H = dpi.px(560)             # 代码区最高像素（约 33 行）；超过就内部滚动 + 右侧细滚动条
 
     def __init__(self, parent, app, lang="", code=""):
-        tk.Frame.__init__(self, parent, bd=0, highlightthickness=1)
+        tk.Frame.__init__(self, parent, bd=0, highlightthickness=dpi.px(1))
         self.app = app
         self.lang = lang if lang in CODE_LANG_LABEL else ""
         self._loading = True
@@ -4162,21 +4998,21 @@ class CodeBlock(tk.Frame):
         self._head.pack(fill=tk.X)
         self._head.pack_propagate(False)
         # 语言标签：点了弹出语言菜单（可随时改语言 / 复制 / 删除这一块）
-        self._chip = tk.Label(self._head, bd=0, padx=7, pady=1, cursor="hand2")
-        self._chip.pack(side=tk.LEFT, padx=(8, 0), pady=3)
+        self._chip = tk.Label(self._head, bd=0, padx=dpi.px(7), pady=dpi.px(1), cursor="hand2")
+        self._chip.pack(side=tk.LEFT, padx=(dpi.px(8), 0), pady=dpi.px(3))
         self._chip.bind("<Button-1>", self._open_menu)
-        self._copy = tk.Label(self._head, bd=0, padx=6, pady=1, text="复制", cursor="hand2")
-        self._copy.pack(side=tk.RIGHT, padx=(0, 8), pady=3)
+        self._copy = tk.Label(self._head, bd=0, padx=dpi.px(6), pady=dpi.px(1), text="复制", cursor="hand2")
+        self._copy.pack(side=tk.RIGHT, padx=(0, dpi.px(8)), pady=dpi.px(3))
         self._copy.bind("<Button-1>", lambda e: self.copy_code())
         self._copy.bind("<Enter>", lambda e: self._copy.configure(fg=self.app.pal["accent"]))
         self._copy.bind("<Leave>", lambda e: self._copy.configure(fg=self.app.pal["soft"]))
         # 格式化：先 pack 复制、再 pack 格式化，RIGHT 侧从右往左叠 → 格式化落在复制左边
-        self._fmt = tk.Label(self._head, bd=0, padx=6, pady=1, text="格式化", cursor="hand2")
-        self._fmt.pack(side=tk.RIGHT, padx=(0, 2), pady=3)
+        self._fmt = tk.Label(self._head, bd=0, padx=dpi.px(6), pady=dpi.px(1), text="格式化", cursor="hand2")
+        self._fmt.pack(side=tk.RIGHT, padx=(0, dpi.px(2)), pady=dpi.px(3))
         self._fmt.bind("<Button-1>", lambda e: self.format_code())
         self._fmt.bind("<Enter>", lambda e: self._fmt.configure(fg=self.app.pal["accent"]))
         self._fmt.bind("<Leave>", lambda e: self._fmt.configure(fg=self.app.pal["soft"]))
-        self._sep = tk.Frame(self, height=1, bd=0, highlightthickness=0)
+        self._sep = tk.Frame(self, height=dpi.px(1), bd=0, highlightthickness=0)
         self._sep.pack(fill=tk.X)
         self._body = tk.Frame(self, bd=0, highlightthickness=0)
         self._body.pack(fill=tk.BOTH, expand=True)
@@ -4214,7 +5050,7 @@ class CodeBlock(tk.Frame):
         self.inner.bind("<Map>", lambda e: self.app._after_idle(self.fit))
         self.inner.bind("<Escape>", lambda e: (self.app.text.focus_set(), "break")[1])
         self._head.bind("<Button-1>", lambda e: self.focus_code())
-        self.configure(height=self.HEADER_H + 1 + self._line_h + 2 * self.PADY)
+        self.configure(height=self.HEADER_H + dpi.px(1) + self._line_h + 2 * self.PADY)
 
     def _measure_line(self):
         """量出「纯等宽行」和「含中文行」的行高 + 单字符宽度（等宽字体，可直接算换行）。"""
@@ -4577,7 +5413,7 @@ class CodeBlock(tk.Frame):
         # 也可能给个 0.83 之类的值（末尾空行的算法），拿它判断会误判、误显示。
         self._scrolls = content > self.MAX_H + 1
         self._body_h = min(content, self.MAX_H) + 2 * self.PADY
-        want = self.HEADER_H + 1 + self._body_h
+        want = self.HEADER_H + dpi.px(1) + self._body_h
         try:
             if abs(int(self.cget("height")) - want) > 1:
                 self.configure(height=want)
@@ -4591,6 +5427,12 @@ class CodeBlock(tk.Frame):
         不能直接把滚动条挂成 yscrollcommand：Tk 在内容正好装下时也会给个
         0.83 之类的比例（末尾空行的算法），只按比例判断会误显示滚动条。
         """
+        # 行号栏是按「代码块内部每一行」编号的（见 app_ui._gutter_block_numbers），
+        # 块内一滚，数字就得跟着换 —— 这条回调是块内滚动的唯一出口，不能漏。
+        try:
+            self.app._gutter_schedule()
+        except Exception:
+            pass
         try:
             self._sb_view = (float(first), float(last))
         except Exception:

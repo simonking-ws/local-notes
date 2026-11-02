@@ -25,7 +25,8 @@ import backup                                                   # noqa: E402
 from store import (Store, plain_of, _t, _cb, seed, _fix_sample_note,  # noqa: E402
                    _mark_sample_note, _upgrade_sample_note, like_escape,
                    folder_children, folder_depth, folder_ancestors, subtree_ids,
-                   normalize_folder_parents, set_all_collapsed, MAX_FOLDER_DEPTH)
+                   normalize_folder_parents, set_all_collapsed, MAX_FOLDER_DEPTH,
+                   _ensure_system_folder, SYSTEM_FOLDER)
 from md_conv import TODO_OFF, TODO_ON, TODO_GAP, TODO_GAP_TAG, LI_INDENT   # noqa: E402
 
 
@@ -168,8 +169,14 @@ class StoreTest(TmpCase):
     def test_first_load_seeds_initial_data(self):
         s = Store(self.path())
         d = s.load()
-        self.assertEqual(len(d["folders"]), 5)      # 三个智能分类 + 工作 / 个人
+        self.assertEqual(len(d["folders"]), 6)      # 三个智能分类 + 工作 / 个人 + 系统
         self.assertEqual(len(d["notes"]), 4)
+        # 「系统」是文件夹里的第一格（在「工作」上面），说明笔记住在里面
+        self.assertEqual([f["id"] for f in d["folders"]],
+                         ["f_all", "f_star", "f_lock", SYSTEM_FOLDER,
+                          "f_work", "f_life"])
+        sample = [n for n in d["notes"] if n.get("sample")][0]
+        self.assertEqual(sample["folder"], store.SYSTEM_FOLDER)
         s.close()
 
     def test_first_load_migrates_legacy_json(self):
@@ -308,8 +315,9 @@ class StoreTest(TmpCase):
         for key in ("Ctrl+N", "Ctrl+S", "Ctrl+1", "Ctrl+Shift+K", "Ctrl+Y",
                     "Ctrl+E", "Ctrl+K", "Ctrl+D", "Ctrl+Shift+Z"):
             self.assertIn(key, txt)
-        # Ctrl+F（聚焦搜索框）已按需求撤掉：搜索改用鼠标点搜索框，表里不能再出现
-        self.assertNotIn("Ctrl+F", txt)
+        # Ctrl+F 现在绑定「本篇内查找」（曾经撤掉过，2026-11-04 按需求加回）
+        self.assertIn("Ctrl+F", txt)
+        self.assertIn("本篇内查找", txt)
         # 引用块的按钮和快捷键（Ctrl+Shift+Q）已按需求撤掉，只保留 `> ` 前缀输入
         self.assertNotIn("Ctrl+Shift+Q", txt)
         self.assertEqual(txt.count("Ctrl+Shift+K"), 1)
@@ -376,6 +384,27 @@ class StoreTest(TmpCase):
         before = self._plain(other)
         _upgrade_sample_note(d)
         self.assertEqual(self._plain(other), before)
+
+    def test_upgrade_replaces_whole_content(self):
+        """正文与 `sample_content()` 不一致就整篇换掉。
+
+        说明笔记在编辑器里是只读的，用户改不动它，所以「保留用户改动」无从谈起；
+        整篇对齐一份内容，重排一次版式老用户才看得到（只换尾部那两节的话，
+        简介、三步开始这些新加的部分永远进不去）。
+        """
+        d, n = self._legacy_sample()
+        self.assertTrue(_upgrade_sample_note(d))
+        self.assertEqual(n["content"], store.sample_content())
+        self.assertFalse(_upgrade_sample_note(d))          # 再跑一次不动
+
+    def test_sample_note_shape_is_shared(self):
+        """seed 里的说明笔记与导入后重建的那篇同源（new_sample_note）。"""
+        want = store.new_sample_note(now=1.0)
+        got = [x for x in seed()["notes"] if x.get("sample")][0]
+        self.assertEqual(sorted(got), sorted(want))
+        self.assertEqual(got["content"], want["content"])
+        self.assertTrue(got["sample"] and got["pinned"])
+        self.assertEqual(got["folder"], store.SYSTEM_FOLDER)
 
 
 class SearchTest(TmpCase):
@@ -500,10 +529,13 @@ class ImportTest(unittest.TestCase):
              "notes": [{"id": "n1", "folder": "f_gone", "content": _t("孤儿")},
                        {"id": "n2", "content": "坏数据"}]}
         out = self._overwrite(d)
-        self.assertEqual([f["id"] for f in out["folders"]][:4],
-                         ["f_all", "f_star", "f_lock", "f_mine"])
-        self.assertEqual([n["id"] for n in out["notes"]], ["n1"])
-        self.assertEqual(out["notes"][0]["folder"], "f_work")
+        # 三个智能分类打头，紧跟程序自带的「系统」，然后才是备份里的真实文件夹
+        self.assertEqual([f["id"] for f in out["folders"]][:5],
+                         ["f_all", "f_star", "f_lock", SYSTEM_FOLDER, "f_mine"])
+        # 覆盖导入会补一篇内置说明（备份本身不导出它），只断言备份里那一条
+        self.assertEqual([n["id"] for n in out["notes"] if not n.get("sample")], ["n1"])
+        got = next(n for n in out["notes"] if n["id"] == "n1")
+        self.assertEqual(got["folder"], "f_work")
 
     def test_merge_import_keeps_existing_and_renames_conflicts(self):
         cur = {"folders": [{"id": "f_work", "name": "工作"}],
@@ -512,9 +544,11 @@ class ImportTest(unittest.TestCase):
                          {"id": "f_new", "name": "新文件夹"}],
              "notes": [note("dup", "备份里的同名 id"), note("other", "备份里新的")]}
         out = self._merge(d, cur)
-        # 合并后的文件夹列表同样以三个智能分类打头（它们是视图，不在备份里也补）
+        # 合并后的文件夹列表同样以三个智能分类打头（它们是视图，不在备份里也补），
+        # 紧跟程序自带的「系统」，其余按备份里的顺序（系统不随备份走）
         self.assertEqual([f["id"] for f in out["folders"]],
-                         ["f_all", "f_star", "f_lock", "f_work", "f_new"])
+                         ["f_all", "f_star", "f_lock", SYSTEM_FOLDER,
+                          "f_work", "f_new"])
         ids = [n["id"] for n in out["notes"]]
         self.assertEqual(ids[0], "dup")
         self.assertNotIn("dup", ids[1:])                # 冲突的另起新 id
@@ -525,7 +559,60 @@ class ImportTest(unittest.TestCase):
         out = self._merge({"folders": [{"id": "f_x", "name": "X", "smart": True}],
                            "notes": []},
                           {"folders": [], "notes": []})
-        self.assertNotIn("smart", out["folders"][-1])
+        # 按 id 找，别取 [0]：排头那格是程序自带的「系统」文件夹
+        got = next(f for f in out["folders"] if f["id"] == "f_x")
+        self.assertNotIn("smart", got)
+
+
+class SystemFolderTest(unittest.TestCase):
+    """「系统」文件夹：程序自带的一格，只装内置说明，排在第一个真实文件夹位（「工作」上面）。
+
+    它没有自己的库字段，判定只认固定 id —— 所以这里守的是「补建 / 规整 / 兜底」
+    三件事，任何一件漏了，老库升级或导入之后就会出现「两格系统」或「说明笔记
+    还躺在工作里」。
+    """
+
+    def test_ensure_is_idempotent(self):
+        d = seed()
+        self.assertFalse(_ensure_system_folder(d))
+        self.assertFalse(_ensure_system_folder(d))
+
+    def test_ensure_adds_and_adopts_sample(self):
+        """老库：没有系统的这一格，说明笔记还躺在「工作」下。"""
+        d = {"folders": [{"id": "f_work", "name": "工作"}],
+             "notes": [{"id": "s1", "folder": "f_work", "sample": True},
+                       {"id": "n1", "folder": "f_work"}]}
+        self.assertTrue(_ensure_system_folder(d))
+        self.assertEqual(d["folders"][0]["id"], SYSTEM_FOLDER)
+        self.assertEqual(d["folders"][0]["name"], "系统")
+        self.assertEqual(d["folders"][1]["id"], "f_work")       # 排在「工作」上面
+        self.assertEqual(d["notes"][0]["folder"], SYSTEM_FOLDER)
+        self.assertEqual(d["notes"][1]["folder"], "f_work")     # 用户笔记不动
+
+    def test_ensure_normalizes_name_parent_and_order(self):
+        """被改名 / 挂到别的文件夹下 / 塞了 smart 或 collapsed 的历史数据。"""
+        d = {"folders": [{"id": SYSTEM_FOLDER, "name": "杂项", "parent": "f_x",
+                          "collapsed": True, "smart": True},
+                         {"id": "f_work", "name": "工作"}],
+             "notes": []}
+        self.assertTrue(_ensure_system_folder(d))
+        self.assertEqual(d["folders"][0],
+                         {"id": SYSTEM_FOLDER, "name": "系统"})
+        self.assertEqual(d["folders"][1]["id"], "f_work")       # 提到「工作」上面
+
+    def test_ensure_rescues_foreign_note(self):
+        """普通笔记误落系统区 → 退回「工作」：否则它被锁在一个动不了的角落。"""
+        d = {"folders": [{"id": "f_work", "name": "工作"},
+                         {"id": SYSTEM_FOLDER, "name": "系统"}],
+             "notes": [{"id": "n1", "folder": SYSTEM_FOLDER}]}
+        self.assertTrue(_ensure_system_folder(d))
+        self.assertEqual(d["notes"][0]["folder"], "f_work")
+
+    def test_backup_skips_system_folder(self):
+        """备份不导出系统那一格（导入时补），也不导出说明笔记。"""
+        payload = backup.encode(seed())
+        self.assertNotIn(SYSTEM_FOLDER, [f["id"] for f in payload["folders"]])
+        self.assertEqual([n for n in payload["notes"] if n.get("sample")], [])
 
 
 class SaveFailureTest(unittest.TestCase):
@@ -582,7 +669,7 @@ class SaveFailureTest(unittest.TestCase):
             snap = json.load(f)
         back, _warn = backup.decode(snap)
         back = backup.overwrite(back)
-        self.assertEqual([n["id"] for n in back["notes"]], ["n1"])
+        self.assertEqual([n["id"] for n in back["notes"] if not n.get("sample")], ["n1"])
 
     def test_close_clears_singleton(self):
         """close() 之后 store() 必须重新连库，不能返回已关闭的连接。"""

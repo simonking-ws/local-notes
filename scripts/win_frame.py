@@ -27,6 +27,8 @@ Alt+Tab / 边缘拖拽缩放都还是系统那一份。换来的代价只有三�
 import ctypes
 import sys
 
+import dpi
+
 WM_NCCALCSIZE = 0x0083
 WM_SIZE = 0x0005
 GWLP_WNDPROC = -4
@@ -62,6 +64,9 @@ if _IS_WIN:
         _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", _RECT),
                     ("rcWork", _RECT), ("dwFlags", ctypes.c_ulong)]
 
+    class _POINT(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
     _u32.GetParent.restype = wintypes.HWND
     _u32.GetParent.argtypes = [wintypes.HWND]
     _u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
@@ -70,6 +75,8 @@ if _IS_WIN:
     _u32.IsZoomed.argtypes = [wintypes.HWND]
     _u32.MonitorFromWindow.restype = wintypes.HMONITOR
     _u32.MonitorFromWindow.argtypes = [wintypes.HWND, ctypes.c_ulong]
+    _u32.MonitorFromPoint.restype = wintypes.HMONITOR
+    _u32.MonitorFromPoint.argtypes = [_POINT, ctypes.c_ulong]
     _u32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(_MONITORINFO)]
     _u32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     _u32.SetWindowLongPtrW.restype = ctypes.c_void_p
@@ -102,6 +109,105 @@ def work_area(win):
         return (r.left, r.top, r.right - r.left, r.bottom - r.top)
     except Exception:
         return (0, 0, win.winfo_screenwidth(), win.winfo_screenheight())
+
+
+def work_area_at(x, y, fallback=None):
+    """**点 (x, y) 所在那块显示器**的工作区（扣掉任务栏），返回 (x, y, w, h)。
+
+    与 `work_area(win)` 的区别：那个按「窗口在哪块屏」算，这个按「坐标在哪块屏」算。
+    浮层（右键菜单、气泡）必须用后者 —— 菜单是在鼠标那一点弹出来的，而鼠标完全
+    可以落在另一块屏上（甚至窗口横跨两块屏）。
+
+    ⚠️ 别用 `winfo_screenwidth()/screenheight()` 代替：Tk 那两个数只报**主屏**的
+    分辨率，而且副屏坐标在主屏左侧时是负数。多屏机器上拿它夹取，副屏弹出的菜单
+    会被拉到 x=0（主屏最左边），看上去就是「跨屏」；主屏右下角也会压到任务栏上。
+    """
+    if not _IS_WIN:
+        win = fallback
+        if win is not None:
+            return (0, 0, win.winfo_screenwidth(), win.winfo_screenheight())
+        return None
+    try:
+        mon = _u32.MonitorFromPoint(_POINT(int(x), int(y)), MONITOR_DEFAULTTONEAREST)
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        _u32.GetMonitorInfoW(mon, ctypes.byref(mi))
+        r = mi.rcWork
+        return (r.left, r.top, r.right - r.left, r.bottom - r.top)
+    except Exception:
+        if fallback is not None:
+            return (0, 0, fallback.winfo_screenwidth(),
+                    fallback.winfo_screenheight())
+        return None
+
+
+def clamp_pos(area, x, y, w, h, pad=0):
+    """把「左上角 (x, y)、尺寸 w×h」的浮层夹进工作区 `area`，返回 (x, y)。
+
+    浮层（右键菜单、悬停气泡、@ 候选层、对话框）都要做这件事，而每个都用
+    `winfo_screenwidth()` 手写一遍就是给多屏埋坑：那个数只报**主屏**，副屏坐标
+    又是负数，下限夹到 0 就等于把浮层拽到主屏最左边。算式收在这里，只此一份。
+
+    `pad` 是贴着右/下边时留的余量。"下方放不下就翻到锚点上方"那种翻转由调用方
+    自己算好 y 再传进来 —— 各处的翻转偏移不一样（候选层还要多让 22px），
+    硬统一反而会悄悄改掉某几处的手感。
+    """
+    ax, ay, aw, ah = area
+    return (min(max(int(x), ax), max(ax, ax + aw - w - pad)),
+            min(max(int(y), ay), max(ay, ay + ah - h - pad)))
+
+
+def fit_dialog(area, x, y, w, h, dx=0, dy=0, pad=0):
+    """把「客户区 w×h」的对话框摆进工作区 `area`，返回 (x, y, avail_h)。
+
+    传进来的 x/y 是**想要的客户区左上角**；返回的是 `wm geometry` 该填的值。两者
+    不是一回事：Tk 的 geometry x/y 指的是**窗口矩形**（含系统标题栏与那条看不见的
+    缩放边框）的左上角，而调用方手里只有客户区尺寸（`winfo_reqwidth/reqheight`）。
+    不换算就会从屏幕上沿或下沿漏出一条：副屏 738 高、设置窗 735 高时正好漏 31px，
+    底下那排「确定 / 取消」跟着看不见 —— 这就是「多屏 / 小屏上对话框底缘溢出」。
+
+    `dx` 是单侧边框宽、`dy` 是顶部标题栏高（见 `UIMixin._dlg_frame_pad`）。
+
+    返回的 `avail_h` 是这块屏上**客户区最多能有**多高（已扣标题栏、下边框与 pad）。
+    内容比它还高就说明「怎么摆都放不下」，调用方应把内容收进可滚区，而不是硬摆。
+    """
+    ax, ay, aw, ah = area
+    avail_h = ah - dy - dx - pad
+    x, y = clamp_pos(area, x - dx, y - dy,
+                     w + dx * 2, h + dy + dx, pad)
+    return (x, y, avail_h)
+
+
+def dialog_center_y(host_h, h, dy=0, dx=0):
+    """窗口垂直居中于主窗客户区时，该传给 `fit_dialog` 的**客户区 y**（相对主窗顶）。
+
+    `fit_dialog` 收的是客户区左上角，返回的却是窗口矩形（含标题栏）左上角，所以
+    这里必须按**整窗**算：整窗高 = 客户区 h + 标题栏 dy + 下边框 dx。先把整窗摆到
+    `(host_h - 整窗高)/2`，再把客户区相对窗口矩形的偏移 dy 加回来。
+
+    只按客户区 h 居中（`(host_h - h)//2`）会让窗口整体**偏上**半条标题栏：
+    窗口矩形比客户区多出的 dy + dx 没算进去，100% 缩放下约 11px。对 500px
+    上下的高弹窗，这点偏差叠在 1/3 摆法上尤其明显。
+    """
+    return (int(host_h) - (int(h) + int(dy) + int(dx))) // 2 + int(dy)
+
+
+def panel_canvas_height(target_h, avail_h, fixed, min_canvas=120):
+    """固定高度弹窗里，可滚内容区该有多高（纯函数）。
+
+    全局设置窗要和数据管理窗一样高，多出来的内容滚着看。整窗客户区高度 =
+    内容区（会滚）+ 底部按钮行等固定开销，所以这里反解内容区：
+
+        target_h：邻居窗的自然高度，也就是本窗的目标高度
+        avail_h ：`fit_dialog` 给的、这块屏客户区最多能有多高
+        fixed   ：不参与滚动的固定开销（按钮行 + 内边距）
+        min_canvas：内容区下限，调用方一般传 `dpi.px(120)`（与 ScrollBody.fit 一致）
+
+    取 `min(target, avail)` 是为了矮屏上宁可比邻居矮一截，也不能把按钮顶出屏外；
+    `max(...)` 是画布下限 —— 再矮内容就只剩一条缝，宁可让整窗略高于目标。
+    """
+    return max(int(min_canvas),
+               min(int(target_h), int(avail_h)) - max(0, int(fixed)))
 
 
 class WindowFrame(object):
@@ -405,7 +511,7 @@ class WindowFrame(object):
         self._notify_zoom()
 
     def restore(self):
-        box = self._restore_box or (0, 0, 1080, 700)
+        box = self._restore_box or (0, 0, dpi.px(1080), dpi.px(700))
         if _IS_WIN and self._hwnd and _u32.IsZoomed(self._hwnd):
             # 用户可能是用 Win+↑ / 双击让它变成「系统最大化」的，得先退出那个状态
             try:

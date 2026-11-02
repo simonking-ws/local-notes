@@ -184,6 +184,111 @@ class SearchHitTest(unittest.TestCase):
                 "%s：命中词在黄底上读不清（正文色没跟着主题走？）" % name)
 
 
+class EditorBandsTest(unittest.TestCase):
+    """编辑区两条横带：只读提示条 / 底部字数状态条。
+
+    用户 2026-11-05 报障：说明笔记里那条「内置示例笔记」提示条直接吃
+    pal["hover"]（列表行悬停色 #e3e9e0），和未选中标签 #e6e9e6 只差 6/255，
+    两条灰带连成一片；底部状态条 #f4f4f4 与白稿纸反差 1.10，等于没画。
+    把「至少差多少」写成断言，换肤、加主题时跑一遍就知道有没有退回旧坑。
+    """
+
+    def _tab_idle(self, p):
+        return theme._tab_idle_bg(theme._toolbar_bg(p))
+
+    def test_readonly_bar_is_not_an_inactive_tab(self):
+        for name in PALETTES:
+            p = pal_of(name)
+            idle = self._tab_idle(p)
+            ro = theme._readonly_bar_bg(p, idle)
+            self.assertGreaterEqual(
+                theme._color_dist(ro, idle), theme.RO_BAR_MIN_DIST,
+                "%s：提示条 %s 与未选中标签 %s 撞色了" % (name, ro, idle))
+            self.assertNotEqual(
+                ro, p["hover"], "%s：提示条不该再用列表行悬停色" % name)
+
+    def test_readonly_bar_is_visible_on_the_paper(self):
+        """提示条是「一张纸片」，不能淡到和白稿纸分不出，也不能和引用块同色。"""
+        for name in PALETTES:
+            p = pal_of(name)
+            ro = theme._readonly_bar_bg(p, self._tab_idle(p))
+            self.assertGreaterEqual(
+                theme._contrast_ratio(ro, p["editor"]), 1.12,
+                "%s：提示条 %s 在稿纸上浮不出来" % (name, ro))
+            self.assertGreater(
+                theme._color_dist(ro, theme._quote_bg(p)), 6,
+                "%s：提示条和引用块撞成同一张纸" % name)
+
+    def test_status_bar_follows_the_theme_accent(self):
+        """核心需求：换主题，状态条要变色。
+
+        旧实现只往稿纸压中性墨，而浅色主题的稿纸都是白的 —— 于是绿皮肤、
+        浅灰皮肤的状态条永远是同一个 #e3e3e3，换肤完全看不出来。
+        """
+        light, green = pal_of("light"), pal_of("green")
+        self.assertEqual(light["editor"], green["editor"],
+                         "稿纸同色才隔离得出「色相有没有跟着走」")
+        a, b = theme._status_bar_bg(light), theme._status_bar_bg(green)
+        self.assertGreater(
+            theme._color_dist(a, b), 20,
+            "浅灰 / 绿皮肤的状态条 %s / %s 几乎同色，等于没跟主题走" % (a, b))
+        for name in PALETTES:
+            c = theme._status_bar_bg(pal_of(name))
+            r, g, bl = theme._hex_rgb(c)
+            self.assertGreater(
+                max(r, g, bl) - min(r, g, bl), 8,
+                "%s：状态条 %s 仍是中性灰，没染上主题色相" % (name, c))
+
+    def test_status_bar_is_distinct_from_the_other_bands(self):
+        """两条带同色相最容易撞：提示条是淡纸片，状态条必须是更沉的一档。"""
+        for name in PALETTES:
+            p = pal_of(name)
+            bg = theme._status_bar_bg(p)
+            for other, label in (
+                    (theme._readonly_bar_bg(p, self._tab_idle(p)), "只读提示条"),
+                    (self._tab_idle(p), "未选中标签"),
+                    (theme._quote_bg(p), "引用块")):
+                self.assertGreaterEqual(
+                    theme._color_dist(bg, other), theme.FOOTER_BAND_MIN_DIST,
+                    "%s：状态条 %s 与%s %s 撞色" % (name, bg, label, other))
+
+    def test_status_bar_contrasts_with_the_paper(self):
+        """浅底压暗 / 深底提亮，方向由 _ink_target 定，但都得离稿纸够远。"""
+        for name in PALETTES:
+            p = pal_of(name)
+            bg = theme._status_bar_bg(p)
+            ratio = theme._contrast_ratio(bg, p["editor"])
+            self.assertGreaterEqual(
+                ratio, theme.FOOTER_MIN_RATIO,
+                "%s：状态条 %s 与稿纸反差只有 %.3f" % (name, bg, ratio))
+            # 上沿 1px 线要看得见（pal["line"] 只深 5% 的老坑）
+            self.assertGreater(
+                theme._color_dist(theme._status_bar_rule(p, bg), bg), 16,
+                "%s：状态条上沿细线等于没画" % name)
+
+    def test_status_bar_text_stays_readable(self):
+        """底染了主题色又沉一档，文字得按底色动态提深（9pt 小字 ≥4.5）。"""
+        for name in PALETTES:
+            p = pal_of(name)
+            bg = theme._status_bar_bg(p)
+            fg = theme._status_bar_fg(p, bg)
+            self.assertGreaterEqual(
+                theme._contrast_ratio(fg, bg), theme.FOOTER_FG_MIN_RATIO,
+                "%s：状态条小字 %s 在 %s 上读不清" % (name, fg, bg))
+            self.assertEqual(fg, theme._status_bar_fg(p),
+                             "%s：不传底色时也该算出同一个字色" % name)
+
+    def test_toolbar_bg_single_source(self):
+        """TabStrip 的常态色与提示条的参照色必须走同一个 _toolbar_bg 口径。"""
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import widgets                                          # noqa: E402
+        self.assertEqual(widgets.TOOL_BG_MIX, theme.TOOL_BG_MIX)
+        for name in PALETTES:
+            p = pal_of(name)
+            self.assertEqual(widgets._tab_idle_bg(widgets._toolbar_bg(p)),
+                             self._tab_idle(p))
+
+
 class ShadeTest(unittest.TestCase):
     """_shade / _away 这两个底层工具本身的行为。"""
 

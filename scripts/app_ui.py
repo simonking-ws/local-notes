@@ -3,6 +3,7 @@
 
 以 mixin 形态提供，最终由 notes_app.py 里的 class NotesApp(UIMixin, ActionsMixin) 组合。
 """
+import math
 import os
 import queue
 import re
@@ -13,17 +14,23 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
 
-from store import (APP_NAME, store, save_data,
-                   SMART_FOLDERS, LOCKED_BODY_TEXT, folder_children,
-                   subtree_ids)
-from theme import FONT, _RES
+# 像素常量要跟 DPI 走：SCALE 已在 notes_app.py 顶部定好（导入本模块之前）
+import dpi
+
+from store import (APP_NAME, save_data,
+                   SMART_FOLDERS, SYSTEM_FOLDER, LOCKED_BODY_TEXT, folder_children,
+                   subtree_ids, ensure_note_color, resolve_adjacent_colors,
+                   pick_note_color, NOTE_COLORS)
+from theme import (FONT, _RES, build_palette, DEFAULT_THEME, THEMES, list_themes,
+                   theme_label, on_accent)
 from widgets import (RoundButton, FontSizeSlider, ArrowButton,
                      SidebarToggle, SettingsButton, DataButton, AboutButton,
                      CreateButton, WindowButton,
                      ExpandAllButton, CollapseAllButton, TwistyButton,
                      TOP_BAR_H,
-                     ScrollJumpNav, MarqueeLabel, PopupMenu,
-                     ScrollPanel, HRule, Tooltip, TabStrip,
+                     ScrollJumpNav, MarqueeLabel, CountBadge, PopupMenu,
+                     ScrollPanel, ScrollBody, HRule, Tooltip, TabStrip,
+                     gutter_width, gutter_slots, gutter_hit_at,
                      SMART_ICON_ALL, SMART_ICON_STAR, SMART_ICON_LOCK,
                      FOLDER_ICON_W, FOLDER_ICON_H, CARD_RADIUS, CARD_PADX, CARD_GAP,
                      SIDEBAR_W, LIST_W, SEARCH_PADX,
@@ -31,28 +38,42 @@ from widgets import (RoundButton, FontSizeSlider, ArrowButton,
                      SEP_HIT_W, SIDE_MIN, SIDE_MAX, LIST_MIN, LIST_MAX, EDITOR_MIN,
                      FOLDER_TREE_INDENT, FOLDER_TWISTY_H,
                      PICK_ROW_H, PICK_INDENT,
-                     TOOLBAR_H, TOOL_LINE_MIX, TOOL_BG_MIX, JUMP_W, JUMP_GAP, TEXT_PADX,
+                     TOOLBAR_H, TOOL_LINE_MIX, JUMP_W, JUMP_GAP,
+                     VSCROLL_W,
+                     TEXT_PADX, TEXT_PADY, line_spacing,
                      READONLY_BAR_H,
                      BTN_PRESS_MIX, CODE_FONTS, CODE_LANGS, MENU_DANGER, _sel_fg,
                      _quote_bg, _sel_bg, _icode_bg, _hover_bg, _search_hit_bg,
                      GITHUB_URL, ISSUES_URL,
-                     _tinted_png_photo,
-                     _mix_hex, _contrast_ratio, _ink_target, _round_rect_points, _star_points)
+                     _tinted_png_photo, _icon_photo,
+                     _mix_hex, _ink_target, _round_rect_points, _star_points,
+                     _toolbar_bg, _tab_idle_bg,
+                     _readonly_bar_bg, _status_bar_bg, _status_bar_rule,
+                     _status_bar_fg, _draw_section_icon,
+                     repaint_widget_colors,
+                     AAImage, aa_disc, aa_ring, aa_left_half, aa_round_rect,
+                     aa_outline, aa_segment)
 from md_conv import (TODO_OFF, TODO_ON, TODO_LEGACY, TODO_MARKS, TODO_GAP, TODO_GAP_TAG,
                      LI_INDENT, split_list_prefix)
 import secret
 import updater
+from find_replace import replacement_plan
 from version import __version__
-from win_frame import WindowFrame, work_area
+from win_frame import (WindowFrame, work_area, work_area_at,
+                       fit_dialog, dialog_center_y, panel_canvas_height)
 
 
 # 编辑区底部状态条的高度（创建时间 / 修改时间 / 字数）。
-# 取 22 = 正文 pady 的底部留白：状态条正好落在这条留白里，浮出来不遮最后一行字。
-# 改这个值之前先看 Text 的 pady —— 两者绑在一起（见 _show_footer 里那条 place 说明）。
-FOOTER_H = 22
-# 触发状态条的「底部热区」高度。比状态条本身高一截：只留 22px 的话，
+# ⚠️ 不再等于 TEXT_PADY：2026-11-05 起 TEXT_PADY 让出 8px 给首行标题的 spacing1，
+# 但 9pt 一行字实测要 17px（100%），12px 的状态条会把字底裁掉，状态条仍保持 20。
+# 多出来的 (FOOTER_H - TEXT_PADY) = 8px 由 Text 的 pack 底部外边距补上，于是
+# 「正文最后一行 → 窗口底」仍是 20，状态条浮出来既不裁字、也不遮正文。
+FOOTER_H = dpi.px(20)
+# Text 的 pack 底部外边距：把被 TEXT_PADY 让出去的那 8px 还给底部留白。
+FOOTER_GAP = FOOTER_H - TEXT_PADY
+# 触发状态条的「底部热区」高度。比状态条本身高一截：只留 20px 的话，
 # 指针得像素级瞄准最下面那一条才碰得到，实际是「怎么移都不出来」。
-FOOTER_HOT_H = FOOTER_H + 26
+FOOTER_HOT_H = FOOTER_H + dpi.px(26)
 
 # 待办勾选框（字面字符 ⬜ / ✅，见 md_conv.TODO_OFF 里为什么不使用自绘控件）。
 # 未勾态的字符颜色 = chk_off 向主文字色混合 —— 和原来自绘空心框的描边同一套算法，
@@ -73,6 +94,12 @@ TODO_ICON_SCALE = 0.83
 # 返回的是「微软雅黑」，「Microsoft YaHei」永远匹配不上（老配置就栽在这）。
 TODO_ICON_FONTS = ("Segoe UI Emoji", "Segoe UI Symbol", "微软雅黑")
 
+# ---------- Ctrl+F 查找 / Ctrl+H 查找替换的浮条 ----------
+# 两个标签分开：FIND_HIT_TAG 是全部命中，FIND_CUR_TAG 是「当前跳到的那一条」。
+# 不与顶栏搜索的 "find" 合并，否则两边会互相抹掉对方的高亮（见 _config_tags）。
+FIND_HIT_TAG = "findhit"
+FIND_CUR_TAG = "findcur"
+
 # ---------- 笔记列表的行内间距 ----------
 # 单条笔记里「标题」与「正文预览」之间的留白（px，上下各一份）。
 # ⚠️ 别指望靠 `pl.pack(pady=...)` 调：预览顶边本来就是 0，那十几 px 空白
@@ -81,7 +108,7 @@ TODO_ICON_FONTS = ("Segoe UI Emoji", "Segoe UI Symbol", "微软雅黑")
 # 而标题 Canvas 只有 24，居中后下面自然空出 13px。所以这里给顶行定高
 # `标题字高 + 2×本值`，星标多出来的空白由父容器裁掉（裁到的全是内边距，
 # 星标字墨仍在正中，不会缺角）。
-NOTE_TITLE_GAP = 6
+NOTE_TITLE_GAP = dpi.px(6)
 
 # ---------- 竖向（矩形）选择 ----------
 # 键位：Alt + 左键拖动。Ctrl+Alt 也认 —— 那是 VS Code 的习惯，两种都收下。
@@ -119,8 +146,9 @@ def alt_key_down():
 #（它们只取第一段，混用会变成「加粗只作用于第一行那截」）。
 COLSEL_TAG = "colsel"
 # 列模式下「每行一根光标」的宽度（像素）。Tk 的 Text 只有一根系统光标，多光标只能
-# 自己画：每行一个这么宽的小窗 place 进正文，见 _col_caret_show。
-COL_CARET_W = 2
+# 自己画：每行一个这么宽的小窗 place 进正文，见 _col_caret_show。高度不写死 ——
+# 由 dlineinfo 的行盒逐行量（标题行 43、正文 28），光标才和所在行一样高。
+COL_CARET_W = dpi.px(2)
 # 拖出正文后的自动滚动节奏（ms）与每次滚动的行数
 COLSEL_SCROLL_MS = 45
 COLSEL_SCROLL_STEP = 1
@@ -153,15 +181,85 @@ def _panel_width(root=None):
         # ① 保证「关于」的 reqwidth 打不过它，三张窗才会**正好**一样宽；
         # ② 把宽度让给数据管理里最长的那句说明（512px），三段说明都能一行说完，
         #    不会出现「第一段折两行、后两段一行」的参差。
-        _PANEL_W = url_w + 180
+        _PANEL_W = url_w + dpi.px(180)
     return _PANEL_W
+
+
+# ---------- 信息型弹窗的统一高度 ----------
+_PANEL_H_FALLBACK = 504      # 100% 缩放下「数据管理」窗的实测客户区高度
+
+
+def _panel_height(app):
+    """「全局设置」该有多高 —— 直接量「数据管理」窗的自然高度。
+
+    不写死像素：数据管理窗的说明文字会随系统字体折行，换字体 / 换语言 / 高 DPI
+    都会让它的自然高度变。让设置窗去问它本人，两张窗才是同一把尺，而不是「在
+    我这台机器上刚好一样」。量法见 `open_data_manager(_measure=True)`：建一张
+    withdraw 的窗、摆完同样的内容、读 reqheight 后立刻销毁，不显示也不抢 grab。
+    每次打开设置窗量一次（几毫秒）且不缓存 —— 缓存会在数据管理窗改了布局后
+    悄悄留着旧值，那就又对不齐了。
+    """
+    try:
+        h = int(app.open_data_manager(_measure=True))
+        if h > 100:
+            return h
+    except Exception:
+        pass
+    return dpi.px(_PANEL_H_FALLBACK)
+
+
+def _draw_accent_bar(cv, w, h, color):
+    """在笔记卡片左缘画一条圆头色条（宽 4、上下各留 6、两端半圆）。
+
+    为什么不用现成的圆头图元（`create_oval` 或 `create_line(capstyle="round")`）：
+    Tk 的 Canvas 走 GDI 光栅化、**完全没有抗锯齿**，颜色非此即彼。4px 宽的条，
+    端头半径只有 2px，`create_oval` 会把偶数尺寸的包围盒向右多占一列 —— 顶端
+    2 像素、往下第三行却宽出 5 像素，右边多出一个 1px 的凸起（实测像素：
+    `..##..` / `####` / `#####` / `#####` / `####`），这就是「两头有毛刺」的来源。
+
+    所以这里自己按行栅格化：把端头当成半圆，逐行算出左右边界（浮点），
+    小数部分落到哪个像素就按覆盖率把**色条色与卡片底色混合**后画那一个像素。
+    中间直身段仍然是一个矩形，只有上下各 2 行要逐像素补，开销可以忽略。
+
+    坐标约定：x 取 4 而不是 0 —— 卡片有 CARD_RADIUS 圆角，贴边的竖条会在上下
+    拐角处戳到圆角外面；缩进 4 + 上下各留 6 之后整条都在卡片内部。
+    """
+    bw = dpi.px(4)
+    x0 = dpi.px(4)
+    y0, y1 = dpi.px(6), h - dpi.px(6)
+    if y1 - y0 < bw * 2:
+        return                  # 行被压得极矮时别画，否则端头糊成一团
+    bg = cv._color              # 当前卡片底色：混合色要跟着悬停/选中一起变
+    r = bw / 2.0
+    cv.create_rectangle(x0, y0 + r, x0 + bw, y1 - r, fill=color, outline="")
+    for y in range(int(y0), int(y1)):
+        cy = y + 0.5
+        if cy < y0 + r:
+            d = y0 + r - cy
+        elif cy > y1 - r:
+            d = cy - (y1 - r)
+        else:
+            continue            # 直身段，已经被上面那个矩形盖住了
+        dx = r - math.sqrt(max(0.0, r * r - d * d))
+        xs, xe = x0 + dx, x0 + bw - dx
+        li, xi = int(math.ceil(xs - 1e-9)), int(math.floor(xe + 1e-9))
+        if xs - math.floor(xs) > 1e-6:                  # 左端半覆盖像素
+            p = int(math.floor(xs))
+            cv.create_rectangle(p, y, p + 1, y + 1,
+                                fill=_mix_hex(bg, color, li - xs), outline="")
+        if math.floor(xe + 1e-9) - xe < -1e-6:          # 右端半覆盖像素
+            p = int(math.floor(xe))
+            cv.create_rectangle(p, y, p + 1, y + 1,
+                                fill=_mix_hex(bg, color, xe - p), outline="")
+        if xi > li:
+            cv.create_rectangle(li, y, xi, y + 1, fill=color, outline="")
 
 
 class UIMixin(object):
     def _build_ui(self):
         self.root.title(APP_NAME)
-        self.root.geometry("1080x700")
-        self.root.minsize(820, 540)
+        self.root.geometry("%dx%d" % (dpi.px(1080), dpi.px(700)))
+        self.root.minsize(dpi.px(820), dpi.px(540))
         # 窗口/任务栏/弹窗图标：笔记本+铅笔（替换 Tk 默认的羽毛）
         self._set_app_icon()
         # 自绘标题栏：下面那条 30px 顶栏就是窗口标题栏本身，系统那条会被顶掉
@@ -178,7 +276,7 @@ class UIMixin(object):
         # 的都是同一个 top），不带这一道两者会连成一片，标题栏到哪儿结束看不出来。
         # 不能用 pal["line"]（只比 top 深 5%，1px 肉眼看不出），改按顶栏色压深
         # 22%，实测在 1x 下是一条清楚的界线而不刺眼。
-        self.top_rule = tk.Frame(self.root, height=1, bg=self._top_rule_color())
+        self.top_rule = tk.Frame(self.root, height=dpi.px(1), bg=self._top_rule_color())
         self.top_rule.pack(fill=tk.X)
         # 窗口键：贴窗口右上角，先 pack 的先占最右，所以顺序是 关闭 → 最大化 → 最小化
         self.win_btns = {}
@@ -193,12 +291,12 @@ class UIMixin(object):
         # 唯一还带应用标识的地方。左侧留白 12px —— 原来是按左缘那条 22px 折叠条
         # 让位的，折叠条撤掉后改成与左栏搜索框同一个内边距（SEARCH_PADX），
         # 上下两条左缘才在同一条竖线上。
-        self.brand_icon_img = self._brand_photo(16)
+        self.brand_icon_img = self._brand_photo(dpi.px(16))
         if self.brand_icon_img is not None:
             self.brand_icon = tk.Label(self.top, image=self.brand_icon_img,
                                        bg=self.pal["top"], bd=0)
             self.brand_icon.pack(side=tk.LEFT, padx=(SEARCH_PADX, 0))
-            first_padx = 6
+            first_padx = dpi.px(6)
         else:
             self.brand_icon = None
             first_padx = SEARCH_PADX
@@ -212,9 +310,9 @@ class UIMixin(object):
         # 竖分割线：把「我是谁」（图标 + 应用名）和「能干什么」分成两段。
         # 用的是顶栏那条横分割线的同一份颜色（同样的压深 22%），一条横两条竖，
         # 粗细都是 1px、长度只占顶栏的一半 —— 是分隔符，不是边框。
-        self.top_divider = tk.Frame(self.top, width=1, height=16,
+        self.top_divider = tk.Frame(self.top, width=dpi.px(1), height=dpi.px(16),
                                     bg=self._top_rule_color())
-        self.top_divider.pack(side=tk.LEFT, padx=(10, 9))
+        self.top_divider.pack(side=tk.LEFT, padx=(dpi.px(10), dpi.px(9)))
         # 侧栏开关：标题右侧一枚小图标（图形照 icon/sz.svg 折算）。
         # 原样＝点击收起左侧两栏，折叠后换成水平镜像＝点击展开。
         # 左缘那条折叠条撤掉后，这里就是**唯一**的收起/展开入口。
@@ -229,7 +327,7 @@ class UIMixin(object):
         self.settings_btn = SettingsButton(self.top, self.pal,
                                            command=self.open_settings,
                                            base=self.pal["top"])
-        self.settings_btn.pack(side=tk.LEFT, padx=(10, 0))
+        self.settings_btn.pack(side=tk.LEFT, padx=(dpi.px(10), 0))
         # 数据管理：紧跟齿轮（图形照 icon/db.png 折算，数据库圆柱 + 右下一枚齿轮）。
         # 导出备份 / 导入数据 / 清空原本挤在设置弹窗下半部分，和「正文字体、字号」
         # 这类外观项混在一起，找起来得先想到「设置」；单独立一枚图标后，三件事
@@ -237,19 +335,19 @@ class UIMixin(object):
         self.data_btn = DataButton(self.top, self.pal,
                                    command=self.open_data_manager,
                                    base=self.pal["top"])
-        self.data_btn.pack(side=tk.LEFT, padx=(10, 0))
+        self.data_btn.pack(side=tk.LEFT, padx=(dpi.px(10), 0))
         # 关于：紧跟数据管理（图形照 icon/about.png 折算，圆圈 + i）。
         # 原本压在全局设置弹窗最底下，得先打开设置、再往下看才找得到；
         # 「代码在哪、这是谁做的」和导出/清空同属「关于这个应用」，各给一枚图标。
         self.about_btn = AboutButton(self.top, self.pal,
                                      command=self.open_about,
                                      base=self.pal["top"])
-        self.about_btn.pack(side=tk.LEFT, padx=(10, 0))
+        self.about_btn.pack(side=tk.LEFT, padx=(dpi.px(10), 0))
         # 第二条竖分割线：把「看」的一排（折叠/设置/数据/关于）和「动手」的那一枚
         # 隔开。与第一条同宽同高同色，两条竖线因此是一套标点，而不是两个边框。
-        self.create_divider = tk.Frame(self.top, width=1, height=16,
+        self.create_divider = tk.Frame(self.top, width=dpi.px(1), height=dpi.px(16),
                                        bg=self._top_rule_color())
-        self.create_divider.pack(side=tk.LEFT, padx=(10, 9))
+        self.create_divider.pack(side=tk.LEFT, padx=(dpi.px(10), dpi.px(9)))
         # 新建笔记：紧跟关于（图形照 icon/create.png 折算，记事本 + 铅笔），
         # 运行时染成强调色 —— 这排图标里只有它是「动手」的，其余都是「看」的。
         # 原来它是最右端那枚写着「新建笔记」的实心胶囊：文字按钮压在一条 30px
@@ -291,7 +389,7 @@ class UIMixin(object):
         # 搜索框跟着收起（place_forget），再展开时重新 place 回 holder 顶部。
         # holder 只负责占出这块位置和高度。
         self.search_holder = tk.Frame(self.side, bg=self.pal["side"], height=SEARCH_H)
-        self.search_holder.pack(fill=tk.X, padx=SEARCH_PADX, pady=(8, 4))
+        self.search_holder.pack(fill=tk.X, padx=SEARCH_PADX, pady=(dpi.px(8), dpi.px(4)))
         self.search_holder.pack_propagate(False)
         self.search_canvas = tk.Canvas(self.root,
                                        width=self._side_w - 2 * SEARCH_PADX,
@@ -322,7 +420,7 @@ class UIMixin(object):
         self.search_ent.bind("<FocusOut>", lambda e: self._update_search_ph())
         # 占位文字的显隐跟着 `_on_search_change` 一起刷新（不必再挂一条 trace）
         self.folder_panel = ScrollPanel(self.side, self.pal["side"], self.pal)
-        self.folder_panel.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 10))
+        self.folder_panel.pack(fill=tk.BOTH, expand=True, padx=dpi.px(8), pady=(dpi.px(2), dpi.px(10)))
         # 文件夹列底部不再摆「新建 / 删除文件夹」按钮：列表的空白处右键就是入口
         # （行上的右键仍是文件夹自己的菜单）。画布负责内容下方那大片留白，
         # inner 负责行与行之间的缝和分组标题以外的空隙。
@@ -339,7 +437,7 @@ class UIMixin(object):
         # 文件夹列宽度变化时让搜索框跟着对齐（它住在这一列顶部，宽度 = 列宽 - 留白）
         self.side.bind("<Configure>", lambda e: self._sync_search_width(), add="+")
         self.mid_head = tk.Label(self.list_frame, anchor="w", font=(FONT[0], 12, "bold"))
-        self.mid_head.pack(fill=tk.X, padx=16, pady=(7, 4))
+        self.mid_head.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(7), dpi.px(4)))
         self.note_panel = ScrollPanel(self.list_frame, self.pal["list"], self.pal)
         self.note_panel.pack(fill=tk.BOTH, expand=True)
 
@@ -348,6 +446,12 @@ class UIMixin(object):
         self._vsep2.pack(side=tk.LEFT, fill=tk.Y)
         self.editor_frame = tk.Frame(body)
         self.editor_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # 涂鸦标注层：临时模态，关闭即丢弃。蒙层盖的是**整个主窗口客户区**
+        # （2026-11-06 用户要求覆盖整个界面：顶栏 / 侧栏 / 列表 / 稿纸 / 状态条
+        # 一起进网点），窗口移动或缩放时按新几何重摆一次。折叠工具栏不改窗口
+        # 大小，蒙层也用不着跟着动，所以只挂 root。
+        self._doodle = None
+        self.root.bind("<Configure>", lambda e: self._doodle_relayout(), add="+")
         # 窗口一改宽，先按当前窗口把两栏夹回可用范围（只夹紧、不写回设置）。
         # 放在这里是因为 side / list_frame 都已存在，夹紧时能立刻见到效果。
         body.bind("<Configure>", lambda e: self._on_body_resize(), add="+")
@@ -355,6 +459,12 @@ class UIMixin(object):
         # 哪一栏上都能收到，处理函数里按 _sep_drag 判空放行，平时零成本。
         self.root.bind("<B1-Motion>", self._sep_motion, add="+")
         self.root.bind("<ButtonRelease-1>", self._sep_release, add="+")
+        # 笔记行拖拽的后半程同理（原因见 _note_press）：拖拽一开始会新建一个浮签
+        # 窗口，Windows 在焦点切换时会把 Tk 的本地 grab（SetCapture）收走，之后
+        # 指针一跨到别的行上，行自己的 <B1-Motion> 就再也收不到了。挂在顶层上
+        # 则走冒泡，跨行 / 跨栏 / 跨到编辑器都不会丢；`_drag` 为空时立即返回。
+        self.root.bind("<B1-Motion>", self._drag_on_motion, add="+")
+        self.root.bind("<ButtonRelease-1>", self._drag_on_release, add="+")
         # 工具栏：底色跟随皮肤侧栏色，与白色编辑区明确区分（bar 存成 self 以便换肤时重配色）
         bar = tk.Frame(self.editor_frame, height=TOOLBAR_H, bg=self.pal["side"])
         bar.pack(fill=tk.X)
@@ -363,7 +473,7 @@ class UIMixin(object):
         # 工具栏与编辑区之间的分隔线。展开时只有 1px，颜色比工具栏底色更深一档，
         # 给这条工具带收个口；工具栏被折叠后它变成 6px 的窄条 —— 这是「重新展开」
         # 的唯一入口，因为折叠后工具栏上所有按钮（含 ⋯）都一起消失了。
-        self._tool_bottom = tk.Frame(self.editor_frame, height=1, bg=self._tool_line())
+        self._tool_bottom = tk.Frame(self.editor_frame, height=dpi.px(1), bg=self._tool_line())
         self._tool_bottom.pack(fill=tk.X)
         self._tool_bottom.bind("<Button-1>", lambda e: self._expand_toolbar())
         self._tool_bottom.bind("<Enter>", self._on_toolbar_strip_enter, add="+")
@@ -374,14 +484,11 @@ class UIMixin(object):
         # 而活动标签底色 = 稿纸色，紧贴着下面的白纸，看上去就是「这张纸被抽出来」。
         self._tabs = []             # 打开着的笔记 id，按打开顺序
         self._tab_active = None
-        self.tabbar = TabStrip(self.editor_frame, self.pal,
-                               on_select=self._tab_go,
-                               on_close=self._tab_close,
-                               on_new=self.new_note,
-                               on_menu=self._tab_menu,
-                               on_reorder=self._tab_move,
-                               base=self._tool_bg())
-        self.tabbar.pack(fill=tk.X)
+        # 多标签关掉时 self.tabbar 为 None（标签条不存在这件事，全类都按「可能没有」处理）
+        self.tabbar = None
+        if self._multi_tab_enabled():
+            self.tabbar = self._make_tabbar()
+            self.tabbar.pack(fill=tk.X)
         self._tabs_restore()
 
         # 只读提示条：打开内置示例笔记或未解锁的加密笔记时出现，夹在工具带与稿纸之间。
@@ -392,31 +499,69 @@ class UIMixin(object):
         self._ro_restoring = False
         # 载入笔记期间为 True：这段时间编辑器由程序改动，不算用户编辑（见 load_editor）
         self._loading = False
+        # ⚠️ 底色别用 pal["hover"]（列表行悬停色）：它和未选中标签只差 6/255，
+        # 两条灰带会连成一片。改用主题色的淡纸片，见 _ro_bar_bg。
+        ro = self._ro_bar_bg()
         self._ro_bar = tk.Frame(self.editor_frame, height=READONLY_BAR_H,
-                                bg=self.pal.get("hover", "#ececf0"))
+                                bg=ro)
         self._ro_label = tk.Label(self._ro_bar,
                                   text="内置示例笔记 · 内容不可编辑（文字可以选中复制）",
-                                  bg=self.pal.get("hover", "#ececf0"),
+                                  bg=ro,
                                   fg=self.pal.get("soft", "#76767e"),
                                   font=(FONT[0], 10), anchor="w")
         self._ro_label.pack(side=tk.LEFT, padx=TEXT_PADX + 2)
         # 加密笔记未解锁时多一个入口：直接在提示条上点「输入口令」，
         # 不必再去右键菜单里找一遍
         self._ro_action = tk.Label(self._ro_bar, text="输入口令 →",
-                                   bg=self.pal.get("hover", "#ececf0"),
-                                   fg=self.pal["accent"], font=(FONT[0], 10, "bold"),
+                                   bg=ro,
+                                   fg=self._ro_accent_fg(), font=(FONT[0], 10, "bold"),
                                    anchor="w", cursor="hand2")
         self._ro_action.bind("<Button-1>", lambda e: self._unlock_current())
 
-        self.text = tk.Text(self.editor_frame, bd=0, padx=TEXT_PADX, pady=22, wrap=tk.WORD,
+        self.text = tk.Text(self.editor_frame, bd=0, padx=TEXT_PADX, pady=TEXT_PADY, wrap=tk.WORD,
                             undo=True,
                             font=(self.ui_font or FONT[0], self.body_size),
-                            spacing1=4, spacing3=4,
+                            spacing1=dpi.px(4), spacing2=dpi.px(8), spacing3=dpi.px(4),
                             highlightthickness=0, insertbackground=self.pal["accent"],
                             selectbackground=self.pal.get("sel", "#cfe0fb"),
                             inactiveselectbackground=self.pal.get("sel2", "#e0e9f7"),
                             selectforeground=_sel_fg(self.pal), exportselection=False)
-        self.text.pack(fill=tk.BOTH, expand=True)
+        # 底部外边距 FOOTER_GAP(8) 补回被 TEXT_PADY 让出去的那 8px：状态条改挂
+        # editor_frame 后整条浮在「8px 外边距 + 12px 下留白」里，不遮最后一行字。
+        self.text.pack(fill=tk.BOTH, expand=True, pady=(0, FOOTER_GAP))
+        # ---------- 左侧行号栏 ----------
+        # 独立一块 Canvas 贴在正文左边（不是 Text 里那种行号控件，Tk 没有）。
+        # 一列**等距**的数字：一格的高度 = 正文当前字号的行高（`_gutter_metrics`
+        # 量出来的 unit），每 unit 像素一个号往下数，空行和末尾的空白区都有号。
+        # ⚠️ 不要改回「按每行的 dlineinfo 贴齐」：标题、内嵌代码块的行高与 unit
+        # 差很多，贴齐的结果是 63 / 29 / 67 / 18×9 这种毫无规律的间距（用户否掉）。
+        # 创建在 text 之后、pack 时必须 before=text，否则会跑到正文右边去。
+        self._gutter_font = None
+        self._gutter_font_size = 0
+        self._gutter_job = None
+        self._gutter_phase = 0      # 刻度相位（见 _measure_gutter_phase）
+        self._gutter_hover = None   # 当前高亮的画布图元 id（不是行号，见 _gutter_hit）
+        self._gutter_lines = {}     # 显示号 → 画布图元 id（探针/调试用）
+        # 每个数字占据的纵向区间：[(top, bottom, 逻辑行, 图元 id)]。
+        # ⚠️ 不能用「行号 → 图元」的字典查命中：号是标尺数出来的，和逻辑行号
+        # 不再一一对应（代码块那一格占 260px，底下几行的号就差了 9），按号查会错位。
+        self._gutter_hit = []
+        # 查找 / 替换浮条：懒创建（不按 Ctrl+F、Ctrl+H 就永远不占内存），这里只占个位
+        self._find_bar = None
+        self._find_hits = []
+        self._find_idx = 0
+        self._find_job = None
+        self._replace_mode = False     # 替换行是否展开（Ctrl+H）
+        self.gutter = tk.Canvas(self.editor_frame, bd=0, highlightthickness=0,
+                                bg=self.pal["editor"], width=dpi.px(30))
+        self.gutter.bind("<Button-1>", self._on_gutter_click)
+        self.gutter.bind("<Button-3>", self._gutter_menu)
+        self.gutter.bind("<Motion>", self._on_gutter_motion, add="+")
+        self.gutter.bind("<Leave>", lambda e: self._gutter_hover_set(None), add="+")
+        self.gutter.bind("<Configure>", lambda e: self._gutter_schedule(), add="+")
+        self.gutter.bind("<MouseWheel>", self._on_gutter_wheel)
+        self.gutter.pack(side=tk.LEFT, fill=tk.Y, before=self.text)
+        self._apply_line_numbers(redraw=False)
         self._config_tags()
         self.text.bind("<<Modified>>", self.on_edit)
         self.text.config(state=tk.DISABLED)
@@ -439,7 +584,7 @@ class UIMixin(object):
         self.text.bind("<Control-Shift-K>",
                        lambda e: (self.insert_code(), "break")[1])
         self.text.bind("<Control-Shift-T>",
-                       lambda e: (self.insert_check(), "break")[1])
+                       lambda e: (self.apply_list_kind("check"), "break")[1])
         # 整行操作：Ctrl+D 复制当前行、Ctrl+Y 删当前行（有选区则作用于整块）。
         # Ctrl+Y 原本挂在重做上：删整行是天天要用几十次的动作，重做是偶尔一次，
         # 让高频的占走近的那组键；重做回到 Tk 默认的 Ctrl+Shift+Z（下面另有绑定，
@@ -457,8 +602,14 @@ class UIMixin(object):
         for _seq in ("<<Paste>>", "<<Cut>>", "<<Clear>>", "<<Undo>>", "<<Redo>>",
                      "<<PasteSelection>>"):
             self.text.bind(_seq, self._readonly_clip_guard, add="+")
-        # 搜索框没有快捷键：Ctrl+F 已按需求撤掉（Text 自带的 emacs「光标右移」也随之
-        # 恢复）。要用搜索就点搜索框 —— 它是顶栏上唯一可输入的地方，不愁找不到。
+        # Ctrl+F：本篇内查找（浮出查找框，不动左栏列表）。
+        # 必须绑在**实例**上并 return "break" —— Text 的类绑定把 Ctrl+F 接成了
+        # emacs 的「光标右移」，类绑定在 toplevel/all 之前跑，不在这里拦下来，
+        # 全局那条 bind_all 永远轮不到。
+        self.text.bind("<Control-f>", self._find_open)
+        # Ctrl+H：同一张浮条展开替换行。Text 的类绑定把 Ctrl+H 接成 emacs 的
+        # 「删除光标前一个字符」，不在这里绑实例 + break，按下去会先删一个字。
+        self.text.bind("<Control-h>", self._replace_open)
         # ---------- markdown 输入快捷 ----------
         # 敲完 "# " / "- " 这类块级前缀，敲空格那一刻就地转成已有的样式。
         # 这里**不能** return "break"：要让 Tk 先把空格插进去，idle 时才去看行首，
@@ -471,6 +622,9 @@ class UIMixin(object):
         # 点正文别处、滚轮、光标移出触发词时收起 —— 见 _mention_refilter
         for _seq in ("<Up>", "<Down>", "<Escape>"):
             self.text.bind(_seq, self._mention_key, add="+")
+        # 查找框开着时，焦点在正文里按 Esc 也要能关掉（候选面板没开时它才生效，
+        # 上面那条 _mention_key 先跑、它会 break 掉候选面板那一支）
+        self.text.bind("<Escape>", self._find_esc, add="+")
         for _seq in ("<Left>", "<Right>", "<Home>", "<End>",
                      "<Prior>", "<Next>", "<MouseWheel>"):
             self.text.bind(_seq, self._mention_recheck, add="+")
@@ -540,6 +694,9 @@ class UIMixin(object):
         # 实例绑定先于类绑定，标志位为假就 break 掉，TextSelectTo 根本不会执行。
         self._text_pressed = False
         self.text.bind("<Button-1>", self._on_text_press, add="+")
+        # 兜底：点到「有方框字符、却没有 todo 标签」的位置也要能打钩（粘贴 / 撤销 /
+        # 早期数据留下的裸方框）。排在 _on_text_press 之后：先记按下标志，再判方框。
+        self.text.bind("<Button-1>", self._on_click_untagged_todo, add="+")
         self.text.bind("<ButtonRelease-1>", self._on_text_release, add="+")
         self.text.bind("<B1-Motion>", self._on_text_drag)
         # 同一条链上还挂着 <B1-Leave> → tk::TextAutoScan：按住鼠标拖出正文时它每 50ms
@@ -563,6 +720,10 @@ class UIMixin(object):
         self.text.bind("<<SelectAll>>", self._colsel_drop, add="+")
         # 粘贴 / 剪切：列模式下改成「列粘贴 / 列剪切」（notepad++ 同款）。
         self.text.bind("<<Paste>>", self._col_paste, add="+")
+        # 粘贴进来的是**裸字符**：剪贴板只有文字、没有标签，粘出来的 ⬜ / ✅ 既小
+        # 又点不动（点击切换的 tag_bind 挂在 todo 上）。粘完补一遍标签。
+        self.text.bind("<<Paste>>", self._on_paste_fix_todo, add="+")
+        self.text.bind("<<PasteSelection>>", self._on_paste_fix_todo, add="+")
         self.text.bind("<<Cut>>", self._col_cut, add="+")
         # 键盘：可打印字符 = 列插入，Backspace / Delete = 列删除，其余键退出列模式。
         # ⚠️ 通用 <Key> 收不到「有更具体绑定」的那些键（见 _on_escape 的注释），
@@ -642,27 +803,13 @@ class UIMixin(object):
         self.frame_ctl.close()
 
     def _brand_photo(self, size):
-        """顶栏的应用图标：app_icon.png 缩到 size 见方。
+        """顶栏的应用图标：取 `icon/px/<size>/app_icon.png`（预渲染的精确尺寸）。
 
-        有 PIL 时走 LANCZOS（512px 直接 subsample 到 20px 会掉细节）；
-        没有 PIL 就退回 PhotoImage 的整数降采样 —— 还是零依赖也能跑。
+        这张不再走「512 原图现场缩」：16px 那一档是生成脚本单独调过饱和度与对比度
+        的（拟物图直接缩到 16px 只剩一团米色，铅笔认不出来），20/24/32/44 各有
+        各的档，取到就是对的尺寸，一个像素都不用插值。
         """
-        path = os.path.join(_RES, "app_icon.png")
-        if not os.path.exists(path):
-            return None
-        try:
-            from PIL import Image, ImageTk
-            resample = getattr(Image, "LANCZOS", getattr(Image, "BICUBIC", None))
-            im = Image.open(path).convert("RGBA").resize((size, size), resample)
-            return ImageTk.PhotoImage(im, master=self.root)
-        except Exception:
-            pass
-        try:
-            img = tk.PhotoImage(file=path, master=self.root)
-            k = max(1, int(round(max(img.width(), img.height()) / float(size))))
-            return img.subsample(k) if k > 1 else img
-        except Exception:
-            return None
+        return _icon_photo(self.root, "app_icon.png", size)
 
     def _bind_global_shortcuts(self):
         """焦点不在正文里（比如正停在列表或侧栏）也要能用的快捷键。
@@ -671,10 +818,19 @@ class UIMixin(object):
         兜底不会与之重复执行 —— 事件链是 widget > class > toplevel > all，
         前面的环节一旦 break 就轮不到 all。
         """
+        # 基础快捷键
         pairs = (
             ("<Control-n>", self.new_note),        # 新建笔记
             ("<Control-s>", self._flush_save),     # 立刻落库（平时是输入停顿后自动存）
             ("<Control-comma>", self.open_settings),  # 设置（同多数软件的 Ctrl+,）
+            ("<Control-f>", self._find_open),      # 本篇内查找
+            ("<Control-h>", self._replace_open),   # 本篇内查找替换
+        )
+        # 多标签快捷键：**始终绑**，由各回调自己判 _multi_tab_enabled() 决定要不要动。
+        # 不能在启动时按开关决定绑不绑 —— 开关能在设置里当场拨动，那样拨到「开」
+        # 之后快捷键要重启才活（而且解绑 bind_all 会连带清掉别的绑定）。
+        # 关着的时候按下去等于空操作，不会误伤别的功能。
+        pairs += (
             ("<Control-Tab>", self._tab_next),         # 下一个标签
             ("<Control-Shift-Tab>", self._tab_prev),   # 上一个标签
             # 部分键盘布局把 Shift+Tab 报成 ISO_Left_Tab（Windows 的 Tk 不认这个
@@ -689,7 +845,21 @@ class UIMixin(object):
         )
         for seq, fn in pairs:
             try:
-                self.root.bind_all(seq, lambda e, f=fn: (f(), "break")[1])
+                # 涂鸦是临时模态：Ctrl+N / 查找 / 切标签等一律挡掉，否则会趁
+                # 蒙层盖着的时候把正文换掉，退出时的快照就对不上了。
+                # ⚠️ bind_all 不受 grab 影响，光靠 grab_set 拦不住这些键。
+                self.root.bind_all(
+                    seq,
+                    lambda e, f=fn: ("break" if self.doodle_active()
+                                    else (f(), "break")[1]))
+            except Exception:
+                pass
+        # 涂鸦入口是唯一在模态里仍要响应的全局键：再按一次 = 退出。
+        # 两个写法都试一遍（不同 Tk 版本对 Shift+D 的 keysym 说法不一致）。
+        for seq in ("<Control-Shift-D>", "<Control-Shift-Key-D>"):
+            try:
+                self.root.bind_all(seq, lambda e: (self.toggle_doodle(), "break")[1])
+                break
             except Exception:
                 pass
 
@@ -741,6 +911,8 @@ class UIMixin(object):
             self._vscroll.set(first, last)
         except Exception:
             pass
+        # 行号跟着正文滚：它们不在同一个控件里，谁也不会替谁动
+        self._gutter_schedule(0)
         self._sync_jump_nav(float(first), float(last))
         if self._col_active():
             # 光标条是按屏幕坐标 place 的，内容一滚它们就全不在原处了；滚出视口
@@ -765,12 +937,15 @@ class UIMixin(object):
                 self._jump_placed = False
             return
         if not self._jump_placed:
-            # 右侧垂直居中，落在竖向滚动条左边一点，别压住滚动条。
+            # 竖向居中，停在**滚动条左侧**（滚动条占右缘 17px，胶囊不覆盖它 —— 它
+            # 任何一列都得能拖）。正文右留白 25，滚动条吃掉 17 之后只剩 8px 空隙，
+            # 26 宽的胶囊摆进去必然压住行尾那一两个字；这是「不挡滚动条」的必然代价，
+            # 别为了躲字再往右挪 —— 那就又盖回滚动条上了。
             # rely=0.5 是对整个编辑列取中，正文上面还有工具栏 + 标签条 —— 补回
             # 「顶部那截的一半」，导航才落在**正文**的正中（top 为 0 时正好不偏）。
             self.jump_nav.place(relx=1.0, rely=0.5, anchor="e",
                                 y=max(0, self.text.winfo_y() // 2),
-                                x=-(int(self._vscroll.winfo_reqwidth()) + JUMP_GAP))
+                                x=-(VSCROLL_W + JUMP_GAP))
             # 浮在正文之上（Canvas 的 lift 被重定向到 tag_raise，这里要走窗口层级的 raise）
             tk.Misc.lift(self.jump_nav)
             self._jump_placed = True
@@ -811,6 +986,827 @@ class UIMixin(object):
 
         step()
 
+    # ---------- 左侧行号 ----------
+    # 只做「看得见、点得到、能关掉」，不做断点/折叠之类的编辑器特权：
+    # 这是笔记软件不是 IDE，行号的用处是「刚才那句在第几行」和「快速定位」。
+
+    def _line_numbers_on(self):
+        """行号开关落在 settings.line_numbers（默认开）。"""
+        cfg = self.data.get("settings")
+        if not isinstance(cfg, dict):
+            return True
+        return bool(cfg.get("line_numbers", True))
+
+    def _apply_line_numbers(self, redraw=True):
+        """按开关挂上 / 摘下行号栏。切换后正文宽度会变，必须让 Text 重排一次。"""
+        g = getattr(self, "gutter", None)
+        if g is None:
+            return
+        on = self._line_numbers_on()
+        try:
+            managed = bool(g.winfo_manager())
+            if on and not managed:
+                # 必须 before=text：正文早就 pack 好了，裸 pack 会排到它右边去
+                g.pack(side=tk.LEFT, fill=tk.Y, before=self.text)
+                g.lift()
+            elif not on and managed:
+                g.pack_forget()
+        except Exception:
+            pass
+        if redraw:
+            # 刚 pack 的控件要等几何管理落定才 ismapped，否则 _gutter_redraw 会
+            # 因为「还没显示」直接返回，切开关后行号要等下次滚动才出现
+            try:
+                g.update_idletasks()
+            except Exception:
+                pass
+            self._gutter_schedule(0)
+
+    def set_line_numbers(self, on):
+        """改行号开关并落库（去抖，和正文用同一条保存链路）。"""
+        on = bool(on)
+        if on == self._line_numbers_on():
+            return
+        self.data.setdefault("settings", {})["line_numbers"] = on
+        self._apply_line_numbers()
+        self._schedule_save()
+
+    def _gutter_schedule(self, delay=8):
+        """把重绘推迟到本轮事件之后：一次滚动会连来好几条 yscroll，合并成一次画。"""
+        if not self._line_numbers_on():
+            return
+        if self._gutter_job is not None:
+            self._cancel_after(self._gutter_job)
+        self._gutter_job = self._after(delay, self._gutter_redraw)
+
+    def _gutter_redraw(self):
+        """重画行号：一列**等距**的数字，一格的高度 = 正文当前字号的行高。
+
+        unit 由 `_gutter_metrics()` 量出来（正文普通行的行高，含段间距），数字
+        每 unit 像素一个、从文档第一行往下连续数 —— 空行、正文末尾以下的空白
+        区域照样有号。因此：
+
+        * 行号列永远等距：敲字、插代码块、换字号都不会让某一段突然挤紧或拉开；
+        * 滚动时整列跟着正文一起上下走，数字与正文的相对位置恒定；
+        * 「一行」的口径是正文行高，不是某个控件自己的行距。
+
+        代价（用户拍板接受）：标题（字号更大）和内嵌代码块（行距更紧、整块
+        两百多像素高）那几行会偏十几像素 —— 它们的行距本来就不是 unit，
+        「等距」和「逐行贴齐」只能选一个。
+        """
+        self._gutter_job = None
+        g = getattr(self, "gutter", None)
+        if g is None:
+            return
+        try:
+            if not g.winfo_exists():
+                return
+        except Exception:
+            return
+        g.delete("all")
+        self._gutter_lines = {}
+        self._gutter_hit = []
+        self._gutter_hover = None
+        if not self._line_numbers_on() or not g.winfo_ismapped():
+            return
+        p = self.pal
+        h = g.winfo_height()
+        if h <= 1:
+            return
+        fam = getattr(self, "ui_font", None) or FONT[0]
+        # 比正文小两档：行号是参考信息，和正文同号会把眼睛往左拽
+        size = max(7, min(int(self.body_size) - 2, 13))
+        if self._gutter_font is None or self._gutter_font_size != size:
+            try:
+                self._gutter_font = tkfont.Font(family=fam, size=size)
+            except Exception:
+                self._gutter_font = None
+            self._gutter_font_size = size
+        unit, base = self._gutter_metrics()
+        unit = max(dpi.px(6), int(unit))
+        # Tk 的 Canvas 文字没有 baseline 锚点，"se" 指的是**包围盒底边**（含
+        # descender 那段空白）。直接把底边摆在基线上，数字会浮起 3~4px ——
+        # 所以补一个 descent，让数字的字脚真正坐到基线上。
+        try:
+            desc = int(self._gutter_font.metrics("descent")) if self._gutter_font else 3
+        except Exception:
+            desc = 3
+        try:
+            total = int(str(self.text.index("end-1c")).split(".")[0])
+        except Exception:
+            total = 1
+        # 整列的刻度以「文档第一行的顶端」为原点：先问出视口顶端离正文开头多少
+        # 像素，反推出第一行的视口坐标 v0（往下滚就是负的）。滚动时数字才不乱跳。
+        try:
+            info0 = self.text.dlineinfo("@0,0")
+            d = self.text.count("1.0", "@0,0", "ypixels")
+        except Exception:
+            return
+        if not info0:
+            return
+        v0 = int(info0[1]) - (int(d[0]) if d else 0)
+        # 让刻度「穿过多行」而不是钉死在第一行：标题那种大字号行会把正文往下推
+        # 几十像素（实测 72px 一行），而 72 不是 unit 的整数倍 —— 整列数字就会
+        # 统一偏高 12~13px。
+        # ⚠️ 相位只在**文档顶端可见时**量一次并缓存：每次都按「当前第一条可见
+        # 普通行」重算的话，滚动时各行残余像素略有不同，数字会整体跳一格（实测
+        # 滚 6 行时同一行旁边的号从 17 变成 16）。缓存之后整列纹丝不动。
+        try:
+            info1 = self.text.dlineinfo("1.0")
+        except Exception:
+            info1 = None
+        if info1:
+            self._gutter_phase = self._measure_gutter_phase(v0, unit)
+        v0 += int(getattr(self, "_gutter_phase", 0) or 0)
+        k0, k1 = gutter_slots(v0, unit, h)
+        # 栏宽**不跟内容走**：固定预留 GUTTER_DIGITS 位（见 widgets.gutter_width）
+        unit_w = self._gutter_font.measure("0") if self._gutter_font else dpi.px(8)
+        w = gutter_width(unit_w, max(total, k1 + 1))
+        try:
+            if int(float(g.cget("width"))) != int(w):   # cget 可能回来是 "30.0"
+                g.configure(width=w)
+        except Exception:
+            pass
+        # 右侧一道极淡的竖线把「行号」和「正文」分开。不能取 pal["line"]：
+        # 它只比底色深 5%，在白色稿纸上等于不存在。
+        g.create_line(w - dpi.px(1), 0, w - dpi.px(1), h,
+                      fill=_mix_hex(p.get("editor", "#ffffff"),
+                                    p.get("text", "#222222"), 0.12))
+        for k in range(k0, k1 + 1):
+            y = v0 + k * unit
+            # 点这个号跳到「这个高度上的那一行」；空白段跳到最后一行
+            try:
+                ln = int(str(self.text.index("@0,%d" % int(max(0, y + unit // 2)))).split(".")[0])
+            except Exception:
+                ln = total
+            self._gutter_number(g, w, y + base + desc, k + 1, y, y + unit, ln, p)
+
+    def _measure_gutter_phase(self, v0, unit):
+        """刻度相对「文档第一行顶端」的相位修正（像素，±unit/2）。
+
+        第一行常常是标题：字号更大、段间距更宽（实测一行 72px），72 不是 unit
+        的整数倍，于是整列数字会统一偏高十几像素。找第一行**普通行**（行高正好
+        等于 unit），把刻度对齐到它的顶端 —— 代价只是整列挪不到半格。
+
+        只在文档顶端可见时调用（见 `_gutter_redraw`），结果由调用方缓存。
+        """
+        try:
+            y = 0
+            prev = -(1 << 30)
+            for _ in range(60):
+                info = self.text.dlineinfo("@0,%d" % int(y))
+                if not info:
+                    break
+                _x, yy, _w, hh, _b = info
+                if yy <= prev:
+                    break
+                prev = yy
+                if int(hh) == unit:
+                    return int(yy - int(round((yy - v0) / float(unit))) * unit - v0)
+                y = yy + max(1, hh)
+        except Exception:
+            pass
+        return 0
+
+    def _gutter_metrics(self):
+        """量一格的 (行高, 基线偏移)。行高取正文普通行的行高，不取控件自己的。
+
+        * unit：可见行里出现次数最多的行高。空行、普通文字都长这样，标题和内嵌
+          代码块是少数；直接读字体 metrics 会漏掉 Tk 加的段间距（spacing1/3）
+          和标签自带的 spacing，实测差 4px 以上。
+        * base：这一行里基线相对行顶的偏移，数字就坐在这个基线上。
+
+        结果按（正文字号, 字体）缓存 —— 每次滚动都去量八十行纯属白烧 Tcl 调用。
+        """
+        key = (self.body_size, str(self.text.cget("font")))
+        if getattr(self, "_gutter_unit_key", None) == key:
+            cached = getattr(self, "_gutter_unit_val", None)
+            if cached:
+                return cached
+        try:
+            total = int(str(self.text.index("end-1c")).split(".")[0])
+        except Exception:
+            total = 1
+        cap = dpi.px(80)          # 比这还高的行不是「正常行」（代码块 / 大图）
+        counts = {}
+        bases = {}
+        for ln in range(1, min(total, 80) + 1):
+            try:
+                info = self.text.dlineinfo("%d.0" % ln)
+            except Exception:
+                continue
+            if not info:
+                continue
+            hh = int(info[3])
+            if 4 <= hh <= cap:
+                counts[hh] = counts.get(hh, 0) + 1
+                bases.setdefault(hh, int(info[4]))
+        if counts:
+            unit = max(counts.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+            base = bases.get(unit, int(round(unit * 0.72)))
+            self._gutter_unit_key = key
+            self._gutter_unit_val = (unit, base)
+            return unit, base
+        # 一行都量不到（空笔记 / 还没映射）：按字体 + 段间距估，且**不缓存**，
+        # 等真有字了再量准的
+        try:
+            f = tkfont.Font(family=getattr(self, "ui_font", None) or FONT[0],
+                            size=int(self.body_size))
+            unit = int(f.metrics("linespace"))
+        except Exception:
+            unit = dpi.px(19)
+        for opt in ("spacing1", "spacing3"):
+            try:
+                unit += int(float(self.text.cget(opt) or 0))
+            except Exception:
+                pass
+        unit = max(unit, dpi.px(12))
+        return unit, int(round(unit * 0.72))
+
+    def _gutter_number(self, g, w, ty, num, top, bottom, line, p):
+        """画一个行号，并登记它占的纵向区间（悬停 / 点击都按区间查，不按号查）。"""
+        item = g.create_text(w - dpi.px(7), ty, text=str(num), anchor="se",
+                             font=self._gutter_font,
+                             fill=p.get("soft", "#76767e"),
+                             tags=("gnum", "gnum_%d" % num))
+        self._gutter_lines[num] = item
+        if bottom <= top:
+            bottom = top + 1
+        self._gutter_hit.append((int(top), int(bottom), line, item))
+        return item
+
+    def _gutter_line_at(self, y):
+        """行号栏 y 处对应的 (目标行号, 图元 id)；落在数字区间外就给 (None, None)。
+
+        区间是画的时候一并登记的（见 `_gutter_number`），不按数字反查 —— 号是
+        标尺数出来的，一个号未必等于一个逻辑行。
+        """
+        return gutter_hit_at(self._gutter_hit, y)
+
+    def _on_gutter_motion(self, e):
+        _ln, item = self._gutter_line_at(e.y)
+        if item is not None:
+            self._gutter_hover_set(item)
+
+    def _gutter_hover_set(self, item):
+        """悬停的那个行号变主题色 —— 点之前就知道「会跳到哪一行」。
+
+        参数是**画布图元 id**，不是行号：号是标尺数出来的，一个号未必等于一个
+        逻辑行，按号找会亮错一条。
+        """
+        if item == self._gutter_hover:
+            return
+        old, self._gutter_hover = self._gutter_hover, item
+        soft = self.pal.get("soft", "#76767e")
+        acc = self.pal["accent"]
+        if old is not None:
+            try:
+                self.gutter.itemconfigure(old, fill=soft)
+            except Exception:
+                pass
+        if item is not None:
+            try:
+                self.gutter.itemconfigure(item, fill=acc)
+            except Exception:
+                pass
+
+    def _on_gutter_click(self, e):
+        ln, _item = self._gutter_line_at(e.y)
+        if ln is None:
+            # 语言条左侧、块与块之间的留白没有数字，也没有区间 —— 按正文行兜底，
+            # 别让「点到行号栏空白」变成没反应。
+            try:
+                ln = int(str(self.text.index("@0,%d" % int(e.y))).split(".")[0])
+            except Exception:
+                return "break"
+        try:
+            self.text.mark_set("insert", "%d.0" % ln)
+            self.text.see("%d.0" % ln)
+            self.text.focus_set()
+        except Exception:
+            pass
+        return "break"
+
+    def _on_gutter_wheel(self, e):
+        """滚轮落在行号栏上也要滚正文 —— 那里不是「别的控件」，是同一条正文的边。"""
+        try:
+            self.text.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        except Exception:
+            pass
+        return "break"
+
+    def _gutter_menu(self, e):
+        m = PopupMenu(self.root, self.pal)
+        m.add("隐藏行号", command=lambda: self.set_line_numbers(False))
+        try:
+            m.popup(e.x_root, e.y_root)
+        except Exception:
+            pass
+        return "break"
+
+    # ---------- Ctrl+F 查找 / Ctrl+H 替换（只看当前打开的这篇） ----------
+    # 与顶栏搜索是两件事：顶栏那个会**过滤左栏列表**、跨全部笔记搜；这个只在
+    # 当前正文里找，不动列表、不落库。所以高亮标签也分开（见 FIND_HIT_TAG）。
+    # 查找与替换是同一张浮条、同一份 `_find_hits`：Ctrl+F 收起替换行，Ctrl+H 展开。
+
+    def _build_find_bar(self):
+        """造查找 / 替换浮条（只造不挂）。
+
+        ⚠️ 父容器必须是 `self.text` 而不是 `editor_frame`：editor_frame 顶上还压着
+        工具栏、标签条、只读提示条，按它的坐标算 y=8 会正好糊在工具栏和「+」上。
+        挂进 Text 里 place，坐标就是「正文可视区」的，而且和底部状态条一个路子
+        （不随正文滚动，永远贴在可视区右上角）。
+
+        两行共用**一张**浮条：Ctrl+F 只挂第一行，Ctrl+H 再 pack 出第二行。拆成
+        两张浮窗就得维护两套命中高亮，还会出现「查找框关了、替换框还挂着」。
+        """
+        p = self.pal
+        bar = tk.Frame(self.text, bg=p["editor"], bd=0,
+                       highlightthickness=dpi.px(1),
+                       highlightbackground=p.get("line", "#cfcfd6"))
+        row1 = tk.Frame(bar, bg=p["editor"], bd=0)
+        row1.pack(fill=tk.X)
+        row2 = tk.Frame(bar, bg=p["editor"], bd=0)   # 先不 pack：Ctrl+H 才展开
+
+        def mk_btn(parent, text, fn, tip, size=11, padx=4, pady=0,
+                   side=tk.LEFT, right=2):
+            """`side=tk.RIGHT` 时贴浮条右边缘。
+
+            ⚠️ 两行的最右一枚（第一行 ✕ / 第二行「全部替换」）必须用**同一个**
+            `right` 外边距，否则右边缘差几像素、看着就是没对齐。pack 用 side=RIGHT
+            时**先 pack 的在最右**，所以调用顺序要倒过来（先 ✕ 再 ↑↓）。
+            """
+            b = tk.Label(parent, text=text, bg=p["editor"],
+                         fg=p.get("soft", "#76767e"), cursor="hand2",
+                         font=(FONT[0], size), bd=0,
+                         padx=dpi.px(padx), pady=dpi.px(pady))
+            if side == tk.RIGHT:
+                b.pack(side=tk.RIGHT, padx=(0, dpi.px(right)))
+            else:
+                b.pack(side=tk.LEFT)
+            b.bind("<Button-1>", lambda e, f=fn: (f(), "break")[1])
+            b.bind("<Enter>", lambda e, w=b: w.configure(
+                bg=_hover_bg(p["editor"]), fg=p["text"]))
+            b.bind("<Leave>", lambda e, w=b: w.configure(
+                bg=p["editor"], fg=p.get("soft", "#76767e")))
+            self._add_tip(b, tip)
+            return b
+
+        # 输入框要「看得出是输入框」：原来的 entry 无边框、底色和浮条同色，
+        # 空的时候整个框消失在背景里，只剩右边几枚按钮（用户反馈「不知道在哪输入」）。
+        # 现在压一档底色 + 1px 描边 + 框内占位提示，焦点进来描边转主题色。
+        field_bg = _mix_hex(p["editor"], p["text"], 0.05)
+        field_line = _mix_hex(p["editor"], p["text"], 0.22)
+        ph_fg = _mix_hex(field_bg, p.get("soft", "#76767e"), 0.9)
+
+        def mk_entry(parent, var, hint):
+            e = tk.Entry(parent, textvariable=var, width=18, bd=0,
+                         relief="flat",
+                         highlightthickness=dpi.px(1),
+                         highlightbackground=field_line,
+                         highlightcolor=p["accent"],
+                         bg=field_bg, fg=p["text"],
+                         insertbackground=p["accent"],
+                         font=(FONT[0], 11))
+            e.pack(side=tk.LEFT, padx=(dpi.px(9), dpi.px(4)), pady=dpi.px(6))
+            # 占位文字做成 Entry 的子 Label：Tk 的 Entry 没有 placeholder，
+            # 往 textvariable 里塞假文字会污染 `_find_var.get()`（查找词、计数、
+            # 替换判断全读这个变量）。子窗口会被父窗口裁掉超出部分，窄框不会溢出。
+            ph = tk.Label(e, text=hint, bg=field_bg, fg=ph_fg, bd=0,
+                          font=(FONT[0], 10), cursor="xterm")
+            ph._sujian_ph = True     # _restyle_find_bar 靠它认出来，别刷成浮条底色
+
+            def sync(*_a):
+                # ⚠️ 只按「有没有内容」判断，**不看焦点**：Ctrl+F / Ctrl+H 打开时
+                # 焦点本来就在框里，若聚焦就藏提示，空框又会变回一滴墨水都没有，
+                # 正好复现用户反馈的「不知道在哪输入」。和浏览器一致：一直显示到
+                # 真正敲进第一个字符为止。
+                try:
+                    if var.get():
+                        ph.place_forget()
+                    else:
+                        ph.place(x=dpi.px(5), rely=0.5, anchor="w")
+                except Exception:
+                    pass
+
+            var.trace_add("write", sync)
+            e.bind("<FocusIn>", lambda ev: (sync(), "break")[1], add="+")
+            e.bind("<FocusOut>", lambda ev: (sync(), "break")[1], add="+")
+            ph.bind("<Button-1>", lambda ev: (e.focus_set(), "break")[1])
+            e._ph = ph
+            sync()
+            return e
+
+        self._find_var = tk.StringVar()
+        ent = mk_entry(row1, self._find_var, "查找内容")
+        self._find_entry = ent
+        self._find_count = tk.Label(row1, text="", bg=p["editor"],
+                                    fg=p.get("soft", "#76767e"),
+                                    font=(FONT[0], 9), bd=0)
+        self._find_count.pack(side=tk.LEFT, padx=(0, dpi.px(6)))
+        for txt, fn, tip in (("✕", self._find_close, "关闭（Esc）"),
+                             ("↓", lambda: self._find_step(1), "下一个（Enter）"),
+                             ("↑", lambda: self._find_step(-1), "上一个（Shift+Enter）")):
+            # 倒序 + RIGHT：先 pack 的在最右，✕ 才会贴住浮条右边缘，
+            # 和第二行「全部替换」在同一条竖线上。
+            mk_btn(row1, txt, fn, tip, side=tk.RIGHT)
+
+        # 第二行：替换输入框 + 两枚动作。留「替换为」三个字，否则空输入框
+        # 和上面的查找框长得一模一样，用户分不清该往哪儿打字。
+        tk.Label(row2, text="替换为", bg=p["editor"],
+                 fg=p.get("soft", "#76767e"),
+                 font=(FONT[0], 10), bd=0).pack(side=tk.LEFT, padx=(dpi.px(9), 0))
+        self._replace_var = tk.StringVar()
+        ent2 = mk_entry(row2, self._replace_var, "可留空")
+        ent2.pack_configure(padx=(dpi.px(4), dpi.px(4)))
+        self._replace_entry = ent2
+        # 倒序 + RIGHT：「全部替换」最右（与第一行 ✕ 同一条竖线），「替换」在它左侧。
+        # 「替换」的 right=0，靠两枚 Label 各自的内部 padx 撑开间距，和原来一样。
+        mk_btn(row2, "全部替换", self._find_replace_all,
+               "替换全部命中（Ctrl+Enter）", size=10, padx=7, pady=2,
+               side=tk.RIGHT)
+        mk_btn(row2, "替换", self._find_replace_one,
+               "替换当前这一处（Enter）", size=10, padx=7, pady=2,
+               side=tk.RIGHT, right=0)
+
+        # Enter 下一条 / Shift+Enter 上一条，和浏览器一致；Esc 关掉
+        for seq, delta in (("<Return>", 1), ("<KP_Enter>", 1)):
+            ent.bind(seq, lambda e, d=delta: (self._find_step(d), "break")[1])
+        ent.bind("<Shift-Return>", lambda e: (self._find_step(-1), "break")[1])
+        # 替换框：Enter 替换当前并跳下一条，Shift+Enter 跳上一条，Ctrl+Enter 全替
+        for seq, step in (("<Return>", 1), ("<KP_Enter>", 1)):
+            ent2.bind(seq, lambda e, s=step: (self._find_replace_one(s), "break")[1])
+        ent2.bind("<Shift-Return>",
+                  lambda e: (self._find_replace_one(-1), "break")[1])
+        ent2.bind("<Control-Return>",
+                  lambda e: (self._find_replace_all(), "break")[1])
+        # 两个输入框里都要能 Esc / 切模式。⚠️ Entry 的类绑定把 Ctrl+H 接成
+        # 「删前一个字符」、Ctrl+F 接成光标右移，不绑实例 + break 就会误删字。
+        for e in (ent, ent2):
+            e.bind("<Escape>", lambda ev: (self._find_close(), "break")[1])
+            e.bind("<Control-f>", lambda ev: (self._find_open(), "break")[1])
+            e.bind("<Control-h>", lambda ev: (self._replace_open(), "break")[1])
+        # 输入即搜（不需要回车）。关键词一变就把「当前命中」拨回第一条。
+        self._find_var.trace_add("write", lambda *a: self._find_refresh(reset=True))
+        self._find_bar = bar
+        self._find_row2 = row2
+        self._find_hits = []
+        self._find_idx = 0
+        self._find_job = None
+
+    def _find_open(self, event=None, replace=False):
+        """Ctrl+F：本篇内查找；`replace=True` 时（Ctrl+H）展开第二行做查找替换。"""
+        if getattr(self, "_find_bar", None) is None:
+            self._build_find_bar()
+        bar = self._find_bar
+        if not bar.winfo_manager():
+            # 贴在正文右上角。往左让开 18px 是给右侧浮动导航和滚动条留的位
+            bar.place(relx=1.0, x=-dpi.px(18), y=dpi.px(10), anchor="ne")
+        bar.lift()
+        # 两行共用一张浮条，切模式只 pack / pack_forget 第二行：命中状态、关键词、
+        # 高亮全部留着，不会「从查找切到替换就跳回第一条」。
+        if replace:
+            if not self._find_row2.winfo_manager():
+                self._find_row2.pack(fill=tk.X)
+        else:
+            self._find_row2.pack_forget()
+        self._replace_mode = bool(replace)
+        # 窗口窄的时候把输入框收短：查找条是「贴在正文右上角」的，宽过正文就会被
+        # place 裁掉左半边（关键词和计数一起看不见）。18 字符是宽松时的默认值；
+        # 130 / 190 是两行「除输入框以外」的固定开销（第一行计数 + 三枚按钮，
+        # 第二行再加「替换为」+ 两枚文字按钮），少算就会在最小窗口上压出去。
+        try:
+            avail = self.text.winfo_width() - dpi.px(18)
+            overhead = dpi.px(190 if replace else 130)
+            chars = max(6, min(18, int((avail - overhead) / float(dpi.px(9)))))
+            self._find_entry.configure(width=chars)
+            self._replace_entry.configure(width=chars)
+        except Exception:
+            pass
+        # 选中了一个词再按 Ctrl+F / Ctrl+H → 直接把它填进去，少一次输入
+        sel = ""
+        try:
+            sel = self.text.get("sel.first", "sel.last")
+        except Exception:
+            sel = ""
+        if sel and "\n" not in sel and len(sel) <= 80:
+            self._find_var.set(sel)
+        try:
+            bar.update_idletasks()
+        except Exception:
+            pass
+        # 替换模式下关键词已经填好了就直接落在替换框，连 Ctrl+H 带选词一步到位；
+        # 否则先填查找词，Tab 也能按顺序走到替换框。
+        if replace and self._find_var.get():
+            self._replace_entry.focus_set()
+            self._replace_entry.select_range(0, tk.END)
+        else:
+            self._find_entry.focus_set()
+            self._find_entry.select_range(0, tk.END)
+        self._find_refresh()
+        return "break"
+
+    def _replace_open(self, event=None):
+        """Ctrl+H：查找替换。走同一张浮条，只是多展开一行。"""
+        return self._find_open(event, replace=True)
+
+    def _find_close(self):
+        bar = getattr(self, "_find_bar", None)
+        if bar is None:
+            return "break"
+        try:
+            bar.place_forget()
+            self._find_row2.pack_forget()
+        except Exception:
+            pass
+        self._replace_mode = False
+        if getattr(self, "_find_job", None) is not None:
+            self._cancel_after(self._find_job)
+            self._find_job = None
+        try:
+            self.text.tag_remove(FIND_HIT_TAG, "1.0", tk.END)
+            self.text.tag_remove(FIND_CUR_TAG, "1.0", tk.END)
+        except Exception:
+            pass
+        self._find_hits = []
+        self._find_idx = 0
+        try:
+            self.text.focus_set()
+        except Exception:
+            pass
+        return "break"
+
+    def _find_refresh(self, reset=False):
+        """重扫全文、重贴高亮。
+
+        直接操作 tag、不进撤销栈（Tk 的 undo 只记 insert/delete），所以不必包
+        edit_separator —— Ctrl+Z 撤的仍是用户的输入，不会变成「撤掉一次高亮」。
+        """
+        bar = getattr(self, "_find_bar", None)
+        if bar is None or not bar.winfo_manager():
+            return
+        if reset:
+            self._find_idx = 0
+        self._find_hits = []
+        try:
+            self.text.tag_remove(FIND_HIT_TAG, "1.0", tk.END)
+            self.text.tag_remove(FIND_CUR_TAG, "1.0", tk.END)
+        except Exception:
+            return
+        q = self._find_var.get() if getattr(self, "_find_var", None) else ""
+        if not q:
+            self._find_count.configure(text="")
+            return
+        start = "1.0"
+        for _ in range(5000):        # 兜底：不给「一轮轮标下去」留死循环的可能
+            try:
+                pos = self.text.search(q, start, stopindex=tk.END, nocase=True)
+            except Exception:
+                break
+            if not pos:
+                break
+            end = "%s+%dc" % (pos, len(q))
+            try:
+                self.text.tag_add(FIND_HIT_TAG, pos, end)
+            except Exception:
+                break
+            self._find_hits.append((pos, end))
+            start = end
+        if not self._find_hits:
+            self._find_count.configure(text="无结果")
+            return
+        self._find_idx = max(0, min(self._find_idx, len(self._find_hits) - 1))
+        self._find_highlight_current()
+
+    def _find_highlight_current(self):
+        """把「当前命中」换成醒目底色并滚进视口，同时更新 3/12 计数。"""
+        if not self._find_hits:
+            return
+        pos, end = self._find_hits[self._find_idx]
+        try:
+            self.text.tag_remove(FIND_CUR_TAG, "1.0", tk.END)
+            self.text.tag_add(FIND_CUR_TAG, pos, end)
+            self.text.see(pos)
+        except Exception:
+            return
+        self._find_count.configure(
+            text="%d/%d" % (self._find_idx + 1, len(self._find_hits)))
+
+    def _find_step(self, delta):
+        """Enter / ↑ / ↓：在命中之间循环。没有命中就先重扫一次。"""
+        if not self._find_hits:
+            self._find_refresh(reset=True)
+            return "break"
+        self._find_idx = (self._find_idx + int(delta)) % len(self._find_hits)
+        self._find_highlight_current()
+        return "break"
+
+    # ---------- 查找替换（Ctrl+H） ----------
+    def _find_has_object(self, pos, end):
+        """命中范围里有没有嵌入窗口 / 图片（代码块、闹钟图标）。
+
+        `text.search` 找的是字符，正常不会命中这些元素，但真撞上了也不能
+        delete —— 那会把 serialize() 认领的非文本元素连根拔掉，重开笔记就少一块。
+        """
+        try:
+            for kind, _val, _idx in self.text.dump(
+                    pos, end, window=True, image=True,
+                    text=False, tag=False, mark=False):
+                if kind in ("window", "image"):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _find_replace_ready(self):
+        """替换前的统一守卫；返回关键词，不能替换就返回 None。
+
+        只读（内置示例 / 未解锁的加密笔记）走 `_refuse_readonly()` 闪提示条；
+        没选中笔记时正文是 DISABLED，delete/insert 会直接抛，也在这里挡掉。
+        """
+        if self._refuse_readonly():
+            return None
+        if not self.current_note():
+            self._find_count.configure(text="没有打开的笔记")
+            return None
+        q = self._find_var.get() if getattr(self, "_find_var", None) else ""
+        if not q:
+            return None
+        self._find_refresh()          # 正文可能刚被编辑过，旧索引已经指偏了
+        if not self._find_hits:
+            self._find_count.configure(text="无结果")
+            return None
+        try:
+            if str(self.text.cget("state")) == "disabled":
+                return None
+        except Exception:
+            pass
+        return q
+
+    def _find_pick_near(self, anchor, step):
+        """重扫后把「当前命中」拨到 anchor 之后（step>0）/ 之前（step<0）的第一条。"""
+        if not self._find_hits:
+            return 0
+        try:
+            if step > 0:
+                for i, (a, _b) in enumerate(self._find_hits):
+                    if self.text.compare(a, ">=", anchor):
+                        return i
+                return 0                      # 到尾了就绕回第一条
+            for i in range(len(self._find_hits) - 1, -1, -1):
+                if self.text.compare(self._find_hits[i][0], "<", anchor):
+                    return i
+            return len(self._find_hits) - 1
+        except Exception:
+            return 0
+
+    def _find_swap(self, pos, end, repl):
+        """就地换一段字符：删掉命中、在原位插回替换串（两侧样式标签不动）。"""
+        self.text.delete(pos, end)
+        if repl:
+            self.text.insert(pos, repl)
+
+    def _find_edit_group(self, fn):
+        """把一组 delete/insert 收进**一个** undo 单元，返回 fn 的结果。
+
+        ⚠️ Tk 默认 autoseparators=True，会在 delete 与 insert 之间自动插一条撤销
+        边界（两者命令类型不同）。实测这时 `edit_separator()` 也压不住：一次
+        Ctrl+Z 只撤掉插入，被删的词留在地上（'cat' → ''，半个词没了）。所以
+        这一组操作期间临时关掉自动分组、手工在首尾各打一条边界。
+        """
+        old = self.text.cget("autoseparators")
+        self.text.configure(autoseparators=False)
+        try:
+            self.text.edit_separator()
+            return fn()
+        finally:
+            self.text.edit_separator()
+            self.text.configure(autoseparators=old)
+
+    def _find_replace_one(self, step=1):
+        """替换当前这一处，然后跳到下一条（Shift+Enter 跳上一条）。"""
+        q = self._find_replace_ready()
+        if q is None:
+            return "break"
+        repl = self._replace_var.get() if getattr(self, "_replace_var", None) else ""
+        idx = max(0, min(self._find_idx, len(self._find_hits) - 1))
+        pos, end = self._find_hits[idx]
+        if self._find_has_object(pos, end):
+            return "break"
+        try:
+            if len(self.text.get(pos, end)) != len(q):
+                return "break"
+            self._find_edit_group(lambda: self._find_swap(pos, end, repl))
+        except Exception:
+            return "break"
+        self.on_edit()                # <<Modified>> 可能在 idle 才回调，这里主动收口
+        anchor = self.text.index("%s +%dc" % (pos, len(repl)))
+        self._find_idx = idx
+        self._find_refresh()
+        # 替换串里含查找词时（a → aa），重扫后不能还指回刚替换的那一处，
+        # 否则连按 Enter 会一直在原地打转。
+        self._find_idx = self._find_pick_near(anchor, step)
+        self._find_highlight_current()
+        return "break"
+
+    def _find_replace_all(self):
+        """替换全部命中：按 `replacement_plan` 从后往前改，前面的索引才不漂移。"""
+        q = self._find_replace_ready()
+        if q is None:
+            return "break"
+        repl = self._replace_var.get() if getattr(self, "_replace_var", None) else ""
+        hits = list(self._find_hits)
+        try:
+            # 传的是**序号**区间而不是 "行.列" 字符串：纯函数里的重叠判断用
+            # 数值比较，字符串比较会把 "1.9" 判成比 "1.10" 还靠后。
+            plan = replacement_plan([(i, i + 1) for i in range(len(hits))], repl)
+
+            def do_all():
+                done = 0
+                for i, _end, text in plan:
+                    pos, end = hits[i]
+                    if self._find_has_object(pos, end):
+                        continue
+                    if len(self.text.get(pos, end)) != len(q):
+                        continue
+                    self._find_swap(pos, end, text)
+                    done += 1
+                return done
+
+            done = self._find_edit_group(do_all)
+        except Exception:
+            return "break"
+        self.on_edit()
+        self._find_idx = 0
+        self._find_refresh(reset=True)
+        self._find_count.configure(text=("已替换 %d 处" % done) if done else "无结果")
+        # 让「已替换 N 处」停一会儿再换回真实命中数；期间改关键词会提前刷新
+        if getattr(self, "_find_job", None) is not None:
+            self._cancel_after(self._find_job)
+        self._find_job = self._after(1200, self._find_refresh)
+        return "break"
+
+    def _restyle_find_bar(self):
+        """换肤时重配查找 / 替换浮条的控件色（关键词与命中范围保持不动）。
+
+        ⚠️ 加了两行之后 bar 的直接子级是 row1 / row2 两个 Frame，只遍历一层
+        会一个控件都刷不到 —— 必须递归。
+        """
+        bar = getattr(self, "_find_bar", None)
+        if bar is None:
+            return
+        p = self.pal
+        # 输入框底色 / 描边 / 占位字色都是从当前皮肤推出来的，换肤必须一起重算，
+        # 否则浅色皮肤下会留一块旧的深色方块。
+        field_bg = _mix_hex(p["editor"], p["text"], 0.05)
+        field_line = _mix_hex(p["editor"], p["text"], 0.22)
+        ph_fg = _mix_hex(field_bg, p.get("soft", "#76767e"), 0.9)
+
+        def walk(w):
+            for c in w.winfo_children():
+                if isinstance(c, tk.Entry):
+                    c.configure(bg=field_bg, fg=p["text"],
+                                insertbackground=p["accent"],
+                                highlightbackground=field_line,
+                                highlightcolor=p["accent"])
+                elif getattr(c, "_sujian_ph", False):
+                    # 占位 Label 是 Entry 的子级，顺序上排在 Entry 之后处理，
+                    # 必须盖住它、用输入框自己的底色。
+                    c.configure(bg=field_bg, fg=ph_fg)
+                elif isinstance(c, tk.Frame):
+                    c.configure(bg=p["editor"])
+                elif isinstance(c, tk.Label):
+                    c.configure(bg=p["editor"], fg=p.get("soft", "#76767e"))
+                walk(c)
+
+        try:
+            bar.configure(bg=p["editor"],
+                          highlightbackground=p.get("line", "#cfcfd6"))
+            walk(bar)
+        except Exception:
+            pass
+
+    def _find_esc(self, event=None):
+        """焦点在正文里按 Esc：查找框开着就关掉，没开就放行（候选面板还占着它）。"""
+        bar = getattr(self, "_find_bar", None)
+        if bar is not None and bar.winfo_manager():
+            return self._find_close()
+        return None
+
+    def _find_on_edit(self):
+        """正文改动后重扫：命中位置会移动，不重扫就会指到旧字符上。
+
+        只重算不重置下标 —— 用户一边改一边看「还有几个」，突然跳回第一条更烦。
+        打字时每次按键都会走到这里，所以去抖 60ms：一次输入连着改十几个字符，
+        没必要每改一个就全文重扫一遍。
+        """
+        bar = getattr(self, "_find_bar", None)
+        if bar is None or not bar.winfo_manager():
+            return
+        if getattr(self, "_find_job", None) is not None:
+            self._cancel_after(self._find_job)
+        self._find_job = self._after(60, self._find_refresh)
+
     # ---------- 底部状态条：创建时间 / 修改时间 / 字数 ----------
     # 为什么浮在正文上、还要「鼠标移到底部才出现」：
     #   - 常驻一条灰条会压在最后一行正文下面，阅读时很碍眼；
@@ -819,9 +1815,13 @@ class UIMixin(object):
     # 所以做成贴在编辑区底部的浮层：指针挪进底部热区才浮出来，离开即收起。
 
     def _footer_bg(self):
-        """状态条底色：稿纸色往墨色压一点点，够分出一条边又不抢正文。"""
-        ed = self.pal.get("editor") or "#ffffff"
-        return _mix_hex(ed, _ink_target(ed), 0.045)
+        """状态条底色：**主题色的沉一档**（稿纸压深 + accent 染色）。
+
+        推导在 theme._status_bar_bg：换主题时色相跟着 accent 走，同时自动与
+        顶部「淡纸片」提示条、未选中标签拉开色差。状态条是浮层，得先有一条
+        看得见的边界，再谈文字 —— 文字色也是按这块底的反差动态提深的。
+        """
+        return _status_bar_bg(self.pal)
 
     def _top_rule_color(self):
         """顶栏下沿那条分割线：顶栏色压深 22%。
@@ -833,20 +1833,29 @@ class UIMixin(object):
         return _mix_hex(top, _ink_target(top), 0.22)
 
     def _build_footer(self):
-        p = self.pal
         bg = self._footer_bg()
-        f = tk.Frame(self.text, bg=bg, height=FOOTER_H)
-        self._foot_rule = tk.Frame(f, height=1, bg=_mix_hex(bg, p["line"], 0.85))
+        fg = self._foot_fg()
+        # ⚠️ 父级是 editor_frame，不是 Text：place 的子窗口超出 Text 底边会被父窗口
+        # 裁掉（实测），而状态条 20px 要跨「Text 下留白 12 + pack 外边距 8」两段。
+        # 挂在外层才完整显示；水平范围仍按 Text 内容区算（见 _show_footer）。
+        f = tk.Frame(self.editor_frame, bg=bg, height=FOOTER_H)
+        # 上沿细线从状态条自己的底色再压一档：pal["line"] 只深 5%，1px 上等于没画
+        self._foot_rule = tk.Frame(f, height=dpi.px(1), bg=self._foot_rule_bg())
         self._foot_rule.pack(fill=tk.X)
         row = tk.Frame(f, bg=bg)
         row.pack(fill=tk.BOTH, expand=True)
         self._foot_row = row
-        self._foot_left = tk.Label(row, text="", bg=bg, fg=p["soft"],
-                                   font=(FONT[0], 9), anchor="w")
+        # pady/borderwidth 归零：状态条只有 20px，1px 分隔线占掉 1 后行区 19px，
+        # 而 Label 默认的 2px pady + 2px border 会把 9pt 字撑到 23px，字底被裁。
+        # 实测归零后 reqheight = 17，留 2px 余量；换肤改色不会覆盖这两个选项。
+        self._foot_left = tk.Label(row, text="", bg=bg, fg=fg,
+                                   font=(FONT[0], 9), anchor="w",
+                                   pady=0, borderwidth=0)
         self._foot_left.pack(side=tk.LEFT, padx=(TEXT_PADX - 6, 0))
-        self._foot_right = tk.Label(row, text="", bg=bg, fg=p["soft"],
-                                    font=(FONT[0], 9), anchor="e")
-        self._foot_right.pack(side=tk.RIGHT, padx=(0, 16))
+        self._foot_right = tk.Label(row, text="", bg=bg, fg=fg,
+                                    font=(FONT[0], 9), anchor="e",
+                                    pady=0, borderwidth=0)
+        self._foot_right.pack(side=tk.RIGHT, padx=(0, dpi.px(16)))
         # 指针从正文移进这条状态条时不该把它收起来（否则永远读不到、也点不到）
         for w in (f, row, self._foot_left, self._foot_right):
             w.bind("<Enter>", self._cancel_footer_hide, add="+")
@@ -888,12 +1897,15 @@ class UIMixin(object):
             return
         self._refresh_footer()
         try:
-            # ⚠️ place 放在 Text 里时坐标系是「内容区」：原点在 (padx, pady)，
-            # rely 的分母是去掉上下 padding 之后的高度。所以 rely=1.0 配
-            # anchor="sw" 得到的是「停在下留白的**上沿**」，离正文底边整整差一个
-            # pady（22px）—— 看着就是一条悬空的横条。
-            # 用 anchor="nw" 让**顶边**落在 rely=1.0 上，底边正好压在正文下边缘。
-            f.place(x=0, rely=1.0, anchor="nw", relwidth=1.0, height=FOOTER_H)
+            # ⚠️ 状态条现在是 editor_frame 的子窗口（见 _build_footer），place 相对
+            # 外层：anchor="sw" + rely=1.0 让**底边**贴在编辑区底部，整条从底往上
+            # 占 FOOTER_H(20) —— 正好是「8px pack 外边距 + 12px 下留白」，不碰正文。
+            # x/width 仍按 Text 内容区算，避开左侧行号栏、也不压右侧滚动条。
+            # ⚠️ 别改回挂成 Text 的子窗口：那样超出 Text 底边的 8px 会被父窗口
+            # clip，状态条下半截凭空消失（实测）。
+            tx = self.text.winfo_x() + TEXT_PADX
+            tw = max(dpi.px(40), self.text.winfo_width() - 2 * TEXT_PADX)
+            f.place(x=tx, rely=1.0, anchor="sw", width=tw, height=FOOTER_H)
             tk.Misc.lift(f)
             self._footer_visible = True
         except Exception:
@@ -984,7 +1996,7 @@ class UIMixin(object):
             except Exception:
                 return
             if h > 40:
-                sy.place(relx=1.0, y=y, width=17, height=h, anchor="ne")
+                sy.place(relx=1.0, y=y, width=VSCROLL_W, height=h, anchor="ne")
         self._vscroll_place_fn = place
         self.editor_frame.bind("<Configure>", place, add="+")
         place()
@@ -1008,18 +2020,21 @@ class UIMixin(object):
         # 底用 editor 白（而不是列表底色）：搜索框现在躺在侧栏灰底上，
         # 只有纯白 + 描边才看得出「这里可以打字」，与下方文件夹卡片同理。
         self._search_bg_item = c.create_polygon(
-            _round_rect_points(1, 1, W - 1, H - 1, 9, 6),
-            fill=p["editor"], outline=p["line"], width=1)
+            _round_rect_points(1, 1, W - 1, H - 1, dpi.px(9), 6),
+            fill=p["editor"], outline=p["line"], width=dpi.px(1))
         # 放大镜：圆环 + 右下手柄（Tk 不能用 emoji 字符，直接画）
-        icx, icy, r = 19, 14, 5.5
+        icx, icy, r = dpi.px(19), dpi.px(14), dpi.fx(5.5)
         c.create_oval(icx - r, icy - r, icx + r, icy + r,
-                      outline=p["soft"], width=2)
-        c.create_line(icx + r * 0.72, icy + r * 0.72, icx + r + 4.0, icy + r + 4.0,
-                      fill=p["soft"], width=2, capstyle=tk.ROUND)
+                      outline=p["soft"], width=dpi.px(2))
+        c.create_line(icx + r * 0.72, icy + r * 0.72,
+                      icx + r + dpi.fx(4.0), icy + r + dpi.fx(4.0),
+                      fill=p["soft"], width=dpi.px(2), capstyle=tk.ROUND)
         # 图标与输入区之间的分隔竖线：把要输入的关键字和放大镜隔开
-        c.create_line(34, 8, 34, H - 8, fill=p["line"], width=1)
+        c.create_line(dpi.px(34), dpi.px(8), dpi.px(34), H - dpi.px(8),
+                      fill=p["line"], width=dpi.px(1))
         # 输入框摆在分隔线右侧（place 按像素定位、垂直居中，右侧留白给圆角）
-        self.search_ent.place(in_=c, x=42, rely=0.5, anchor="w", width=W - 56)
+        self.search_ent.place(in_=c, x=dpi.px(42), rely=0.5, anchor="w",
+                              width=W - dpi.px(56))
         # 占位文字跟随换色；可见性（place/place_forget）交给 _update_search_ph
         self.search_ph_lbl.configure(bg=p["editor"], fg=p["soft"])
         self._update_search_ph()
@@ -1035,8 +2050,9 @@ class UIMixin(object):
         H = int(float(c["height"]))
         item = getattr(self, "_search_bg_item", None)
         if item:
-            c.coords(item, *_round_rect_points(1, 1, W - 1, H - 1, 9, 6))
-        self.search_ent.place_configure(x=42, rely=0.5, anchor="w", width=W - 56)
+            c.coords(item, *_round_rect_points(1, 1, W - 1, H - 1, dpi.px(9), 6))
+        self.search_ent.place_configure(x=dpi.px(42), rely=0.5, anchor="w",
+                                        width=W - dpi.px(56))
         self._update_search_ph()
 
     def _update_search_ph(self):
@@ -1048,7 +2064,7 @@ class UIMixin(object):
         show = (not self.search_var.get()) and not focused
         try:
             if show:
-                self.search_ph_lbl.place(in_=self.search_canvas, x=43,
+                self.search_ph_lbl.place(in_=self.search_canvas, x=dpi.px(43),
                                          rely=0.5, anchor="w")
                 self.search_ph_lbl.lift()   # 压在输入框上层，真实控件叠放稳定
             else:
@@ -1117,9 +2133,9 @@ class UIMixin(object):
         base = self.pal["side"] if which == "side" else self.pal["list"]
         wrap = tk.Frame(parent, width=SEP_HIT_W, bg=base,
                         cursor="sb_h_double_arrow")
-        line = tk.Frame(wrap, width=1, bg=self.pal["line"],
+        line = tk.Frame(wrap, width=dpi.px(1), bg=self.pal["line"],
                         cursor="sb_h_double_arrow")
-        line.place(x=SEP_HIT_W // 2, y=0, relheight=1.0, width=1)
+        line.place(x=SEP_HIT_W // 2, y=0, relheight=1.0, width=dpi.px(1))
         self._sep_lines[which] = line
         # 1px 的细线压在抓取带正中间，鼠标最容易落到的就是它 —— 两个都绑，
         # 否则「正好点在线上」反而拖不动。
@@ -1197,6 +2213,20 @@ class UIMixin(object):
             changed = True
         return changed
 
+    def _doodle_relayout(self):
+        """涂鸦蒙层跟着**主窗口**走（移动 / 缩放 / 最大化）。
+
+        蒙层盖整窗，所以只关心 root 的客户区几何；`relayout()` 自己按
+        (x, y, w, h) 去重，Configure 连发时不会反复重画。笔迹是视口像素坐标，
+        窗口缩放后不跟随文字漂移 —— 这是「锁定滚动」的既定代价。
+        """
+        d = getattr(self, "_doodle", None)
+        if d is not None and d.active:
+            try:
+                d.relayout()
+            except Exception:
+                pass
+
     def _on_body_resize(self):
         """窗口宽度变了：按当前可用宽重新夹紧两栏（不改设置）。"""
         if self._layout_txn:
@@ -1266,11 +2296,16 @@ class UIMixin(object):
             pass
 
     def _save_split_widths(self):
-        """松手时才落库：拖动过程中每帧 save 一次会把数据库写爆。"""
+        """松手时才落库：拖动过程中每帧 save 一次会把数据库写爆。
+
+        存的是**设计稿宽度**（÷SCALE），不是当前物理像素：同一份数据在 125% 和
+        200% 的机器上都该还原成同样的视觉比例，否则换台机器一打开，两栏要么挤成
+        一条缝、要么把正文推到屏幕外。读回来时由 `_read_col_w` 再乘当前 SCALE。
+        """
         try:
             st = self.data.setdefault("settings", {})
-            st["side_w"] = int(self._side_w)
-            st["list_w"] = int(self._list_w)
+            st["side_w"] = int(round(self._side_w / dpi.SCALE))
+            st["list_w"] = int(round(self._list_w / dpi.SCALE))
             save_data(self.data)
         except Exception:
             pass
@@ -1313,28 +2348,27 @@ class UIMixin(object):
         self.root.update_idletasks()
 
     def _set_app_icon(self):
-        """把窗口/任务栏/弹窗图标换成笔记本+铅笔 PNG（替换 Tk 默认羽毛）。"""
-        path = os.path.join(_RES, "app_icon.png")
-        if not os.path.exists(path):
-            return
-        img = None
-        try:
-            # PIL 可用时先缩到 64x64，小尺寸下比让系统缩 512x512 更清晰
-            from PIL import Image, ImageTk
-            resample = getattr(Image, "LANCZOS", getattr(Image, "BICUBIC", None))
-            im = Image.open(path).convert("RGBA").resize((64, 64), resample)
-            img = ImageTk.PhotoImage(im, master=self.root)
-        except Exception:
+        """把窗口/任务栏/弹窗图标换成「素笺」图标（替换 Tk 默认羽毛）。
+
+        优先 `wm iconbitmap -default`：.ico 里就带着 16/24/32/48/64/128/256 七档，
+        Windows 按当前 DPI 和场景自己挑最合适的那一张（任务栏 32、高 DPI 48/64），
+        比只塞一张 64px 位图再由系统缩放清楚。ico 缺失或调用失败时退回 iconphoto。
+        """
+        ico = os.path.join(_RES, "app_icon.ico")
+        if os.path.exists(ico):
             try:
-                img = tk.PhotoImage(file=path)
-            except Exception:
-                img = None
-        if img is not None:
-            self._app_icon = img          # 持引用：PhotoImage 被 GC 图标会消失
-            try:
-                self.root.iconphoto(True, img)   # True = 以后新建的弹窗都继承
+                self.root.iconbitmap(default=ico)   # default = 以后新建的弹窗都继承
+                return
             except Exception:
                 pass
+        img = _icon_photo(self.root, "app_icon.png", dpi.px(64))
+        if img is None:
+            return
+        self._app_icon = img              # 持引用：PhotoImage 被 GC 图标会消失
+        try:
+            self.root.iconphoto(True, img)
+        except Exception:
+            pass
 
     def _tool_bg(self):
         """工具栏底色：侧栏色朝稿纸色提亮一档。
@@ -1346,13 +2380,35 @@ class UIMixin(object):
 
         若某套皮肤的侧栏与稿纸本来就同色，提亮拿不到层次，退一档到「稿纸压暗一点」，
         保证工具带在两色之间仍有可见的分区。
+
+        推导本身在 theme._toolbar_bg（纯函数、回归测试直接断言）；这里只是转发，
+        免得标签条底色和「未选中标签」的参照色各算一份。
         """
-        side = self.pal.get("side") or self.pal.get("editor", "#ffffff")
-        ed = self.pal.get("editor") or "#ffffff"
-        bg = _mix_hex(side, ed, TOOL_BG_MIX)
-        if _contrast_ratio(bg, ed) < 1.025 and _contrast_ratio(bg, side) < 1.025:
-            bg = _mix_hex(ed, _ink_target(ed), 0.05)
-        return bg
+        return _toolbar_bg(self.pal)
+
+    def _ro_bar_bg(self):
+        """只读提示条底色：主题色的淡纸片，且保证不与「未选中标签」撞色。
+
+        ⚠️ 别改回 pal["hover"]：那是列表行的悬停色（由 list 底推出来），铺在
+        标签条正下方会跟灰色未选中标签连成一条，提示读成「多了一枚标签」。
+        """
+        return _readonly_bar_bg(self.pal, _tab_idle_bg(self._tool_bg()))
+
+    def _ro_accent_fg(self):
+        """提示条上「可点 / 闪一下」的强调字色：accent 往主文字色压深。
+
+        纸片本身已经带主题色，纯 accent 落在上面只剩 3:1 左右，口令入口和
+        拦截闪烁会发虚；压深一档到主文字色附近，既仍是主题色系又读得清。
+        """
+        p = self.pal
+        return _mix_hex(p["accent"], p.get("text", "#1f1f24"), 0.35)
+
+    def _foot_rule_bg(self):
+        return _status_bar_rule(self.pal, self._footer_bg())
+
+    def _foot_fg(self):
+        # 传当前底色：文字要按这块底的反差逐档提深，不能拿 soft 硬铺
+        return _status_bar_fg(self.pal, self._footer_bg())
 
     def _tool_line(self):
         """工具栏内分隔线色：由工具栏底色向次级文字色混合，保证在底色上仍看得见。"""
@@ -1378,10 +2434,10 @@ class UIMixin(object):
         ("strike",   "删除线",                             1),
         ("color",    "文字颜色 / 下划线颜色",               1),
         ("link",     "超链接  Ctrl+K",                     1),
-        ("bullet",   "项目符号列表",                       2),
-        ("numbered", "有序列表",                           2),
-        ("triangle", "三角列表",                           2),
-        ("todo",     "待办事项",                           2),
+        ("bullet",   "项目符号列表（右键：转换 / 清除）",   2),
+        ("triangle", "三角列表（右键：转换 / 清除）",       2),
+        ("numbered", "有序列表（右键：转换 / 重新编号）",   2),
+        ("todo",     "待办事项（右键：转换 / 清除）",       2),
         ("code",     "代码块（选择语言）",                  2),
         ("alarm",    "任务提醒：在正文里插一个小闹钟",        2),
         ("more",     "更多：导出笔记 / 插入分割线 / 全局设置", 3),
@@ -1394,12 +2450,15 @@ class UIMixin(object):
         "#e84393", "#ffffff", "#7f8c8d", "#d35400", "#16a085", "#2c3e50",
     ]
 
-    # 全局设置「工具栏按钮」里给每项起的短名（TOOL_ITEMS 的提示语太长，不适合当复选框文字）
+    # 全局设置「工具栏按钮定制」里给每项起的短名（TOOL_ITEMS 的提示语太长，
+    # 不适合当复选框文字）。列表类一律用「无序 / 有序」的正式叫法：工具栏图标是
+    # 项目符号 / 数字序号，写成「列表 / 序号」会让人以为一个是总开关、一个是编号工具。
     TOOL_SHORT_NAMES = {
         "style": "段落样式", "bold": "加粗", "italic": "斜体",
         "underline": "下划线", "strike": "删除线", "color": "颜色",
         "link": "超链接",
-        "bullet": "列表", "numbered": "序号", "triangle": "三角列表", "todo": "待办",
+        "bullet": "无序列表", "numbered": "有序列表",
+        "triangle": "三角列表", "todo": "待办",
         "code": "代码块", "alarm": "任务提醒",
     }
 
@@ -1508,18 +2567,33 @@ class UIMixin(object):
             b = self._mk_fmt(parent, "S", lambda: self.toggle_sel_tag("strike"), strike=True,
                              tip=tip)
         elif iid == "color":
-            b = self._mk_dropdown(parent, "A", tip, None, command=self._open_color_panel,
-                                  fg=self.pal["accent"])
+            # ⚠️ 别给这枚按钮单独传 fg=pal["accent"]：那是把「建窗那一刻」的强调色
+            # 写死在 RoundButton 实例上，换主题时旁边 B/I/U 都按新板重算字色，
+            # 唯独这枚还留着旧色（深色主题下像被选中/高亮，格外扎眼）。颜色面板
+            # 里的色板已经足够说明它是干什么的，按钮本身和其它工具栏项同一套样式。
+            b = self._mk_dropdown(parent, "A", tip, None, command=self._open_color_panel)
         elif iid == "link":
             b = self._mk_icon(parent, "link", tip, self.toggle_link)
-        elif iid == "bullet":
-            b = self._mk_icon(parent, "bullet", tip, self.insert_bullet)
-        elif iid == "numbered":
-            b = self._mk_icon(parent, "numbered", tip, self.insert_numbered)
-        elif iid == "triangle":
-            b = self._mk_icon(parent, "triangle", tip, self.insert_triangle)
-        elif iid == "todo":
-            b = self._mk_icon(parent, "todo", tip, self.insert_check)
+        elif iid in ("bullet", "numbered", "triangle", "todo"):
+            # 对有序/无序/三角列表使用自定义位图图标（list.png / unorder_list.png / arrow.png），其它保持矢量绘制
+            if iid == "numbered":
+                icon_img = "list.png"
+            elif iid == "bullet":
+                icon_img = "unorder_list.png"
+            elif iid == "triangle":
+                icon_img = "arrow.png"
+            else:
+                icon_img = None
+            # 命令显式传给 apply_list_kind。曾经用 getattr(self, "insert_" + iid)
+            # 拼方法名：名字藏在字符串里，静态扫描看不见引用，谁也不敢删那几个
+            # 一行包装；而且改 iid 就直接 AttributeError。
+            list_kind = "check" if iid == "todo" else iid
+            b = self._mk_icon(parent, iid, tip,
+                              lambda k=list_kind: self.apply_list_kind(k),
+                              icon_img=icon_img)
+            # 四个列表按钮共用一套右键菜单：互转、重新编号、清除标记（P1）。
+            # 左键仍是「切换 / 批量应用」（P0），右键补上左键表达不了的动作。
+            b.bind("<Button-3>", self._open_list_menu)
         elif iid == "code":
             b = self._mk_code_ui(parent)
         elif iid == "alarm":
@@ -1532,16 +2606,16 @@ class UIMixin(object):
             # 里面还有「全局设置」这种与内容无关的项）
             self._tool_btns[iid] = b
 
-    def _mk_icon(self, parent, icon, tip, cmd):
+    def _mk_icon(self, parent, icon, tip, cmd, icon_img=None):
         """纯图标按钮（列表 / 序号 / 待办 / ⋯ 等）。
 
         内边距 8 / 外边距 2：13 项排开要压进 1080 窗口那 536px 的可视宽，
         按 9/3 算是 581px（溢出 45px，右箭头会把 ⋯ 整颗盖住）。收这 1px 是
         为了默认窗口下整条不用横向滚动 —— 再往上加按钮就得先减掉别的东西。
         """
-        b = RoundButton(parent, self.pal, "", command=cmd, icon=icon,
-                        padx=8, pady=4, base=self._tool_bg())
-        b.pack(side=tk.LEFT, padx=2, pady=3)
+        b = RoundButton(parent, self.pal, "", command=cmd, icon=icon, icon_img=icon_img,
+                        padx=dpi.px(8), pady=dpi.px(4), base=self._tool_bg())
+        b.pack(side=tk.LEFT, padx=dpi.px(2), pady=dpi.px(3))
         b.bind_events()
         self.fmt_buttons.append(b)
         self._add_tip(b, tip)
@@ -1562,9 +2636,9 @@ class UIMixin(object):
                 menu_builder(holder.get("btn"))
 
         b = RoundButton(parent, self.pal, text, command=act, icon="chevron",
-                        padx=8, pady=4, fg=fg, base=self._tool_bg())
+                        padx=dpi.px(8), pady=dpi.px(4), fg=fg, base=self._tool_bg())
         holder["btn"] = b
-        b.pack(side=tk.LEFT, padx=2, pady=3)
+        b.pack(side=tk.LEFT, padx=dpi.px(2), pady=dpi.px(3))
         b.bind_events()
         self.fmt_buttons.append(b)
         self._add_tip(b, tip)
@@ -1617,6 +2691,11 @@ class UIMixin(object):
         """
         ro = self.is_readonly()     # 只读笔记：会改内容的项置灰，界面类项照常可用
         m = PopupMenu(self.root, self.pal)
+        # 涂鸦不改正文（笔迹在独立窗口里，关闭即丢），所以只读笔记也照常可用；
+        # 工具栏 14 项已经顶到 559/562px，第 15 枚一律收进 ⋯ 菜单。
+        m.add("涂鸦标注…（Esc 退出）" if not self.doodle_active() else "退出涂鸦标注",
+              icon="pencil", command=self.toggle_doodle)
+        m.add_separator()
         m.add("插入分割线", icon="hr", enabled=not ro, command=self.insert_hr)
         m.add("还原默认格式", icon="undo", enabled=not ro, command=self.reset_format)
         m.add_separator()
@@ -1628,9 +2707,46 @@ class UIMixin(object):
         m.add("导出为 PDF（.pdf）", icon="export",
               command=lambda: self.export_note("pdf"))
         m.add_separator()
-        m.add("全局设置…", icon="sliders", command=self.open_settings)
+        # 行号开关：右键行号能关，但关掉之后那块区域就没了 —— 恢复入口必须另有
+        # 一处，否则用户只能去改配置文件。打勾表示当前是开着的（勾由 PopupMenu
+        # 画在右端，不拼进文案，见 widgets.PopupMenu.add）。
+        m.add("显示行号", icon="gutter", checked=self._line_numbers_on(),
+              command=lambda: self.set_line_numbers(not self._line_numbers_on()))
         m.add("折叠工具栏", icon="panel", command=lambda: self._set_toolbar_collapsed(True))
         self._popup_under(btn or getattr(self, "_more_btn", None), m)
+
+    def _open_list_menu(self, event):
+        """列表按钮右键菜单（P1）：四种列表互转 / 重新编号 / 清除标记。
+
+        菜单作用于**编辑器当前的光标行或选区**，不是按钮本身的状态 —— 和左键
+        同一个作用域。当前选区若都是同一种列表，就在对应项后面打勾，用户不用
+        猜「这一行现在算什么」。
+        """
+        if not self.current_note() or self.is_readonly():
+            return "break"
+        cur = self._common_list_kind()
+        m = PopupMenu(self.root, self.pal)
+        for kind, label, icon in (("bullet", "项目符号", "bullet"),
+                                  ("numbered", "有序列表", "numbered"),
+                                  ("triangle", "三角列表", "triangle"),
+                                  ("check", "待办事项", "todo")):
+            # 勾走右侧固定列（checked），不拼进 label —— 四个选项里只有一个带勾，
+            # 拼字符会让那一行突然比其他项宽 8px，整张菜单跟着跳一下
+            m.add(label, icon=icon, checked=(cur == kind),
+                  command=lambda k=kind: self.apply_list_kind(k))
+        m.add_separator()
+        has_num = any(self._list_kind_at(ln) == "numbered"
+                      for ln in self._touched_lines()
+                      if str(ln) != self.TITLE_LINE)
+        m.add("重新编号", icon="numbered", enabled=has_num,
+              command=self.renumber_selected_lists)
+        m.add("清除列表标记", icon="trash",
+              command=lambda: self.apply_list_kind(None))
+        try:
+            m.popup(event.x_root, event.y_root)
+        except Exception:
+            pass
+        return "break"
 
     # ---------- 工具栏折叠 / 自定义 ----------
 
@@ -1649,10 +2765,10 @@ class UIMixin(object):
         try:
             if collapsed:
                 self.toolbar.pack_forget()
-                self._tool_bottom.configure(height=6, bg=self._strip_bg(), cursor="hand2")
+                self._tool_bottom.configure(height=dpi.px(6), bg=self._strip_bg(), cursor="hand2")
             else:
                 self.toolbar.pack(fill=tk.X, before=self._tool_bottom)
-                self._tool_bottom.configure(height=1, bg=self._tool_line(), cursor="")
+                self._tool_bottom.configure(height=dpi.px(1), bg=self._tool_line(), cursor="")
         except Exception:
             pass
         if collapsed and getattr(self, "_strip_tip", None) is None:
@@ -1738,7 +2854,8 @@ class UIMixin(object):
         elif not show and mapped:
             arrow.pack_forget()
 
-    def apply_palette(self):
+    def apply_palette(self, old_pal=None):
+        """整窗重刷配色。`old_pal` 只在运行时换主题时给（启动时控件刚建好，无需翻译）。"""
         p = self.pal
         # 纯色背景（已移除渐变）：根/顶栏/侧栏用浅色实底，列表与编辑区保持纯色确保文字可读
         self.root.configure(bg=p["top"])
@@ -1793,22 +2910,25 @@ class UIMixin(object):
             self.tabbar.apply_theme(p, base=tbg)
         except Exception:
             pass
-        # 只读提示条：底色跟工具带同一档，换肤时不能留旧色
+        # 只读提示条：主题色淡纸片（⚠️ 不是 pal["hover"]，会和未选中标签撞色）
         try:
-            self._ro_bar.configure(bg=p.get("hover", "#ececf0"))
-            self._ro_label.configure(bg=p.get("hover", "#ececf0"),
-                                     fg=p.get("soft", "#76767e"))
-            self._ro_action.configure(bg=p.get("hover", "#ececf0"), fg=p["accent"])
+            ro = self._ro_bar_bg()
+            acc_fg = self._ro_accent_fg()
+            self._ro_bar.configure(bg=ro)
+            self._ro_label.configure(bg=ro, fg=p.get("soft", "#76767e"))
+            self._ro_action.configure(bg=ro, fg=acc_fg)
         except Exception:
             pass
-        # 底部状态条（创建/修改/字数）：浮层是自己画的，换肤要逐块改
+        # 底部状态条（创建/修改/字数）：底色带主题色相，换肤时逐块重配色
+        # （底 / 上沿细线 / 文字三处都从 _status_bar_* 现算，不缓存旧值）
         try:
             fbg = self._footer_bg()
+            ffg = self._foot_fg()
             self._footer.configure(bg=fbg)
             self._foot_row.configure(bg=fbg)
-            self._foot_rule.configure(bg=_mix_hex(fbg, p["line"], 0.85))
-            self._foot_left.configure(bg=fbg, fg=p["soft"])
-            self._foot_right.configure(bg=fbg, fg=p["soft"])
+            self._foot_rule.configure(bg=self._foot_rule_bg())
+            self._foot_left.configure(bg=fbg, fg=ffg)
+            self._foot_right.configure(bg=fbg, fg=ffg)
         except Exception:
             pass
         # 链接地址小窗：直接丢掉重来（下次悬停按新配色重建）
@@ -1837,9 +2957,9 @@ class UIMixin(object):
         # 折叠条：折叠时是「可点的窄条」，展开时退回 1px 分隔线
         try:
             if getattr(self, "_tool_collapsed", False):
-                self._tool_bottom.configure(height=6, bg=self._strip_bg(), cursor="hand2")
+                self._tool_bottom.configure(height=dpi.px(6), bg=self._strip_bg(), cursor="hand2")
             else:
-                self._tool_bottom.configure(height=1, bg=self._tool_line(), cursor="")
+                self._tool_bottom.configure(height=dpi.px(1), bg=self._tool_line(), cursor="")
         except Exception:
             pass
         self.text.configure(bg=p["editor"], fg=p["text"], insertbackground=p["accent"],
@@ -1847,6 +2967,14 @@ class UIMixin(object):
                              inactiveselectbackground=_sel_bg(p, active=False),
                              selectforeground=_sel_fg(p))
         self._config_tags()
+        # 行号栏：底色是稿纸色；数字和图元是画上去的，改完底色必须重画一遍
+        try:
+            self.gutter.configure(bg=p["editor"])
+        except Exception:
+            pass
+        self._gutter_schedule(0)
+        # 查找浮条：控件颜色是构造时吃进去的，换肤要逐块改（关键词保留）
+        self._restyle_find_bar()
         self._col_caret_invalidate()
         for blk in self._codes:
             try:
@@ -1859,8 +2987,10 @@ class UIMixin(object):
             except Exception:
                 pass
         for b in self.fmt_buttons:
-            # 工具栏按钮的常态底色就是工具栏底色，换肤时必须一起换，否则留一块旧色斑
-            b.apply_theme(p, base=tbg)
+            # 常态底色 = 工具栏底色；显式写死在实例上的 fg / outline（不在 tk option
+            # 里，通用重刷够不着）也要按「旧板 → 新板」翻译，否则换肤后那几枚按钮
+            # 会留着建窗时的旧字色 / 旧描边 —— 工具栏尤其明显。
+            b.apply_theme(p, base=tbg, old_pal=old_pal)
         self.refresh_folders()
         self.refresh_notes()
         # 换肤后重刷搜索高亮：_config_tags 虽然已经把 "find" 的底色换成新主题的，
@@ -1874,6 +3004,41 @@ class UIMixin(object):
             self._sync_toolbar()
         except Exception:
             pass
+        # 涂鸦蒙层：配色构造时吃进去，换肤要按新皮肤重算薄雾 / 工具条 / 提示片。
+        # ⚠️ 只重画装饰层，笔迹（"stroke"）保持原样，别把用户刚画的抹掉。
+        try:
+            d = getattr(self, "_doodle", None)
+            if d is not None and d.active:
+                d.apply_theme(p)
+        except Exception:
+            pass
+
+    # ---------- 主题切换 ----------
+    def _read_theme(self):
+        """从 settings 读当前主题 id；不认识（含已下线的 skin）或缺失都用默认（森林绿）。"""
+        tid = (self.data.get("settings") or {}).get("theme")
+        if tid in THEMES:
+            return tid
+        return DEFAULT_THEME
+
+    def _current_theme(self):
+        return self._read_theme()
+
+    def set_theme(self, tid):
+        """运行时切换主题：换调色板 → 重刷整窗 → 持久化到 settings。
+
+        路径与现有换肤逻辑同构（apply_palette 已覆盖所有控件 / 标签 / 横带 / 图标），
+        所以这套切换天然复用全部派生色推导，不需要另写配色逻辑。
+        """
+        if tid not in THEMES:
+            return
+        old_pal = dict(self.pal)          # 供「把旧板色写死在身上的控件」翻译
+        self.pal = build_palette(tid)
+        self.apply_palette(old_pal=old_pal)
+        self.data.setdefault("settings", {})["theme"] = tid
+        save_data(self.data)
+        # 正文里已嵌入的闹钟图标按 star 染色：清缓存并就地重染，避免换肤后残留旧色
+        self._refresh_alarm_images()
 
     # 标题相对正文的放大比例。用比例而不是固定偏移（旧版是 +4 / +2），是因为
     # 固定偏移在小字号下层级明显、到大字号就几乎看不出差别（正文 24 时 H1 只有 28）。
@@ -1900,12 +3065,21 @@ class UIMixin(object):
         self.text.tag_configure("underline", underline=True)
         self.text.tag_configure("strike", overstrike=True)
         # 行级样式：H1 / H2 按比例跟着正文字号缩放（见 H1_SCALE / H2_SCALE 的说明）。
-        # 标题 / 正文 之间留出间距（spacing3 在标签行下方，spacing1 在其上方）
         h1 = self._heading_size(bs, self.H1_SCALE)
         h2 = self._heading_size(bs, self.H2_SCALE)
-        self.text.tag_configure("title", font=(fam, h1, "bold"), spacing1=8, spacing3=8)
-        self.text.tag_configure("h2", font=(fam, h2, "bold"), spacing1=6, spacing3=6)
-        self.text.tag_configure("body", font=(fam, bs), spacing1=2, spacing3=2)
+        # 段间距只有一份定义：spacing1 在段首上、spacing3 在段尾下，两者之和就是
+        # 「回车换行」的段间距离（基线差 = 行高 + 上 + 下）。
+        # ⚠️ Tk 的自动折行（同一逻辑行的后续 display line）吃的是 **spacing2**，
+        # 默认 0 → 折行比回车紧掉 (上+下) 那么多（实测正文基线差 20 vs 24）。
+        # `line_spacing()` 让 spacing2 取 spacing1 + spacing3，两种换行的行距才一致；
+        # 标题类传 wrap=一半 —— 两行标题之间塞进整个段间距会像两个段落。
+        self.text.tag_configure("title", font=(fam, h1, "bold"), **line_spacing(8, 8, wrap=8))
+        self.text.tag_configure("h2", font=(fam, h2, "bold"), **line_spacing(6, 6, wrap=6))
+        self.text.tag_configure("body", font=(fam, bs), **line_spacing(2, 2))
+        # ⚠️ 首行**没有**专属标签：title 的 8px 段前距在首行同样生效，选中标题时
+        # 色块上下各留 8px 才对称。离顶 20 的口径由 TEXT_PADY(12) + 8 凑出来，
+        # 不是靠压掉 spacing1（旧版 firstline 的做法，2026-11-05 已移除）。
+        # ⚠️ 更别把 title 的 spacing1 改成 0 —— 那会把全文所有 H1 的段前距一起砍掉。
         self.text.tag_configure("done", overstrike=True, foreground=p["soft"])
         # 待办勾选框：**字面字符**，字号按正文比例算，两个状态**共用同一套字体与
         # 字号**（见 TODO_ICON_SCALE）。共用是硬要求：上一版给 ▢ / ✅ 各配一套
@@ -1958,8 +3132,7 @@ class UIMixin(object):
         _qind = _char_w * 2
         self.text.tag_configure("quote", lmargin1=_qind, lmargin2=_qind,
                                 rmargin=_char_w,
-                                spacing1=3, spacing3=3,
-                                background=_quote_bg(p))
+                                background=_quote_bg(p), **line_spacing(3, 3))
         # 链接：固定蓝 + 下划线（不跟 accent，绿皮肤下 accent 是绿的）。点击行为在
         # _on_link_click 里（tag_bind）。裸网址和富链接共用这一个样式标签，观感统一。
         self.text.tag_configure("link", foreground=p.get("link") or p["accent"],
@@ -1969,6 +3142,14 @@ class UIMixin(object):
         # 底色推导见 theme._search_hit_bg：琥珀色，刻意避开主题色 —— 绿皮肤下
         # 主题色就是绿的，和引用块/选中行同族，高亮会被读成「这段被选中了」。
         self.text.tag_configure("find", background=_search_hit_bg(p))
+        # Ctrl+F 查找框的命中：和顶栏搜索共用琥珀底色（同一个心智模型），但**另开两个
+        # 标签** —— 顶栏搜索会整片 `tag_remove("find")`，共用的话关掉查找框就把顶栏
+        # 搜索的高亮一起抹了；反过来顶栏搜索每次刷新也会吃掉查找框的「当前命中」。
+        # 当前命中年那条用主题色压深一档：一片琥珀里得能一眼找到「现在跳到哪一条」。
+        self.text.tag_configure(FIND_HIT_TAG, background=_search_hit_bg(p))
+        self.text.tag_configure(FIND_CUR_TAG,
+                                background=_mix_hex(p["editor"], p["accent"], 0.42),
+                                foreground=_sel_fg(p))
         # 加密笔记未解锁时正文区的占位说明：用最淡的字色，一眼就知道它不是正文
         self.text.tag_configure("locked_ph", foreground=p["soft"])
         # 动态样式：用户自选的文字颜色 / 字体（家族+字号），存入 data["styles"] 以便重开还原
@@ -2008,6 +3189,10 @@ class UIMixin(object):
         # 排在 find 下面时命中词的黄底会被整块盖掉，看起来像「搜索没高亮」。
         # 但必须排在 "sel" 下面 —— 选区是操作反馈，永远最上层。
         self.text.tag_raise("find")
+        # 查找框的两个标签：命中铺底色、当前命中再压一层。同样必须在静态底色
+        # （引用 / 行内代码）之上，否则「一排黄底里就那几行没变色」。
+        self.text.tag_raise(FIND_HIT_TAG)
+        self.text.tag_raise(FIND_CUR_TAG)
         # 竖向（矩形）选择的高亮。颜色跟普通选区同一套 —— 用户认知里它就该是
         # 「选中了」；标签单独一个只是为了复制能自己算（见 COLSEL_TAG 的注释）。
         # 它压在 find 之上、sel 之下：矩形是操作结果，搜索命中不该盖住它。
@@ -2060,24 +3245,73 @@ class UIMixin(object):
         save_data(self.data)
         self._apply_body_size(size)
 
-    def open_settings(self):
-        """全局设置：正文字号（改后全局生效并写入 notes_data.json，重启保持）。"""
-        p = self.pal
+    def open_settings(self, _state=None):
+        """全局设置：正文字号 / 字体 / 外观主题 / 工具栏按钮定制 / 标签页。
+
+        `_state` 是可选的初始状态（字号 / 多标签开关 / 工具栏勾选 / 滚动位置），
+        用户调用的入口都不用给，按已落库的设置初始化。
+
+        窗内换主题走**就地重刷**（见 repaint_settings）：窗口、焦点、未确认的勾选
+        和滚动位置全留在原地，不 destroy 再 create —— 那一下就是用户看到的「闪」。
+        """
+        state = _state or {}
+        # 本窗当前配色。刻意**拷贝**而不是引用 self.pal：set_theme 会把 app 的 pal
+        # 整个换掉，而窗内控件 / 闭包都按 p 取值；换肤时把 p 原地更新，重画图标等
+        # 闭包就自动拿到最新的一套，不需要重建窗口。
+        p = dict(self.pal)
         dlg = tk.Toplevel(self.root)
         dlg.title("全局设置")
         dlg.transient(self.root)
         dlg.resizable(False, False)
         dlg.configure(bg=p["editor"])
-        tk.Label(dlg, text="全局设置", bg=p["editor"], fg=p["text"],
-                 font=(FONT[0], 13, "bold")).pack(anchor="w", padx=20, pady=(16, 2))
 
-        cur = tk.IntVar(value=self.body_size)
+        # 内容全装进可滚动区，底部按钮行留在外面钉住；整窗高度跟「数据管理」窗
+        # 对齐（见 _panel_height），多出来的内容滚动查看。
+        # 这窗自然高 735（内容 662 + 按钮行 73），比数据管理窗（504）高一大截；
+        # 以前只在矮屏装不下时才滚，主屏上仍是长窗，两张窗来回切像换了程序。
+        # 现在固定同一把尺；矮屏再退到「屏幕能放多高就多高」，确定 / 取消始终可见。
+        scroller = ScrollBody(dlg, p["editor"], p)
+        scroller.pack(fill=tk.BOTH, expand=True)
+        body = scroller.inner
+
+        section_icons = []       # 四枚小节的图标 Canvas：换肤时按种类重画
+
+        def sec_icon(parent, kind, size=16):
+            """小节标题前的小图标：按当前主题色画在稿纸底色的 Canvas 上。
+
+            尺寸走 dpi.px，画布即图标本身（不留内边距）；图形由 `_draw_section_icon`
+            按 16×16 网格换算。「字体设置 / 外观主题 / 工具栏按钮定制 / 标签页」四节
+            共用同一套画法与同一个尺寸（16px）—— 四节是平级的，图标忽大忽小会让人
+            以为哪一节是子项。
+            """
+            n = dpi.px(size)
+            cv = tk.Canvas(parent, width=n, height=n, bg=p["editor"],
+                           bd=0, highlightthickness=0, takefocus=0)
+            _draw_section_icon(cv, kind, n / 2.0, n / 2.0, n, p["accent"], p["editor"])
+            # 笔画是「画上去」的，不在 tk 的颜色 option 里：换肤要按这枚图标的
+            # 种类和尺寸重画一次，通用重刷只负责画布底色。
+            cv._sec_icon = (kind, n)
+            section_icons.append(cv)
+            return cv
+
+        head = tk.Frame(body, bg=p["editor"])
+        head.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(16), 0))
+        # 这颗原本是「全局设置」的齿轮标题 —— 它下面整段都是正文的字体与字号，
+        # 叫「全局设置」等于把窗口名写了两遍（标题栏已经有一个），也让人以为
+        # 下面那些外观 / 工具栏项都归它管。改成「字体设置」+ 字形 A，
+        # 和后面三节（外观主题 / 工具栏按钮定制 / 标签页）构成平级的四节。
+        sec_icon(head, "font").pack(side=tk.LEFT, padx=(0, dpi.px(6)),
+                                    pady=(dpi.px(1), 0))
+        tk.Label(head, text="字体设置", bg=p["editor"], fg=p["text"],
+                 font=(FONT[0], 12, "bold")).pack(side=tk.LEFT)
+
+        cur = tk.IntVar(value=int(state.get("size") or self.body_size))
 
         # ---- 正文字体族：原来占着工具栏 93px，收进设置后成为正经的全局项 ----
-        fam_row = tk.Frame(dlg, bg=p["editor"])
-        fam_row.pack(anchor="w", padx=20, pady=(8, 0))
+        fam_row = tk.Frame(body, bg=p["editor"])
+        fam_row.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(8), 0))
         tk.Label(fam_row, text="正文字体", bg=p["editor"], fg=p["text"],
-                 font=(FONT[0], 12)).pack(side=tk.LEFT, padx=(0, 10))
+                 font=(FONT[0], 12)).pack(side=tk.LEFT, padx=(0, dpi.px(10)))
         fam_cb = ttk.Combobox(fam_row, width=16, state="readonly", height=8)
         fam_cb["values"] = [f[0] for f in self.FONT_FAMILIES]
         fam_cb.set(next((lb for lb, fam in self.FONT_FAMILIES
@@ -2096,9 +3330,9 @@ class UIMixin(object):
 
         fam_cb.bind("<<ComboboxSelected>>", on_family)
 
-        tk.Label(dlg, text="正文大小（只改正文；H1 / H2 按比例跟随，正文 12 号时是 16 / 14）",
-                 bg=p["editor"], fg=p["soft"], font=(FONT[0], 11)).pack(anchor="w", padx=20,
-                                                                    pady=(10, 0))
+        tk.Label(body, text="正文大小（只改正文；H1 / H2 按比例跟随，正文 12 号时是 16 / 14）",
+                 bg=p["editor"], fg=p["soft"], font=(FONT[0], 11)).pack(anchor="w", padx=dpi.px(20),
+                                                                    pady=(dpi.px(10), 0))
 
         # 预览盒：一行 H1 + 一行正文，滑动时同时跟着变，直观看出「标题按比例走」。
         # 宽高按最大字号 25pt 一次性算好并锁死 —— 文字单行、盒高固定，拖动滑杆时
@@ -2109,15 +3343,15 @@ class UIMixin(object):
         _body_max = _tf.Font(family=FONT[0], size=25)
         _h1_text = "一级标题 H1"
         _sample_text = "正文预览：笔记内容 Abc"
-        box = tk.Frame(dlg, bg=p["hover"], bd=1, relief=tk.SOLID,
+        box = tk.Frame(body, bg=p["hover"], bd=dpi.px(1), relief=tk.SOLID,
                        height=(_h1_max.metrics("linespace")
-                               + _body_max.metrics("linespace") + 20))
-        box.pack(fill=tk.X, padx=20, pady=(8, 4))
+                               + _body_max.metrics("linespace") + dpi.px(20)))
+        box.pack(fill=tk.X, padx=dpi.px(20), pady=(dpi.px(8), dpi.px(4)))
         box.pack_propagate(False)
         # 两行字放内层容器里垂直居中：盒高按 25pt 锁死，小字号时才不会顶在上沿、
         # 下面留一大片空
         inner = tk.Frame(box, bg=p["hover"])
-        inner.place(x=10, rely=0.5, anchor="w")
+        inner.place(x=dpi.px(10), rely=0.5, anchor="w")
         sample_h1 = tk.Label(inner, text=_h1_text, bg=p["hover"], fg=p["text"],
                              anchor="w", justify="left",
                              font=(FONT[0], self._heading_size(self.body_size, self.H1_SCALE),
@@ -2134,29 +3368,239 @@ class UIMixin(object):
             sample.configure(font=(fam, v))
             sample_h1.configure(font=(fam, self._heading_size(v, self.H1_SCALE), "bold"))
 
+        # 上面两行是照「已落库的字号」造的；带初始状态进来时那可能是个还没确认的
+        # 新值（滑杆拖过但没点确定），这里补一次，预览才不会跳回旧号。
+        preview()
+
         # 字号滑杆：8–25pt 连续步进，拖动时气泡显示当前值
         # 画布本身固定 340 宽，靠 anchor="center" 整体水平居中（轨道、滑钮、
         # 右上角 pt 数值、两端 8/25 标签都跟着居中，不再缩在左侧）
-        slider = FontSizeSlider(dlg, p, cur, minimum=8, maximum=25,
-                                command=preview, width=340)
-        slider.pack(anchor="center", pady=(12, 2))
+        slider = FontSizeSlider(body, p, cur, minimum=8, maximum=25,
+                                command=preview, width=dpi.px(340))
+        slider.pack(anchor="center", pady=(dpi.px(12), dpi.px(2)))
 
-        # ---- 工具栏按钮：编辑区上方那条工具条上留哪几枚 ----
+        # ---- 外观主题：六张色卡折行平铺，点一下就换 ----
+        # 原来是 ttk.Combobox：得先展开才知道有几套，每套长什么样更是一点看不见。
+        # 改成「圆圈 + 名称」的网格：圈内按**这套主题自己**的配色上色（左半顶栏 /
+        # 侧栏色、右半稿纸色、圆心一点强调色），六套能横向比。色卡内部颜色是固定
+        # 的、不随当前主题变；随主题变的只有选中环与名称字色。
+        tk.Frame(body, height=dpi.px(1), bg=p["line"]).pack(
+            fill=tk.X, padx=dpi.px(20), pady=(dpi.px(6), 0))
+        theme_row = tk.Frame(body, bg=p["editor"])
+        theme_row.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(4), 0))
+        sec_icon(theme_row, "theme").pack(side=tk.LEFT, padx=(0, dpi.px(6)),
+                                          pady=(dpi.px(1), 0))
+        tk.Label(theme_row, text="外观主题", bg=p["editor"], fg=p["text"],
+                 font=(FONT[0], 12, "bold")).pack(side=tk.LEFT)
+
+        theme_items = list_themes()                      # [(id, 显示名), ...]
+        # 列数按窗口宽度算：默认的 560 宽正好摆得下 6 个（一行全见，不用滚），
+        # 窗口变窄就自动折成两行。固定写死 3 列会把后 3 套挤到视口外。
+        # 这张窗的滚动区高度跟数据管理窗对齐、是固定的：主题节本来就在视口下沿，
+        # 卡片摆太高会把名称顶到按钮行后面，所以尺寸压成「圆 + 一行名称」。
+        CELL_W, CELL_H = dpi.px(76), dpi.px(60)
+        SWATCH = dpi.px(34)
+        RING_W = dpi.px(3)                       # 选中粗环；回归测试按这个数断言
+        HALO_GAP = max(2, dpi.px(2))             # 粗环外的光晕留白
+        BADGE_R = max(4, dpi.px(7))              # 右上角「已选中」对勾徽标半径
+        THEME_COLS = max(3, min(len(theme_items),
+                                (_panel_width(dlg) - dpi.px(48)) // CELL_W))
+        # 每套主题自己的调色板在建窗时算一次并缓存：色卡要拿来做横向比较，
+        # 换主题时重算反而会让六张卡一起变色，就失去「预览」的意义了。
+        theme_pals = {tid: dict(build_palette(tid)) for tid, _lb in theme_items}
+        theme_cards = []           # [(tid, Canvas)]，换肤时逐张重画
+        theme_hover = [None]
+        # 「当前选中哪一套」是这张窗自己的状态，刻意不每次去读 _current_theme()：
+        # 点击要先给出选中反馈（第一帧），整窗换肤渲染是第二步；状态提交前读 app
+        # 只能拿到旧主题，色卡就会慢半拍才亮，像没点中。
+        theme_selected = [self._current_theme()]
+        theme_grid = tk.Frame(body, bg=p["editor"])
+        theme_grid.pack(anchor="center", pady=(0, 0))
+
+        # 状态 → 已栅格化行数据的缓存。纯 Python 字符串，不绑 Tk 解释器，
+        # 也不像 PhotoImage 那样有跨 root 的坑；上限 64 组，避免越攒越多。
+        bitmap_cache = {}
+
+        def draw_theme_cards():
+            """重画色卡：整张卡先栅格化成一张抗锯齿位图，再贴到 Canvas。
+
+            ⚠️ 原来用 `create_oval` / `create_arc` 画圆和环：Tk Canvas 走 GDI、
+            完全不抗锯齿，34px 的圆是硬边台阶，椭圆描边还被掰成一圈粗细不均的
+            方块，五个图元各自光栅化又差半像素 —— 这就是用户说的「毛刺」。现在
+            所有曲线都用 `widgets.AAImage` 按覆盖率混色一次合成（圆 / 半圆 /
+            环 / 光晕 / 圆角底板 / 徽标 / 对勾），圆心与半径全是浮点 SDF，不再
+            交给 Tk 的整数包围盒（半开区间 [x0,x1) 和 `r=SWATCH//2` 在高 DPI
+            下各会吃掉 1px）。名称仍是 create_text —— 系统字体自带抗锯齿。
+
+            选中态叠五层：浅色底板 → 圆外光晕 → 粗环 → 右上对勾 → 名称加粗换色；
+            悬停只给一层更淡的中性底板。位图按状态缓存：`<Enter>/<Leave>` 只
+            重算受影响的两张卡，不会整排重绘导致顿挫。测试读 `cv._card_state`
+            这份语义状态，不再按图元 fill / outline / 宽度猜渲染实现。
+            """
+            cur_id = theme_selected[0]
+            acc = p["accent"]
+            # 1px 细环不能直接用 pal["line"]（只比底色深 5%，几乎看不见）
+            idle_ring = _mix_hex(p["editor"], p["text"], 0.24)
+            card_bg = _mix_hex(p["editor"], acc, 0.10)       # 选中底板：淡淡一层强调色
+            card_line = _mix_hex(p["editor"], acc, 0.34)      # 底板描边：比底色看得清
+            hover_bg = _mix_hex(p["editor"], p["text"], 0.05)  # 悬停底板：中性、更弱
+            halo = _mix_hex(p["editor"], acc, 0.55)            # 粗环外的第二圈
+            check_fg = on_accent(acc)                          # 实心 accent 上的对勾字色
+            for tid, cv in theme_cards:
+                q = theme_pals[tid]
+                selected = (tid == cur_id)
+                hovered = (tid == theme_hover[0]) and not selected
+                ring_color = acc if (selected or hovered) else idle_ring
+                ring_w = float(RING_W if selected else max(1, dpi.px(1)))
+
+                # 状态没变就别重算位图：悬停是高频事件，整排重绘会顿一下。
+                # ⚠️ key 里必须带 tid —— 六张卡共用一个缓存，圆内三色各不相同，
+                # 少了 tid 会把同一份像素贴到所有主题上。
+                key = (tid, cur_id, selected, hovered, dpi.SCALE,
+                       p["editor"], p["text"], acc)
+                if getattr(cv, "_card_key", None) == key:
+                    continue
+                cv._card_key = key
+
+                # 几何与状态无关，缓存命中时名称位置 / 语义状态也要用同一组值
+                cx = CELL_W / 2.0
+                r = SWATCH / 2.0
+                cy = float(dpi.px(2)) + r
+                rows = bitmap_cache.get(key)
+                if rows is None:
+                    pic = AAImage(CELL_W, CELL_H, p["editor"])
+
+                    # ① 整张卡的圆角底板（选中 / 悬停）
+                    if selected or hovered:
+                        rr, bb = aa_round_rect(dpi.px(2), dpi.px(1),
+                                              CELL_W - dpi.px(2), CELL_H - dpi.px(3),
+                                              float(dpi.px(8)))
+                        pic.fill(card_bg if selected else hover_bg, rr, bb)
+                        pic.fill(card_line if selected else hover_bg,
+                                 aa_outline(rr, max(1, dpi.px(1))), bb)
+                    # ② 圆外光晕：与粗环之间留一道底色缝
+                    if selected:
+                        hs, hb = aa_ring(cx, cy, r + HALO_GAP, max(1, dpi.px(2)))
+                        pic.fill(halo, hs, hb)
+                    # ③ 圆内三色预览：各主题自己的固定色，换主题不重算
+                    ds, db = aa_disc(cx, cy, r)
+                    pic.fill(q["editor"], ds, db)
+                    ls, lb = aa_left_half(cx, cy, r)
+                    pic.fill(q["top"], ls, lb)
+                    dot_s, dot_b = aa_disc(cx, cy, max(2.0, r / 3.0))
+                    pic.fill(q["accent"], dot_s, dot_b)
+                    # ④ 右上对勾徽标：圆 + 1px 底色描边 + 两段折线
+                    if selected:
+                        bx = cx + r - BADGE_R + dpi.px(1)
+                        by = cy - r + BADGE_R + dpi.px(1)
+                        bs, bbox = aa_disc(bx, by, float(BADGE_R))
+                        pic.fill(acc, bs, bbox)
+                        es, eb = aa_ring(bx, by, float(BADGE_R), max(1, dpi.px(1)))
+                        pic.fill(p["editor"], es, eb)
+                        c1 = (bx - BADGE_R * 0.10, by + BADGE_R * 0.38)
+                        s1, b1 = aa_segment(bx - BADGE_R * 0.45, by, c1[0], c1[1],
+                                            max(2, dpi.px(2)))
+                        s2, b2 = aa_segment(c1[0], c1[1],
+                                            bx + BADGE_R * 0.52, by - BADGE_R * 0.42,
+                                            max(2, dpi.px(2)))
+                        pic.fill(check_fg, s1, b1)
+                        pic.fill(check_fg, s2, b2)
+                    # ⑤ 环最后盖上去：外半径就是圆半径，向内占 ring_w
+                    rs, rb = aa_ring(cx, cy, r, ring_w)
+                    pic.fill(ring_color, rs, rb)
+
+                    rows = pic.rows
+                    if len(bitmap_cache) > 64:
+                        bitmap_cache.clear()
+                    bitmap_cache[key] = rows
+
+                # 位图贴在 Canvas 上。PhotoImage 必须挂在实例上保活，否则被 GC
+                # 后这一格会变空白（同 _PHOTO_CACHE / self._app_icon 的红线）。
+                img = AAImage.from_rows(CELL_W, CELL_H, rows).to_photo(
+                    cv, getattr(cv, "_theme_photo", None))
+                cv._theme_photo = img
+                cv.delete("all")
+                cv.create_image(0, 0, anchor="nw", image=img, tags=("bitmap",))
+                name_y = cy + r + dpi.px(3)
+                cv.create_text(cx, name_y, text=theme_label(tid), anchor="n",
+                               tags=("name",),
+                               font=(FONT[0], 10, "bold" if selected else "normal"),
+                               fill=acc if selected else p["text"])
+                cv._card_state = {
+                    "tid": tid, "cur_id": cur_id,
+                    "selected": selected, "hovered": hovered,
+                    "swatch": (q["editor"], q["top"], q["accent"]),
+                    "swatch_bottom": cy + r,
+                    "ring": (ring_color, ring_w),
+                    "cardbg": (card_bg if selected else hover_bg)
+                              if (selected or hovered) else None,
+                    "halo": halo if selected else None,
+                    "check": bool(selected),
+                    "name": (theme_label(tid), acc if selected else p["text"],
+                             bool(selected)),
+                }
+
+        def on_theme(tid):
+            if tid not in THEMES:
+                return
+            # 已经是当前这一套（窗内选中态和落库状态一致）：不必白刷一遍整窗，
+            # 连点时尤其明显。
+            if tid == theme_selected[0] and tid == self._current_theme():
+                return
+
+            # ① 先选中：只改窗内选中状态并重画色卡（按 _card_key 差量，实际只
+            #    重算旧 / 新两张），立刻把这一帧推上屏。此时不碰 self.pal、不
+            #    apply_palette、不落库 —— 点下去第一眼就该看到选中标记，而不是
+            #    等整窗换肤渲染完才补上。
+            theme_hover[0] = None
+            theme_selected[0] = tid
+            draw_theme_cards()
+            dlg.update_idletasks()
+
+            # ② 再渲染：主窗换肤 + 窗内逐控件重刷 + 落库。仍在同一个回调里，
+            #    ⚠️ 不 destroy、不 after(0)、不重建：窗口全程可见，也就没有
+            #    「旧窗消失 → 新窗出现」那一帧闪；grab / 焦点 / 没点确定的字号
+            #    与勾选 / 滚动位置全都留在原地，不必再靠快照搬来搬去。
+            #    上面没动过 self.pal / p，所以两处 old_pal 仍是真正的旧板，
+            #    逐控件旧色 → 新色的翻译不会被短路。
+            self.set_theme(tid)
+            repaint_settings()
+
+        def on_theme_hover(tid):
+            theme_hover[0] = tid
+            draw_theme_cards()
+
+        for i, (tid, _lb) in enumerate(theme_items):
+            cv = tk.Canvas(theme_grid, width=CELL_W, height=CELL_H,
+                           bg=p["editor"], bd=0, highlightthickness=0,
+                           takefocus=0, cursor="hand2")
+            cv.grid(row=i // THEME_COLS, column=i % THEME_COLS,
+                    padx=dpi.px(3), pady=dpi.px(2))
+            cv._theme_tid = tid          # 回归测试按这个标记找色卡，别按尺寸猜
+            cv.bind("<Button-1>", lambda _e, t=tid: on_theme(t))
+            cv.bind("<Enter>", lambda _e, t=tid: on_theme_hover(t))
+            cv.bind("<Leave>", lambda _e: on_theme_hover(None))
+            theme_cards.append((tid, cv))
+        draw_theme_cards()
+
+        # ---- 工具栏按钮定制：编辑区上方那条工具条上留哪几枚 ----
         # 这组勾选框原来住在工具栏 ⋯ →「工具栏设置」的独立小窗里。改工具栏本质是
         # 「这个应用长什么样」，和正文字体、字号同一类；分成两处只会让人记两个地方。
         # 合并进来之后 ⋯ 菜单只留与正文内容有关的操作。
-        tk.Frame(dlg, height=1, bg=p["line"]).pack(fill=tk.X, padx=20, pady=(14, 0))
-        tb_head = tk.Frame(dlg, bg=p["editor"])
-        tb_head.pack(fill=tk.X, padx=20, pady=(10, 0))
-        tk.Label(tb_head, text="工具栏按钮", bg=p["editor"], fg=p["text"],
+        tk.Frame(body, height=dpi.px(1), bg=p["line"]).pack(fill=tk.X, padx=dpi.px(20), pady=(dpi.px(14), 0))
+        tb_head = tk.Frame(body, bg=p["editor"])
+        tb_head.pack(fill=tk.X, padx=dpi.px(20), pady=(dpi.px(10), 0))
+        sec_icon(tb_head, "toolbar").pack(side=tk.LEFT, padx=(0, dpi.px(6)),
+                                         pady=(dpi.px(1), 0))
+        tk.Label(tb_head, text="工具栏按钮定制", bg=p["editor"], fg=p["text"],
                  font=(FONT[0], 12, "bold")).pack(side=tk.LEFT)
-        tk.Label(dlg, text="取消勾选即从工具栏移除，随时可以再勾回来。",
+        tk.Label(body, text="取消勾选即从工具栏移除，随时可以再勾回来。",
                  bg=p["editor"], fg=p["soft"], font=(FONT[0], 11)).pack(
-                     anchor="w", padx=20, pady=(2, 6))
+                     anchor="w", padx=dpi.px(20), pady=(dpi.px(2), dpi.px(6)))
 
         tb_vars = {}
-        box = tk.Frame(dlg, bg=p["editor"])
-        box.pack(fill=tk.X, padx=16)
+        box = tk.Frame(body, bg=p["editor"])
+        box.pack(fill=tk.X, padx=dpi.px(16))
         # 三列等宽：uniform 让三列格子一样大，列与列之间那条空隙就处处相同。
         # 交给 grid 自己按内容排的话，第一列会被某一项撑宽、后两列挤在后面，
         # 三段的水平间距一个宽一个窄（用户一眼就看出来了）。
@@ -2172,16 +3616,17 @@ class UIMixin(object):
         # 不抢标题的注意力。
         b_none = RoundButton(tb_head, p, "全不选", command=lambda: set_all(False),
                              base=p["editor"], fg=p["soft"], outline=p["line"],
-                             font=(FONT[0], 10), padx=9, pady=2)
+                             font=(FONT[0], 10), padx=dpi.px(9), pady=dpi.px(2))
         b_none.pack(side=tk.RIGHT)
         b_none.bind_events()
         b_all = RoundButton(tb_head, p, "全选", command=lambda: set_all(True),
                             base=p["editor"], fg=p["soft"], outline=p["line"],
-                            font=(FONT[0], 10), padx=11, pady=2)
-        b_all.pack(side=tk.RIGHT, padx=(0, 6))
+                            font=(FONT[0], 10), padx=dpi.px(11), pady=dpi.px(2))
+        b_all.pack(side=tk.RIGHT, padx=(0, dpi.px(6)))
         b_all.bind_events()
 
-        hidden_now = self._tool_hidden()
+        # 有初始状态快照就用快照里的勾选：用户可能已经改了一半还没点确定
+        hidden_now = state["hidden"] if "hidden" in state else self._tool_hidden()
         j = 0
         for iid, label, _g in self.TOOL_ITEMS:
             if iid == "more":
@@ -2200,15 +3645,103 @@ class UIMixin(object):
                            selectcolor=p["hover"], cursor="hand2",
                            highlightthickness=0).grid(
                                row=j // 3, column=j % 3, sticky="w",
-                               padx=(4, 0), pady=1)
+                               padx=(dpi.px(4), 0), pady=dpi.px(1))
             j += 1
 
+        # ---- 标签页：工具带下面那条标签条要不要出现 ----
+        # 与「工具栏按钮定制」同属界面开关，所以并排放在同一张窗里；用分割线 + 小节标题
+        # 隔开，否则紧跟在那十二个勾选框后面，会被当成工具栏项之一。
+        tk.Frame(body, height=dpi.px(1), bg=p["line"]).pack(
+            fill=tk.X, padx=dpi.px(20), pady=(dpi.px(12), 0))
+        tab_head = tk.Frame(body, bg=p["editor"])
+        tab_head.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(8), 0))
+        sec_icon(tab_head, "tab").pack(side=tk.LEFT, padx=(0, dpi.px(6)),
+                                       pady=(dpi.px(1), 0))
+        tk.Label(tab_head, text="标签页", bg=p["editor"], fg=p["text"],
+                 font=(FONT[0], 12, "bold")).pack(side=tk.LEFT)
+        mt_var = tk.BooleanVar(
+            value=bool(state["multi_tab"]) if "multi_tab" in state
+            else bool(self._multi_tab_enabled()))
+        # padx 必须与其它 Label / 勾选框同为 20：勾选框的「左缘」是那个方框，
+        # 用 16 的话整行会比上下所有文字左移 4px（方框又是一块实心色，特别显眼）。
+        tk.Checkbutton(body, text="启用多标签页", variable=mt_var, bg=p["editor"],
+                       fg=p["text"], font=(FONT[0], 11), anchor="w", bd=0,
+                       activebackground=p["editor"], activeforeground=p["text"],
+                       selectcolor=p["hover"], cursor="hand2",
+                       highlightthickness=0).pack(anchor="w", padx=dpi.px(20),
+                                                  pady=(dpi.px(2), 0))
+        # 说明压成一行（这窗已经偏长，多一行在 768 高的屏上会把确定按钮挤出画面）
+        tk.Label(body, text="同时打开多篇笔记；关闭后标签条消失，Ctrl+Tab / Ctrl+W 一并停用。",
+                 bg=p["editor"], fg=p["soft"], font=(FONT[0], 11), justify="left",
+                 wraplength=_panel_width(dlg) - 44).pack(
+                     anchor="w", padx=dpi.px(20), pady=(dpi.px(1), 0))
+
+        def settings_snapshot():
+            """打包「还没点确定」的临时状态，供「确定」一次性落库。
+
+            换主题现在不再重建窗口，字号 / 勾选本来就留在控件上；滚动位置同理，
+            scroll 只用于 `_state` 传进来的初始位置。
+            """
+            return {
+                "size": int(cur.get()),
+                "multi_tab": bool(mt_var.get()),
+                "hidden": [i for i, v in tb_vars.items() if not v.get()],
+                "scroll": float(scroller.canvas.yview()[0]),
+            }
+
+        # 这张窗实际用到的调色板角色。限定键是为了避开 top / side 这类同色键：
+        # 旧板里两个键撞成同一个色时，不能让它随便挑一个角色翻译成新色。
+        SETTINGS_PAL_KEYS = ("editor", "text", "soft", "hover", "line",
+                             "accent", "sel", "selfg")
+
+        def repaint_settings():
+            """就地换肤：把窗内控件与自绘图元一起刷成当前主题，不重建任何控件。
+
+            所有 configure 都在同一个事件回调里做完，Tk 到下一次空闲才统一重绘，
+            屏幕上不会出现窗口消失的空档。Canvas 上的笔画不在 tk 颜色 option 里，
+            所以通用重刷之后还要逐个调 apply_theme / 重画，缺一个就会留下旧色斑。
+            """
+            old = dict(p)
+            new = dict(self.pal)
+            # p 是本窗的配色引用（闭包按名字取值）：原地更新后，下面重画图标等
+            # 用到的都是新主题；下一次再切主题时 old 也自动站在这次的新板上。
+            p.clear()
+            p.update(new)
+
+            # 1) 普通 tk 控件：逐颜色 option 翻译旧板色 → 新板色
+            #    （ttk 下拉框、系统默认色、派生色认不出来，自动跳过）
+            repaint_widget_colors(dlg, old, new, SETTINGS_PAL_KEYS)
+            # 2) 可滚区：外框 / 画布 / 内框 / 右侧细滚动条四层，yview 原样保留
+            scroller.apply_theme(new, bg=new["editor"])
+            # 3) Canvas 自绘：四枚小节图标、字号滑杆、四枚圆角按钮、六张主题色卡
+            for cv in section_icons:
+                kind, n = cv._sec_icon
+                cv.delete("all")
+                _draw_section_icon(cv, kind, n / 2.0, n / 2.0, n,
+                                   new["accent"], new["editor"])
+            slider.apply_theme(new)
+            # 色卡圆内是六套主题各自的固定色（不跟着换），但选中环 / 名称字色
+            # 用的是当前板：不重画就会留一圈旧主题的强调色。
+            # 顺手对齐窗内选中态：万一有从色卡点击以外的地方直接 set_theme 再
+            # 调到这里重刷，选中标记也不会停在旧主题上。
+            theme_selected[0] = self._current_theme()
+            draw_theme_cards()
+            for btn in (b_none, b_all, b_ok, b_cancel):
+                # old_pal 只影响显式传过 fg / outline 的那几枚：那两个值是写死在
+                # 实例上的旧板色，不在 tk option 里，得单独翻译。
+                btn.apply_theme(new, base=new["editor"], old_pal=old)
+
         def ok(_=None):
-            self._save_body_size(int(cur.get()))
-            # 工具栏勾选只在「确定」时才落库：点取消就是一次都不改。
+            snap = settings_snapshot()
+            # 开关先落库，再让 _save_body_size 一次写盘（两处都 save 会多写一遍）
+            mt_new = snap["multi_tab"]
+            self.data.setdefault("settings", {})["multi_tab"] = mt_new
+            self._save_body_size(snap["size"])
+            # 点确定就生效：开着就现造标签条、关掉就拆掉，不必重启
+            self._apply_multi_tab(mt_new)
             # 与字号同一套语义（字体族是即时预览、字号靠确定收尾）。
             cfg = self._tool_cfg()
-            new_hidden = [i for i, v in tb_vars.items() if not v.get()]
+            new_hidden = snap["hidden"]
             if new_hidden != list(cfg.get("hidden") or []):
                 cfg["hidden"] = new_hidden
                 self._save_tool_cfg()
@@ -2228,29 +3761,49 @@ class UIMixin(object):
         # 上留白从 14 提到 22：原来的「关于」段（分割线 + 标题 + 链接）已经搬到
         # 顶栏那枚 i 图标里，这里得自己补出滑杆与按钮之间的呼吸。
         btn_row = tk.Frame(dlg, bg=p["editor"])
-        btn_row.pack(fill=tk.X, padx=16, pady=(22, 16))
+        btn_row.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(22), dpi.px(16)))
         btn_mid = tk.Frame(btn_row, bg=p["editor"])
         btn_mid.pack(anchor="center")   # 无 side/fill 时 anchor=center 即水平居中
         b_ok = RoundButton(btn_mid, p, "确定", command=ok, primary=True,
-                           font=(FONT[0], 12, "bold"), padx=22, pady=7)
+                           font=(FONT[0], 12, "bold"), padx=dpi.px(22), pady=dpi.px(7))
         b_ok.pack(side=tk.LEFT)
         b_ok.bind_events()
         b_cancel = RoundButton(btn_mid, p, "取消", command=cancel,
                                base=p["editor"], fg=p["soft"], outline=p["line"],
-                               padx=22, pady=7)
-        b_cancel.pack(side=tk.LEFT, padx=(10, 0))
+                               padx=dpi.px(22), pady=dpi.px(7))
+        b_cancel.pack(side=tk.LEFT, padx=(dpi.px(10), 0))
         b_cancel.bind_events()
 
         dlg.bind("<Escape>", cancel)
         dlg.protocol("WM_DELETE_WINDOW", cancel)
+        scroller.bind_wheel(dlg)
+
+        def fit_body(avail_h):
+            """把整窗钉到数据管理窗的高度，多出来的内容交给滚动区。
+
+            ⚠️ 每次都要调（_center_dialog 保证）：Canvas 默认 265 高，不喂它就会
+            缩成一个小窗里滚。这里不再是「屏幕给多少用多少」，而是先跟邻居等高，
+            再被屏幕可用高夹一道 —— 两张窗的位置、大小完全重合，切换时不跳。
+            """
+            dlg.update_idletasks()
+            fixed = dlg.winfo_reqheight() - scroller.canvas.winfo_reqheight()
+            scroller.fit(panel_canvas_height(_panel_height(self), avail_h, fixed,
+                                             dpi.px(120)))
+
         # 宽度跟数据管理、关于同一把尺（见 _panel_width），三张窗左右边缘对齐
-        self._center_dialog(dlg, min_w=_panel_width(dlg))
+        self._center_dialog(dlg, min_w=_panel_width(dlg), fit_body=fit_body,
+                            center_y=True)
+        # 带初始状态进来时滚回那一屏（几何定下来之后设才有效，所以放在居中之后）。
+        # 窗内换主题是就地重刷，滚动位置本来就留在原地，用不着这一步。
+        if "scroll" in state:
+            dlg.update_idletasks()
+            scroller.canvas.yview_moveto(state["scroll"])
         try:
             dlg.grab_set()
         except Exception:
             pass
 
-    def open_data_manager(self):
+    def open_data_manager(self, _measure=False):
         """数据管理：导出备份 / 导入数据 / 清空所有数据。
 
         这三件事原来挤在全局设置弹窗的下半部分 —— 外观项和数据操作混在一张窗里，
@@ -2258,59 +3811,72 @@ class UIMixin(object):
 
         每一项做成「标题 + 一句说明 + 按钮」三行：导出和导入是安全操作，
         清空是不可撤销的，说明里必须把后果写清楚，别指望用户看按钮颜色就懂。
+
+        `_measure=True` 是给 `_panel_height` 用的标尺模式：摆完同样的内容后只读
+        reqheight 就销毁，窗口始终 withdraw、不设 transient、不抢 grab。全局设置
+        窗拿这个数当自己的高度，两张窗才是同一把尺（改了这里的排版，那边自动跟）。
         """
         p = self.pal
         dlg = tk.Toplevel(self.root)
         dlg.title("数据管理")
-        dlg.transient(self.root)
+        if _measure:
+            dlg.withdraw()          # 一次都不让它有机会映射出来
+        else:
+            dlg.transient(self.root)
         dlg.resizable(False, False)
         dlg.configure(bg=p["editor"])
         # 与关于、全局设置同宽；说明文字按这个宽度折行（左右各 20 的内边距 + 少量框距）
         panel_w = _panel_width(dlg)
         wrap_w = panel_w - 44
         tk.Label(dlg, text="数据管理", bg=p["editor"], fg=p["text"],
-                 font=(FONT[0], 13, "bold")).pack(anchor="w", padx=20, pady=(16, 2))
+                 font=(FONT[0], 13, "bold")).pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(16), dpi.px(2)))
         tk.Label(dlg, text="所有笔记保存在 notes_data.db（程序同目录）。",
                  bg=p["editor"], fg=p["soft"], font=(FONT[0], 11)).pack(
-                     anchor="w", padx=20)
+                     anchor="w", padx=dpi.px(20))
 
         rows = (
             ("导出备份",
-             "把全部文件夹、笔记和外观设置导出成一份备份文件，用于存档或换机迁移。",
+             "导出文件夹、笔记与外观设置，用于存档或换机；说明与「系统」不进备份。",
              "导出…", self.export_data, p["accent"]),
             ("导入数据",
              "从备份恢复：覆盖会连外观一起换回去，合并只追加本机没有的笔记。",
              "选择文件…", self.import_data, p["text"]),
             ("清空所有数据",
-             "删除全部笔记与文件夹，回到初次打开时的状态。此项无法撤销。",
+             "删除全部笔记与自建文件夹，回到初次打开的状态。此项无法撤销。",
              "清空…", self.clear_all_data, MENU_DANGER),
         )
         for title, desc, btn_text, cmd, fg in rows:
-            tk.Frame(dlg, height=1, bg=p["line"]).pack(fill=tk.X, padx=20, pady=(14, 0))
+            tk.Frame(dlg, height=dpi.px(1), bg=p["line"]).pack(fill=tk.X, padx=dpi.px(20), pady=(dpi.px(14), 0))
             tk.Label(dlg, text=title, bg=p["editor"], fg=p["text"],
-                     font=(FONT[0], 12, "bold")).pack(anchor="w", padx=20, pady=(10, 0))
+                     font=(FONT[0], 12, "bold")).pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(10), 0))
             tk.Label(dlg, text=desc, bg=p["editor"], fg=p["soft"],
                      font=(FONT[0], 11), justify="left",
-                     wraplength=wrap_w).pack(anchor="w", padx=20, pady=(3, 0))
+                     wraplength=wrap_w).pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(3), 0))
             # 按钮按文字量宽度，不撑满整行：三个按钮大小不一才看得出轻重
             b = RoundButton(dlg, p, btn_text,
                             command=lambda c=cmd: (dlg.destroy(), c()),
                             base=p["editor"], fg=fg, outline=p["line"],
-                            padx=14, pady=5)
-            b.pack(anchor="w", padx=20, pady=(8, 0))
+                            padx=dpi.px(14), pady=dpi.px(5))
+            b.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(8), 0))
             b.bind_events()
 
         btn_row = tk.Frame(dlg, bg=p["editor"])
-        btn_row.pack(fill=tk.X, padx=16, pady=(16, 16))
+        btn_row.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(16), dpi.px(16)))
         b_close = RoundButton(btn_row, p, "关闭", command=dlg.destroy,
                               base=p["editor"], fg=p["soft"], outline=p["line"],
-                              padx=22, pady=7)
+                              padx=dpi.px(22), pady=dpi.px(7))
         b_close.pack(anchor="center")
         b_close.bind_events()
 
+        if _measure:
+            dlg.update_idletasks()
+            h = dlg.winfo_reqheight()
+            dlg.destroy()
+            return h
+
         dlg.bind("<Escape>", lambda _e: dlg.destroy())
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
-        self._center_dialog(dlg, min_w=panel_w)
+        self._center_dialog(dlg, min_w=panel_w, center_y=True)
         try:
             dlg.grab_set()
         except Exception:
@@ -2331,24 +3897,24 @@ class UIMixin(object):
 
         # 头：应用图标 + 名字 / 一句话定位（图标 44px，缩略图不会糊）
         head = tk.Frame(dlg, bg=p["editor"])
-        head.pack(anchor="w", padx=20, pady=(18, 0))
-        icon_img = self._brand_photo(44)
+        head.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(18), 0))
+        icon_img = self._brand_photo(dpi.px(44))
         if icon_img is not None:
             lab = tk.Label(head, image=icon_img, bg=p["editor"], bd=0)
             lab.image = icon_img       # PhotoImage 必须持住引用，否则显示成空白
-            lab.pack(side=tk.LEFT, padx=(0, 12))
+            lab.pack(side=tk.LEFT, padx=(0, dpi.px(12)))
         title_box = tk.Frame(head, bg=p["editor"])
         title_box.pack(side=tk.LEFT)
         tk.Label(title_box, text=APP_NAME, bg=p["editor"], fg=p["text"],
                  font=(FONT[0], 16, "bold")).pack(anchor="w")
         tk.Label(title_box, text="零依赖的本地笔记应用 · Python + Tkinter",
                  bg=p["editor"], fg=p["soft"], font=(FONT[0], 11)).pack(anchor="w",
-                                                                      pady=(2, 0))
+                                                                      pady=(dpi.px(2), 0))
         # 版本号挂在这里，而不是工具栏：工具栏 14 项已经把 1080 窗口的横向预算
         # 吃到只剩 3px（559/562），再加一枚按钮就会出现横向滚动箭头。而「我装的是
         # 哪个版本」属于「关于这个应用」，和项目地址、反馈通道是一类东西。
         tk.Label(title_box, text="v" + __version__, bg=p["editor"], fg=p["soft"],
-                 font=(FONT[0], 10)).pack(anchor="w", pady=(3, 0))
+                 font=(FONT[0], 10)).pack(anchor="w", pady=(dpi.px(3), 0))
 
         # 拆成三行短句而不是一段长文：一段话折在「——」后面会断得很难看。
         # ⚠️ 第三行是「检查更新」上线后补的：原来第一行写的是「不联网」，而现在
@@ -2363,19 +3929,19 @@ class UIMixin(object):
                 "只有检查或下载更新时才会访问 GitHub，其余时间不联网。")):
             tk.Label(dlg, text=line, bg=p["editor"], fg=p["soft"],
                      font=(FONT[0], 11), justify="left",
-                     wraplength=470).pack(anchor="w", padx=20,
-                                          pady=(14 if i == 0 else 2, 0))
+                     wraplength=dpi.px(470)).pack(anchor="w", padx=dpi.px(20),
+                                          pady=(dpi.px(14) if i == 0 else dpi.px(2), 0))
 
         # 项目地址 / 问题反馈：两行，图标分别是 icon/github.png 与 icon/issue.png。
         # 图标是线条图（原色烤死成 #191313），运行时按 alpha 染成主题文字色，
         # 换肤不会跟正文打架；16px 与 11pt 的行高（约 21px）居中齐平。
-        tk.Frame(dlg, height=1, bg=p["line"]).pack(fill=tk.X, padx=20, pady=(14, 0))
+        tk.Frame(dlg, height=dpi.px(1), bg=p["line"]).pack(fill=tk.X, padx=dpi.px(20), pady=(dpi.px(14), 0))
         tk.Label(dlg, text="项目与反馈", bg=p["editor"], fg=p["text"],
-                 font=(FONT[0], 12, "bold")).pack(anchor="w", padx=20, pady=(10, 0))
+                 font=(FONT[0], 12, "bold")).pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(10), 0))
         # PhotoImage 必须由窗口持住引用，否则被回收后行里只剩文字
         self._about_photos = []
         link_box = tk.Frame(dlg, bg=p["editor"])
-        link_box.pack(anchor="w", padx=20, pady=(4, 0))
+        link_box.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(4), 0))
         for name, label, url in (("github.png", "项目地址", GITHUB_URL),
                                  ("issue.png", "问题反馈", ISSUES_URL)):
             self._about_link_row(link_box, p, name, label, url)
@@ -2390,12 +3956,12 @@ class UIMixin(object):
                         wraplength=_panel_width(dlg) - 40, cursor="arrow")
 
         btn_row = tk.Frame(dlg, bg=p["editor"])
-        btn_row.pack(fill=tk.X, padx=16, pady=(14, 16))
+        btn_row.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(14), dpi.px(16)))
         inner = tk.Frame(btn_row, bg=p["editor"])
         inner.pack(anchor="center")
         b_check = RoundButton(inner, p, "检查更新", base=p["editor"],
-                              fg=p["text"], outline=p["line"], padx=18, pady=7)
-        b_check.pack(side=tk.LEFT, padx=(0, 8))
+                              fg=p["text"], outline=p["line"], padx=dpi.px(18), pady=dpi.px(7))
+        b_check.pack(side=tk.LEFT, padx=(0, dpi.px(8)))
         b_check.bind_events()
         # 回调里要用到按钮自己（查询期间置灰、把字换成「检查中…」），构造那一刻
         # b_check 还没赋值，所以先建再挂。Canvas 没有 -command 选项，只能走 set_command。
@@ -2403,14 +3969,14 @@ class UIMixin(object):
             dlg, note, btn_row, b_check))
         b_close = RoundButton(inner, p, "关闭", command=dlg.destroy,
                               base=p["editor"], fg=p["soft"], outline=p["line"],
-                              padx=22, pady=7)
+                              padx=dpi.px(22), pady=dpi.px(7))
         b_close.pack(side=tk.LEFT)
         b_close.bind_events()
 
         dlg.bind("<Escape>", lambda _e: dlg.destroy())
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
         # 这把尺子的长度就是「关于」量出来的：另外两张窗跟着它走
-        self._center_dialog(dlg, min_w=_panel_width(dlg))
+        self._center_dialog(dlg, min_w=_panel_width(dlg), center_y=True)
         try:
             dlg.grab_set()
         except Exception:
@@ -2529,7 +4095,7 @@ class UIMixin(object):
         # 用 winfo_manager() 而不是 winfo_ismapped()：后者在窗口尚未映射时也是 0，
         # 会把已经 pack 过的 label 再 pack 一次（Tk 会重复排队，行距翻倍）
         if not note.winfo_manager():
-            note.pack(anchor="w", padx=20, pady=(10, 0), before=btn_row)
+            note.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(10), 0), before=btn_row)
         # 内容高度变了：_center_dialog 支持重复调用（它会先松开 minsize 再重新量）
         self._relayout_dialog(dlg)
 
@@ -2562,7 +4128,7 @@ class UIMixin(object):
             return
         p = self.pal
         if not note.winfo_manager():
-            note.pack(anchor="w", padx=20, pady=(10, 0), before=btn_row)
+            note.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(10), 0), before=btn_row)
         why = self._update_blocked_reason()
         if why:
             # 光标保持 hand2：上一轮挂的「打开更新说明」绑定还在，这行文字仍然可点
@@ -2773,16 +4339,16 @@ class UIMixin(object):
         的一张，全局设置和数据管理的宽度也照它定（见 _panel_width），三张一样宽 560。
         """
         row = tk.Frame(parent, bg=p["editor"], cursor="hand2")
-        row.pack(anchor="w", pady=(3, 0))
+        row.pack(anchor="w", pady=(dpi.px(3), 0))
         # 图标槽固定 16×16 再居中放图：没有 PIL 时回退路径的位图会大几像素
         # （整数倍降采样只能取 17/23 这种档），直接 pack 会把两行文字推得不对齐。
-        box = tk.Frame(row, width=16, height=16, bg=p["editor"], cursor="hand2")
+        box = tk.Frame(row, width=dpi.px(16), height=dpi.px(16), bg=p["editor"], cursor="hand2")
         # 左边让 3px：标题「项目与反馈」的 Label 框虽然也在 x=20，但汉字字形自带
         # 约 3px 左边距，墨迹实际从 x=23 起 —— 位图没有这层留白，不补就看得出
         # 图标比标题往左冒出去一截。
-        box.pack(side=tk.LEFT, padx=(3, 0))
+        box.pack(side=tk.LEFT, padx=(dpi.px(3), 0))
         box.pack_propagate(False)
-        img = _tinted_png_photo(box, icon_name, 16, p["text"])
+        img = _tinted_png_photo(box, icon_name, dpi.px(16), p["text"])
         ic = None
         if img is not None:
             self._about_photos.append(img)      # 不持住引用，图标会被 GC 掉
@@ -2791,12 +4357,12 @@ class UIMixin(object):
         # 「项目地址」「问题反馈」都是四个字，宽度天然相同 → 两行的地址左缘自己就齐了
         lb = tk.Label(row, text=label, bg=p["editor"], fg=p["text"],
                       font=(FONT[0], 11), cursor="hand2")
-        lb.pack(side=tk.LEFT, padx=(8, 8))
+        lb.pack(side=tk.LEFT, padx=(dpi.px(8), dpi.px(8)))
         ub = tk.Label(row, text=url, bg=p["editor"],
                       fg=p.get("link") or "#1668d9",
                       font=(FONT[0], 11), cursor="hand2")
         # 右侧留 20：弹窗宽度由这一行撑出来，不留白的话地址会贴着右缘
-        ub.pack(side=tk.LEFT, padx=(0, 20))
+        ub.pack(side=tk.LEFT, padx=(0, dpi.px(20)))
 
         def open_url(_e=None):
             # 统一走 _open_url：它会把「浏览器没调起来」这种情况处理掉，
@@ -2820,39 +4386,39 @@ class UIMixin(object):
         res = {"v": None}
         tk.Label(win, text="备份文件内容：%s" % content_line,
                  bg=p["top"], fg=p["text"], font=(FONT[0], 12)).pack(
-                     anchor="w", padx=18, pady=(16, 4))
+                     anchor="w", padx=dpi.px(18), pady=(dpi.px(16), dpi.px(4)))
         if exported_at:
             tk.Label(win, text="导出时间：%s" % exported_at, bg=p["top"],
-                     fg=p["soft"], font=(FONT[0], 11)).pack(anchor="w", padx=18)
+                     fg=p["soft"], font=(FONT[0], 11)).pack(anchor="w", padx=dpi.px(18))
         tk.Label(win, text="当前数据：%d 个文件夹、%d 条笔记。请选择导入方式：" %
                  (len(self.data["folders"]), len(self.data["notes"])),
                  bg=p["top"], fg=p["soft"], font=(FONT[0], 11)).pack(
-                     anchor="w", padx=18, pady=(6, 2))
+                     anchor="w", padx=dpi.px(18), pady=(dpi.px(6), dpi.px(2)))
         # 两种方式的差别必须写清：覆盖会连外观一起换回备份的样子，合并只动内容。
         # 两行各自成句（wraplength 430 大于最长那行的 408px），断行位置由文案决定，
         # 不靠窗口宽度去折 —— 否则换个字体就折成三行、跟上面的信息行错位。
         tk.Label(win, text="覆盖 = 用备份完全替换现有数据，外观设置也按备份恢复；\n"
                            "合并 = 保留现有内容，只追加本机没有的笔记，内容相同的自动跳过。",
                  bg=p["top"], fg=p["soft"], font=(FONT[0], 10), justify="left",
-                 wraplength=430).pack(anchor="w", padx=18)
+                 wraplength=dpi.px(430)).pack(anchor="w", padx=dpi.px(18))
 
         def choose(v):
             res["v"] = v
             win.destroy()
 
         row = tk.Frame(win, bg=p["top"])
-        row.pack(fill=tk.X, padx=14, pady=(12, 4))
+        row.pack(fill=tk.X, padx=dpi.px(14), pady=(dpi.px(12), dpi.px(4)))
         ow = RoundButton(row, p, "覆盖现有数据", command=lambda: choose("overwrite"),
                          base=p["editor"], fg=p["accent"], outline=p["line"])
-        ow.pack(side=tk.LEFT, padx=4)
+        ow.pack(side=tk.LEFT, padx=dpi.px(4))
         ow.bind_events()
         mg = RoundButton(row, p, "合并追加", command=lambda: choose("merge"),
                          base=p["editor"], outline=p["line"])
-        mg.pack(side=tk.LEFT, padx=4)
+        mg.pack(side=tk.LEFT, padx=dpi.px(4))
         mg.bind_events()
         cc = RoundButton(row, p, "取消", command=lambda: choose(None),
                          base=p["editor"], outline=p["line"])
-        cc.pack(side=tk.RIGHT, padx=4)
+        cc.pack(side=tk.RIGHT, padx=dpi.px(4))
         cc.bind_events()
         win.bind("<Escape>", lambda e: choose(None))
         win.protocol("WM_DELETE_WINDOW", lambda: choose(None))
@@ -2917,12 +4483,12 @@ class UIMixin(object):
         dlg.configure(bg=p["editor"])
 
         tk.Label(dlg, text="颜色", bg=p["editor"], fg=p["text"],
-                 font=(FONT[0], 13, "bold")).pack(pady=(12, 0))
+                 font=(FONT[0], 13, "bold")).pack(pady=(dpi.px(12), 0))
         tk.Label(dlg, text="作用于当前选中的文字", bg=p["editor"], fg=p["soft"],
-                 font=(FONT[0], 11)).pack(pady=(0, 10))
+                 font=(FONT[0], 11)).pack(pady=(0, dpi.px(10)))
 
         wrap = tk.Frame(dlg, bg=p["editor"])
-        wrap.pack(padx=10, pady=(0, 4))
+        wrap.pack(padx=dpi.px(10), pady=(0, dpi.px(4)))
 
         def pick_native(ttl, cb):
             from tkinter import colorchooser
@@ -2935,28 +4501,28 @@ class UIMixin(object):
                 ("文字颜色", self.apply_color, "选择文字颜色"),
                 ("下划线颜色", self.apply_underline_color, "选择下划线颜色")):
             col = tk.Frame(wrap, bg=p["editor"])
-            col.pack(side=tk.LEFT, padx=10)
+            col.pack(side=tk.LEFT, padx=dpi.px(10))
             tk.Label(col, text=title, bg=p["editor"], fg=p["text"],
-                     font=(FONT[0], 12, "bold")).pack(anchor="w", pady=(0, 6))
+                     font=(FONT[0], 12, "bold")).pack(anchor="w", pady=(0, dpi.px(6)))
             grid = tk.Frame(col, bg=p["editor"])
             grid.pack()
             for i, hexv in enumerate(self.COLOR_SWATCHES):
                 # activebackground 必须与自身同色：不设的话按下会被系统默认灰覆盖
-                b = tk.Button(grid, width=3, height=1, bg=hexv, relief=tk.RAISED, bd=1,
+                b = tk.Button(grid, width=3, height=1, bg=hexv, relief=tk.RAISED, bd=dpi.px(1),
                               activebackground=hexv, activeforeground=hexv,
                               cursor="hand2",
                               command=lambda hv=hexv, f=cb: (f(hv), dlg.destroy()))
-                b.grid(row=i // 6, column=i % 6, padx=4, pady=4)
+                b.grid(row=i // 6, column=i % 6, padx=dpi.px(4), pady=dpi.px(4))
             tk.Button(col, text="自定义颜色…", bg=p["editor"], fg=p["accent"],
                       bd=0, relief=tk.FLAT, font=(FONT[0], 11),
                       command=lambda t=native_title, f=cb: pick_native(t, f),
                       activebackground=p["hover"], activeforeground=p["selfg"],
-                      cursor="hand2").pack(anchor="w", pady=(6, 0))
+                      cursor="hand2").pack(anchor="w", pady=(dpi.px(6), 0))
 
         tk.Button(dlg, text="取消", bg=p["editor"], fg=p["soft"], bd=0, relief=tk.FLAT,
                   font=(FONT[0], 12), command=dlg.destroy,
                   activebackground=p["hover"], activeforeground=p["text"],
-                  cursor="hand2").pack(pady=(6, 14))
+                  cursor="hand2").pack(pady=(dpi.px(6), dpi.px(14)))
 
         dlg.update_idletasks()
         w = dlg.winfo_reqwidth()
@@ -2980,9 +4546,9 @@ class UIMixin(object):
         # 圆角按钮（Canvas 自绘）：按下不会出现系统默认灰，圆角/间距也可控
         # pady=4 / 外边距 3：按钮高 = 行高 21 + 8 = 29，占 35，正好塞进 36 的条
         # padx=10 / 外边距 2：与 _mk_icon 同一套缩紧后的横向预算（见那边的说明）
-        b = RoundButton(parent, self.pal, label, command=cmd, font=f, padx=10, pady=4,
+        b = RoundButton(parent, self.pal, label, command=cmd, font=f, padx=dpi.px(10), pady=dpi.px(4),
                         base=self._tool_bg())
-        b.pack(side=tk.LEFT, padx=2, pady=3)
+        b.pack(side=tk.LEFT, padx=dpi.px(2), pady=dpi.px(3))
         b.bind_events()
         self.fmt_buttons.append(b)
         if kw.get("tip"):
@@ -2992,8 +4558,8 @@ class UIMixin(object):
     def _sep(self, parent):
         # 17 高 + 上下各 8：在 35 的内容高里正好落在 9..25，中线 17.5 与按钮同高
         # 左右 5：与按钮的 2px 外边距凑成「按钮 2 | 空 5 | 线 1 | 空 5 | 按钮 2」
-        s = tk.Frame(parent, width=1, bg=self._tool_line(), height=17)
-        s.pack(side=tk.LEFT, padx=5, pady=8)
+        s = tk.Frame(parent, width=dpi.px(1), bg=self._tool_line(), height=dpi.px(17))
+        s.pack(side=tk.LEFT, padx=dpi.px(5), pady=dpi.px(8))
         self._tool_seps.append(s)
 
     def refresh_folders(self, keep_scroll=False):
@@ -3029,7 +4595,7 @@ class UIMixin(object):
         self._make_group_label("智能分类", top=0)
         for f in smart:
             self._make_folder_row(f)
-        self._make_group_label("文件夹", top=12, fold_tools=True)
+        self._make_group_label("文件夹", top=dpi.px(12), fold_tools=True)
         # 真实文件夹按 **树** 渲染（缩进 + 展开三角）。data["folders"] 仍是平铺的
         # 一维表，父子关系只由 f["parent"] 决定，顺序 = 数组里的先后。
         self._render_folder_tree(real)
@@ -3098,24 +4664,28 @@ class UIMixin(object):
     def _refresh_folder_counts(self):
         """就地刷新左栏每个文件夹的条数。
 
-        新建/删除/移动笔记时调用：文件夹行不重建（避免闪烁），只改计数文本。
+        新建/删除/移动笔记时调用：文件夹行不重建（避免闪烁），只改计数徽章。
         """
-        for fid, lbl in list(self._folder_count_labels.items()):
-            if lbl is None:
+        for fid, badge in list(self._folder_count_labels.items()):
+            if badge is None:
                 continue
             try:
-                if not lbl.winfo_exists():
+                if not badge.winfo_exists():
                     continue
-                lbl.configure(text=str(len(self.folder_notes(fid))))
+                badge.set_count(len(self.folder_notes(fid)))
             except Exception:
                 pass
 
-    def _card_layer(self, parent, color, outside):
+    def _card_layer(self, parent, color, outside, accent=None):
         """在行容器内铺一层圆角背景（Canvas + place），返回该 Canvas。
 
         Tk 的 Frame 是矩形、无法圆角，所以背景交给 Canvas 画：画布底色是「卡片外」
         的面板色，只有圆角多边形内部才是卡片色 —— 两者不能同色，否则圆角会被填满、
         看上去还是方块。
+
+        accent 给定时再在左缘画一条圆头色条（笔记的辨识色）。**必须画在这里**：
+        悬停 / 选中换底色走的是同一个 `draw()`，色条跟着一起重画，四周永远是当前
+        底色；另贴一块 Canvas 的话，换底色时色条周围会露出一圈旧色的小方块。
         """
         cv = tk.Canvas(parent, bg=outside, bd=0, highlightthickness=0)
         cv.place(relx=0, rely=0, relwidth=1, relheight=1)
@@ -3123,6 +4693,7 @@ class UIMixin(object):
         # 注意：Canvas.lower() 是「画布内图元降层」，widget 降层必须走 Tk 原生命令
         tk.Misc.lower(cv)
         cv._color = color
+        cv._accent = accent
 
         def draw(ev=None):
             w, h = cv.winfo_width(), cv.winfo_height()
@@ -3132,6 +4703,8 @@ class UIMixin(object):
             cv.create_polygon(_round_rect_points(0.5, 0.5, w - 0.5, h - 0.5,
                                                  CARD_RADIUS, 6),
                               fill=cv._color, outline="")
+            if cv._accent:
+                _draw_accent_bar(cv, w, h, cv._accent)
 
         cv._draw = draw
         cv.bind("<Configure>", draw)
@@ -3164,7 +4737,7 @@ class UIMixin(object):
         cv._color = color
         cv._draw()
 
-    def _make_group_label(self, text, top=10, fold_tools=False):
+    def _make_group_label(self, text, top=dpi.px(10), fold_tools=False):
         """左栏的分组标题（智能分类 / 文件夹）。
 
         纯装饰：不进 `_folder_rows`、不参与选中与拖放。放进那张表的话，
@@ -3176,7 +4749,7 @@ class UIMixin(object):
         """
         p = self.pal
         house = tk.Frame(self.folder_panel.inner, bg=p["side"])
-        house.pack(fill=tk.X, padx=16, pady=(top, 3))
+        house.pack(fill=tk.X, padx=dpi.px(16), pady=(top, dpi.px(3)))
         if fold_tools:
             # 「文件夹」那一行是真实文件夹行的起点：就地同步后要重排时，
             # 第一行得钉在它后面（没有这个引用就只能靠「追加到末尾」猜）
@@ -3191,7 +4764,7 @@ class UIMixin(object):
             CollapseAllButton(house, p, command=self.collapse_all_folders,
                               base=p["side"]).pack(side=tk.RIGHT)
             ExpandAllButton(house, p, command=self.expand_all_folders,
-                            base=p["side"]).pack(side=tk.RIGHT, padx=(0, 2))
+                            base=p["side"]).pack(side=tk.RIGHT, padx=(0, dpi.px(2)))
         # 分组标题也是一整条空白带：右键在这里同样能新建文件夹（不留「点了没反应」的死角）。
         # 标题是被 Frame 包着的独立控件，事件不会冒泡，两处都得绑。
         for w in (house, lbl):
@@ -3643,15 +5216,16 @@ class UIMixin(object):
         wrap._fid = f["id"]       # 反查用：按 pack 顺序重排行字典（见 _resync_...）
         row._card_outside = p["side"]
         row._card = self._card_layer(row, base, p["side"])
-        # 行首的「>`/`v`」展开箭头：点它收/放这一支。
+        # 行首的「▶ / ▼」展开箭头：点它收/放这一支。
         # 24×28 的可点区（原来 18×18，再早是 13×16）：高 28 正好顶满一行
-        # （行高由文字撑到 38~39，pack 会在竖直方向居中）。常态不画底片、指针停上来
-        # 才浮一层圆角底，让「哪儿能点」看得见。叶子同样占这一格（不画箭头、
-        # 不变手形），名字才对得齐。
+        # （行高由文字撑到 38~39，pack 会在竖直方向居中）。⚠️ 点击区不许缩回去，
+        # 用户两次反馈「太小不好点」。箭头是 9px 填充实心三角、常态就用正文色，
+        # 静态也看得出可点；指针停上来才浮一层 16×16 圆角底。叶子同样占这一格
+        # （不画箭头、不变手形），名字才对得齐。
         tw = TwistyButton(row, self.pal, collapsed=collapsed, available=has_child,
                           base=base,
                           command=(lambda fid=f["id"]: self._twisty_click(fid)))
-        tw.pack(side=tk.LEFT, padx=(2, 0))
+        tw.pack(side=tk.LEFT, padx=(dpi.px(2), 0))
         self._folder_twisty[f["id"]] = tw
         if has_child:
             # 右键：弹不出文件夹菜单，也别让它选中（编组贴左边这是对 kid 的尊重）
@@ -3661,18 +5235,29 @@ class UIMixin(object):
         # 然后是文件夹图标（自绘；智能文件夹用区别图标，普通文件夹用圆角文件夹）
         icon = tk.Canvas(row, width=FOLDER_ICON_W, height=FOLDER_ICON_H,
                          bg=base, bd=0, highlightthickness=0)
-        icon.pack(side=tk.LEFT, padx=(4, 5), pady=6)
+        icon.pack(side=tk.LEFT, padx=(dpi.px(4), dpi.px(5)), pady=dpi.px(6))
         self._folder_icons[f["id"]] = icon
+        # 悬停 / 选中换底色时，图标要跟着重画：画布底色本身是图标的"留白"，
+        # 只 configure(bg=) 不重画，留在上面的图元还是按旧底色取的色（比如曾经的挖孔），
+        # 会看着像一块脏点。统一走 refresh_bg，别在别处单独 configure。（_row_hover 会调它）
+        icon.refresh_bg = lambda cv=icon, fid=f["id"]: self._draw_folder_icon(cv, fid)
         self._draw_folder_icon(icon, f["id"])
-        # 右侧数量先 pack(side=RIGHT)：先把宽度占死，名字再长也压不到它
-        cl = tk.Label(row, text=str(cnt), bg=base, fg=p["soft"], anchor="e",
-                      font=(FONT[0], 11))
-        cl.pack(side=tk.RIGHT, padx=(6, 12), pady=6)
+        # 右侧数量先 pack(side=RIGHT)：先把宽度占死，名字再长也压不到它。
+        # 自绘的圆底徽章而不是 Label：数字要装在一个小圆里（Tk 的控件都是方的）。
+        # 字号 10 比名字（12）小两档，行高由下面的名字盒决定（徽章只有 21 高，
+        # 竖直方向自动居中）—— 所以它不会再把整行撑高。
+        cl = CountBadge(row, cnt, bg=base,
+                        fg=(p["selfg"] if active else p["soft"]),
+                        ink=p["text"], font=self._measure_font(FONT[0], 10))
+        cl.pack(side=tk.RIGHT, padx=(dpi.px(6), dpi.px(12)))
         # 名字装进「固定宽度 + 不随内容扩张」的盒子：超长部分被盒子裁掉，
         # 不会把右侧数字挤走（Tk 的 pack 会按请求宽度挤压邻居，必须靠盒子兜住）
-        name_h = self._measure_font(FONT[0], 12).metrics("linespace")
+        # 量的是 **bold** 而不是 normal：选中行标题是 bold，同字号下 linespace
+        # 会多 1px（21→22），按 normal 量出来的盒子会把选中行的字底裁掉一条。
+        # 这里不改字号、只把盒子做够，行高由它决定 → 正文本就撑得下两种字重。
+        name_h = self._measure_font(FONT[0], 12, "bold").metrics("linespace")
         name_box = tk.Frame(row, bg=base, height=name_h)
-        name_box.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=6)
+        name_box.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=dpi.px(4))
         name_box.pack_propagate(False)
         # 名字用自绘 Canvas（可按像素滚动）：撑满盒子宽度，超长部分由画布天然裁掉
         name_label = MarqueeLabel(name_box, bg=base,
@@ -3984,8 +5569,14 @@ class UIMixin(object):
           展开 = 实心主题色前盖 + 探出的稿纸（见 _draw_folder_icon_open）。
           主体用 editor 白而非 sel 浅绿，因为选中行的底色就是 sel，浅绿填充会和行底糊在一起。
         """
-        p = self.pal
         c.delete("all")
+        self._draw_folder_icon_raw(c, fid)
+        # 上面的坐标是按 18×16 逻辑格写死的，而画布尺寸已经乘过 DPI ——
+        # 整体放大一次，图标才会铺满画布（100% 时 scale_canvas 是空操作）。
+        dpi.scale_canvas(c)
+
+    def _draw_folder_icon_raw(self, c, fid=None):
+        p = self.pal
 
         if fid == SMART_ICON_ALL:
             # 清单：三条等长横线
@@ -4010,6 +5601,26 @@ class UIMixin(object):
                          outline=col, width=1.8)
             body = _round_rect_points(3.2, 6.8, 14.8, 14.2, 2.2)
             c.create_polygon(body, fill=col, outline=col, width=0)
+            return
+
+        if fid == SYSTEM_FOLDER:
+            # 系统区：一台显示器（屏 + 支架 + 底座）。
+            # ⚠️ 全用矩形拼，**一点曲线都不能有**：Tk 的 Canvas 不抗锯齿，
+            # create_oval / create_arc 是折线硬栅格化 —— 18px 的圆环直径才 9 像素，
+            # 弧线每走 1px 掉一格，再被 DPI 放大 1.66 倍，看上去就是一圈毛刺。
+            # 所以连外框的圆角都不用：只留直角，放大后每条边仍是一条笔直的台阶。
+            # ⚠️ 两条硬规矩（第一版就是栽在这里，看着像「虚线框 + 断开的底座」）：
+            #   1. Tk 矩形填充是**半开区间** [x0,x1) × [y0,y1) —— (1,0,16,1) 只画出
+            #      1 行，不是 2 行。想有 2px 厚就得写 x1-x0 = 2。
+            #   2. 相邻矩形的共边必须写**同一个整数**（屏下边到 y=11、支架从 y=11 起），
+            #      scale_canvas 乘同一个系数后仍严丝合缝；差 1 就会裂出一条底色缝。
+            col = p["text"]
+            c.create_rectangle(1, 0, 17, 2, fill=col, outline="", width=0)      # 上框
+            c.create_rectangle(1, 9, 17, 11, fill=col, outline="", width=0)     # 下框
+            c.create_rectangle(1, 2, 3, 9, fill=col, outline="", width=0)       # 左框
+            c.create_rectangle(15, 2, 17, 9, fill=col, outline="", width=0)     # 右框
+            c.create_rectangle(8, 11, 10, 14, fill=col, outline="", width=0)    # 支架
+            c.create_rectangle(4, 14, 14, 16, fill=col, outline="", width=0)    # 底座
             return
 
         # --- 普通文件夹：收起 = 空心描边；展开 = 实心前盖 + 探出的一张纸 ---
@@ -4130,7 +5741,7 @@ class UIMixin(object):
         if cl is not None:
             try:
                 if cl.winfo_exists():
-                    cl.configure(fg=(p["selfg"] if hl else p["soft"]))
+                    cl.set_style(fg=(p["selfg"] if hl else p["soft"]))
             except Exception:
                 pass
 
@@ -4218,9 +5829,11 @@ class UIMixin(object):
 
     def _delete_folders(self, fids):
         """批量删除选中的普通文件夹（连同它们的子文件夹与笔记）。"""
-        real = [i for i in fids if i not in SMART_FOLDERS]
+        # 智能分类是筛选视图、系统区是程序自带的 —— 都不在可删之列。多选里混进了
+        # 系统那一格时直接摘掉，不能因为它整批拒绝（用户选的是别的文件夹）。
+        real = [i for i in fids if i not in SMART_FOLDERS and i != SYSTEM_FOLDER]
         if not real:
-            self._show_info("提示", "智能文件夹（全部笔记 / 星标笔记）不可删除。")
+            self._show_info("提示", "智能分类与系统文件夹都不可删除。")
             return
         folders = self.data["folders"]
         # 每棵树连同子孙一起删；选中互相嵌套时（比如同时勾了父和子）只算一次
@@ -4252,6 +5865,28 @@ class UIMixin(object):
         save_data(self.data)
         self.refresh_all()
 
+    def _resolve_note_colors(self, notes):
+        """给这次要画的整列笔记定颜色：保证相邻两条不同，返回 {笔记 id: 颜色}。
+
+        颜色平时跟着笔记走（`ensure_note_color`），这里只处理「撞在一起」的那几条。
+        落库走 `_schedule_save`（和正文同一个去抖），关窗时 `close_app` 会兜底刷库。
+        """
+        sv = getattr(self, "search_var", None)
+        searching = bool((sv.get() if sv is not None else "").strip())
+        accents, changed = resolve_adjacent_colors(notes, persist=not searching)
+        if changed and not searching:
+            self._schedule_save()
+        return accents
+
+    def _set_row_accent(self, nid, color):
+        """就地换某一行色条的颜色（拖拽排序后不重建整列，也就不能靠重建来重画）。"""
+        rec = self._rows.get(nid)
+        card = rec.get("row")._card if rec else None
+        if card is None or getattr(card, "_accent", None) == color:
+            return
+        card._accent = color
+        card._draw()
+
     def refresh_notes(self):
         p = self.pal
         self._star_buttons = {}
@@ -4262,9 +5897,13 @@ class UIMixin(object):
         for w in list(self.note_panel.inner.children.values()):
             w.destroy()
         notes = self.visible_notes()
+        # 色条：同一屏里相邻两条不能同色（8 色必然有重复，重复色挨在一起就看不出是
+        # 两篇了）。搜索结果是临时行序，只算这一次显示用什么颜色，不写回笔记。
+        accents = self._resolve_note_colors(notes)
         self._active_title = self._active_preview = self._active_date = None
         for i, n in enumerate(notes):
-            self._make_note_row(n, i, n["id"] == self.data.get("current_note"))
+            self._make_note_row(n, i, n["id"] == self.data.get("current_note"),
+                                accent=accents.get(n["id"]))
         # 布局完成后按可用像素截断标题（此时盒子宽度才量得出来）
         for n in notes:
             self._after_idle(lambda nid=n["id"]: self._fit_note_title(nid))
@@ -4315,12 +5954,14 @@ class UIMixin(object):
         except Exception:
             pass
 
-    def _make_note_row(self, n, index, active, before=None):
+    def _make_note_row(self, n, index, active, before=None, accent=None):
         """创建并追加单条笔记行，返回它的外层 wrap。
 
         与文件夹行（_make_folder_row）同一套思路：新建笔记时只调用这个，把新行
         插到正确位置，避免整列重建——否则已存在的行被销毁再重建会闪一下。
         before 给定时插到该控件之前（用于把新笔记放到列表中间）。
+        accent 是这次这一行该用的色条颜色（调用方已按行序消过相邻同色）；
+        不给就退回「跟着笔记走」的那个颜色。
         """
         p = self.pal
         starred = n.get("starred", False)
@@ -4330,21 +5971,27 @@ class UIMixin(object):
         child_bg = p["sel"] if active else p["list"]
         # 圆角悬浮卡片：外层 wrap 负责左右留白与行间距，内层 row 自带圆角背景层
         wrap = tk.Frame(self.note_panel.inner, bg=p["list"])
-        opts = dict(fill=tk.X, padx=CARD_PADX, pady=(CARD_GAP if index else 2, 0))
+        opts = dict(fill=tk.X, padx=CARD_PADX,
+                    pady=(CARD_GAP if index else dpi.px(2), 0))
         if before is not None:
             opts["before"] = before
         wrap.pack(**opts)
         row = tk.Frame(wrap, bg=row_frame_bg)
         row.pack(fill=tk.BOTH, expand=True)
         row._card_outside = p["list"]
-        row._card = self._card_layer(row, row_frame_bg, p["list"])
+        # 色条：颜色跟着笔记走（见 store.ensure_note_color），这条笔记第一次被
+        # 渲染时就定下来，之后切文件夹、换排序都不变；只有和相邻行撞色时，
+        # 由调用方（_resolve_note_colors）临时指定一个
+        if accent is None:
+            accent = ensure_note_color(n, self.data["notes"])
+        row._card = self._card_layer(row, row_frame_bg, p["list"], accent=accent)
         top = tk.Frame(row, bg=row_frame_bg)
         # 顶行定高：高度 = 标题字高 + 上下各一份 NOTE_TITLE_GAP（理由见那边的注释）。
         # 星标 Button 比这更高（49 > 36），多出的空白由 Tk 按父容器边界裁掉。
         t_h = self._measure_font(FONT[0], 13, "bold").metrics("linespace")
         top.configure(height=t_h + 2 * NOTE_TITLE_GAP)
         top.pack_propagate(False)
-        top.pack(fill=tk.X, padx=14, pady=(2, 0))
+        top.pack(fill=tk.X, padx=dpi.px(14), pady=(dpi.px(2), 0))
         # 右侧（星标 + 日期）先 pack：先把宽度占死，标题再长也压不到它
         right = tk.Frame(top, bg=row_frame_bg)
         right.pack(side=tk.RIGHT)
@@ -4354,7 +6001,7 @@ class UIMixin(object):
                        font=(FONT[0], 17),
                        activebackground=child_bg, activeforeground=(p["star"] if starred else p["soft"]),
                        command=lambda nid=n["id"]: self.toggle_star(nid))
-        sb.pack(side=tk.RIGHT, padx=(0, 6))
+        sb.pack(side=tk.RIGHT, padx=(0, dpi.px(6)))
         self._star_buttons[n["id"]] = sb
         dl = tk.Label(right, text=self._date_text(n), bg=child_bg, fg=p["soft"],
                        anchor="e", font=(FONT[0], 11))
@@ -4362,7 +6009,7 @@ class UIMixin(object):
         # 标题装进「固定高度 + 不随内容扩张」的盒子：超长部分被盒子裁掉，
         # 不会把右侧的星标/日期挤走（与文件夹名同一套做法）
         tl_box = tk.Frame(top, bg=child_bg, height=t_h)
-        tl_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
+        tl_box.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, dpi.px(8)))
         tl_box.pack_propagate(False)
         tl = MarqueeLabel(tl_box, bg=child_bg,
                           fg=(p["selfg"] if active else p["text"]),
@@ -4374,9 +6021,11 @@ class UIMixin(object):
         row._name_clipped = False
         row._fit_tries = 0
         prev = self.trunc(self.preview_of(n), 22) or "暂无更多文字"
+        # 摘要 11pt（与日期同档）：比标题小两号才分得出主次；12pt 时只小一号，
+        # 一眼看过去标题和摘要几乎同重，整列像两行正文。
         pl = tk.Label(row, text=prev, bg=child_bg, fg=p["soft"], anchor="w",
-                       font=(FONT[0], 12))
-        pl.pack(fill=tk.X, padx=14, pady=(0, 2))
+                       font=(FONT[0], 11))
+        pl.pack(fill=tk.X, padx=dpi.px(14), pady=(0, dpi.px(2)))
         if active:
             self._active_title, self._active_preview, self._active_date = tl, pl, dl
         self._rows[n["id"]] = {"row": row, "top": top, "right": right,
@@ -4386,18 +6035,16 @@ class UIMixin(object):
         row._base_bg = row_frame_bg
         row.bind("<Enter>", lambda e, r=row: self._row_hover(r, self._row_hover_bg(r)))
         row.bind("<Leave>", lambda e, r=row: self._row_hover(r, r._base_bg))
-        # 拖拽移动：按下记录起点，移动超过阈值进入拖拽态，松手落到目标文件夹；
-        # 未超过阈值则视为普通点击 → 选中该笔记。
+        # 拖拽：只在「按下」这一处记起点。motion / release **不绑在行上**，
+        # 而是统一挂在顶层窗口（见 __init__ 里的 _drag_on_motion / _drag_on_release）——
+        # 指针一开始移动就会跨出本行，行级绑定只能收到起点那一格。
+        # 未超过阈值视为普通点击 → 选中该笔记。
         row.bind("<ButtonPress-1>", lambda e, nid=n["id"]: self._note_press(e, nid))
-        row.bind("<B1-Motion>", lambda e, nid=n["id"]: self._note_motion(e, nid))
-        row.bind("<ButtonRelease-1>", lambda e, nid=n["id"]: self._note_release(e, nid))
         row.bind("<Button-3>", lambda e, nid=n["id"]: self._popup(e, nid))
-        # 子控件也要绑定拖拽/右键：父级不在子控件的 bindtags 中，事件不会自动冒泡
+        # 子控件也要绑定按下/右键：父级不在子控件的 bindtags 中，事件不会自动冒泡
         # （背景层 Canvas 同样要绑定，它覆盖了行四周的内边距区域）
         for w in (top, right, tl_box, tl, dl, pl, row._card):
             w.bind("<ButtonPress-1>", lambda e, nid=n["id"]: self._note_press(e, nid))
-            w.bind("<B1-Motion>", lambda e, nid=n["id"]: self._note_motion(e, nid))
-            w.bind("<ButtonRelease-1>", lambda e, nid=n["id"]: self._note_release(e, nid))
             w.bind("<Button-3>", lambda e, nid=n["id"]: self._popup(e, nid))
         # 悬停标题：被截断过的标题用跑马灯滚动展示完整内容（同文件夹名）
         for w in (tl_box, tl):
@@ -4424,6 +6071,15 @@ class UIMixin(object):
             self.refresh_notes()
             return
         idx = ids.index(n["id"])
+        # 新笔记是「插进」两行之间：上下两位本来就不同色，只要新这条避开它俩就行。
+        # 必须让**新来的**让路 —— 让邻居改色的话，用户会觉得自己点错了笔记。
+        avoid = [notes[i].get("color") for i in (idx - 1, idx + 1)
+                 if 0 <= i < len(notes)]
+        avoid = [c for c in avoid if c in NOTE_COLORS]
+        if n.get("color") not in NOTE_COLORS or n.get("color") in avoid:
+            n["color"] = pick_note_color(self.data["notes"], n.get("folder"),
+                                         avoid)
+            self._schedule_save()
         before = None
         if idx + 1 < len(notes):
             nxt = self._rows.get(notes[idx + 1]["id"])
@@ -4465,7 +6121,7 @@ class UIMixin(object):
         if vis:
             first = self._rows.get(vis[0]["id"])
             if first is not None:
-                first["wrap"].pack_configure(pady=(2, 0))
+                first["wrap"].pack_configure(pady=(dpi.px(2), 0))
         self.note_panel.inner.update_idletasks()
         self.note_panel._update()
         self.note_panel.bind_wheel()
@@ -4479,6 +6135,8 @@ class UIMixin(object):
         把左栏高亮改到它所属的文件夹。否则刚点中的文件夹会被这一篇的文件夹顶掉，
         而两者用的是同一个选中色，看上去就是「那个文件夹始终选着」。
         """
+        if self.doodle_active():
+            return          # 涂鸦期间不许换笔记（蒙层 / 快照都绑在当前正文上）
         prev = self.data.get("current_note")
         if prev == nid:
             # 点中「已是当前项」的笔记：同样要取消文件夹多选（否则这里直接 return 会漏掉同步）
@@ -4514,6 +6172,50 @@ class UIMixin(object):
 
     MAX_TABS = 20
 
+    def _make_tabbar(self):
+        """造一条标签条（只造不管挂）。
+
+        启动与「设置里重新打开多标签」两处都要造，回调表必须一模一样 ——
+        抄两份迟早有一份漏参数，所以只在 `_build` 那一处建。
+        """
+        return TabStrip(self.editor_frame, self.pal,
+                        on_select=self._tab_go,
+                        on_close=self._tab_close,
+                        on_new=self.new_note,
+                        on_menu=self._tab_menu,
+                        on_reorder=self._tab_move,
+                        base=self._tool_bg())
+
+    def _multi_tab_enabled(self):
+        """全局配置：是否启用多标签页（默认 True）。"""
+        cfg = self.data.setdefault("settings", {})
+        return cfg.get("multi_tab", True)
+
+    def _apply_multi_tab(self, enabled):
+        """把「启用多标签页」落到界面上 —— 点确定即生效，不要求重启。
+
+        打开：现造标签条挂回工具带下面，再把上次开着的那几枚标签恢复出来；
+        关闭：拆掉标签条、清空列表。正文只有一份 Text，当前这篇照旧在编辑，
+        关掉标签不涉及任何内容改动，所以这里不需要存盘。
+        """
+        enabled = bool(enabled)
+        if enabled and self.tabbar is None:
+            self.tabbar = self._make_tabbar()
+            # 运行中的编辑区里稿纸（以及可能的只读提示条）都已经 pack 就位，
+            # 裸 pack() 会排到正文下面去 —— 必须显式插到它们前面。
+            # 顺序与启动时一致：标签条 → 只读条 → 稿纸。
+            before = self._ro_bar if self._ro_bar.winfo_manager() else self.text
+            self.tabbar.pack(fill=tk.X, before=before)
+            self._tabs_restore()
+        elif not enabled and self.tabbar is not None:
+            try:
+                self.tabbar.destroy()
+            except Exception:
+                pass
+            self.tabbar = None
+            self._tabs = []
+            self._tab_active = None
+
     def _tabs_cfg(self):
         """开着的标签持久化在 settings.tabs：关掉应用再回来，上次那几篇还开着。"""
         cfg = self.data.setdefault("settings", {})
@@ -4524,6 +6226,11 @@ class UIMixin(object):
         return ids
 
     def _tabs_restore(self):
+        if not self._multi_tab_enabled():
+            # 多标签功能关闭时，保持只有当前笔记的单一标签，不渲染标签条
+            self._tabs = []
+            self._tab_active = None
+            return
         saved = [i for i in self._tabs_cfg() if isinstance(i, str)]
         have = set(n["id"] for n in self.data["notes"])
         self._tabs = [i for i in saved if i in have][:self.MAX_TABS]
@@ -4535,7 +6242,12 @@ class UIMixin(object):
         self._render_tabs()
 
     def _render_tabs(self):
-        """按 self._tabs 重画整条；顺手剪掉已被删除的笔记（删笔记/导入换库都可能）。"""
+        if self.tabbar is None:
+            # 多标签关着：没有标签条可画。判 tabbar 而不是判配置 —— 两者只可能
+            # 由 _apply_multi_tab 同时改，这样「配置说开着、控件却不在」时也不会
+            # 在 set_tabs 上抛 AttributeError。
+            return
+        # 按 self._tabs 重画整条；顺手剪掉已被删除的笔记（删笔记/导入换库都可能）。
         notes = dict((n["id"], n) for n in self.data["notes"])
         keep = [i for i in self._tabs if i in notes]
         if keep != self._tabs:
@@ -4614,12 +6326,28 @@ class UIMixin(object):
             self.select_note(nid)
         save_data(self.data)
 
+    def _tab_close_all(self):
+        """关掉全部标签：编辑区清空，但不删笔记、不动任何内容。
+
+        `_tab_activate(None)` 是唯一能把编辑区真正清空的入口（它把 current_note
+        置空、重装编辑器、重画标签条）。标签列表本身必须显式落库 —— 否则下次启动
+        `_tabs_restore` 会把上一条 settings.tabs 又原样开回来，看起来像没关掉。
+        """
+        if not self._tabs:
+            return
+        self._tabs = []
+        self._tab_active = None
+        self._tab_activate(None)
+        save_data(self.data)
+
     def _tab_activate(self, nid, sync_folder=True):
         """切到某枚标签；None = 全关了，编辑区空着。
 
         sync_folder 透传给 `select_note`：由 `_load_editor_body` 自动顺位回标签时
         传 False（不是用户点的笔记，左栏高亮不该被改写）。
         """
+        if self.doodle_active():
+            return
         self._tab_active = nid
         if nid:
             self.select_note(nid, sync_folder=sync_folder)
@@ -4642,23 +6370,49 @@ class UIMixin(object):
         self._scroll_note_into_view(nid)
 
     def _tab_next(self):
+        if not self._multi_tab_enabled():
+            return
         self._tab_switch(1)
 
     def _tab_prev(self):
+        if not self._multi_tab_enabled():
+            return
         self._tab_switch(-1)
 
     def _tab_close_active(self):
+        if not self._multi_tab_enabled():
+            return
         if self._tab_active:
             self._tab_close(self._tab_active)
         elif self.current_note():
             self._tab_close(self.current_note()["id"])
 
-    def _tab_menu(self, event, nid):
+    def _tab_menu(self, event, nid=None):
+        """标签条右键菜单。nid=None 表示点在条底空白处 —— 没有锚定的那一枚。
+
+        空白处只给「不针对某一枚」的动作：新建一篇、关掉全部。历史上这里右键毫无
+        反应，而开着一排标签想一次收干净时，第一反应往往是去空白处右键。
+        """
+        if not nid:
+            m = PopupMenu(self.root, self.pal)
+            m.add("新建笔记", icon="pencil", command=self.new_note)
+            m.add_separator()
+            m.add("关闭所有标签", icon="trash", enabled=bool(self._tabs),
+                  command=self._tab_close_all)
+            try:
+                m.popup(event.x_root, event.y_root)
+            except Exception:
+                pass
+            return "break"
         i = self._tabs.index(nid) if nid in self._tabs else -1
         m = PopupMenu(self.root, self.pal)
         m.add("关闭标签", icon="trash", command=lambda: self._tab_close(nid))
         m.add("关闭其它标签", icon="trash", enabled=len(self._tabs) > 1,
               command=lambda: self._tab_close_others(nid))
+        # 全关：只关标签不删笔记。放在「其它」下面，是因为它是三者里唯一会把
+        # 编辑区清空的动作 —— 误点代价最大，排远一点。
+        m.add("关闭所有标签", icon="trash", enabled=bool(self._tabs),
+              command=self._tab_close_all)
         # 分区：上面是「关单枚 / 只留这一枚」，下面是「按方向成批关」。
         # 方向项没有可用目标时置灰而不是隐藏 —— 菜单长度别跟着右键位置跳来跳去。
         m.add_separator()
@@ -4793,92 +6547,145 @@ class UIMixin(object):
         if cur_removed:
             self.load_editor()
 
-    def _release_stale_grab(self):
-        """释放可能残留的局部 grab（只释放我们记录过的那一个控件，不动系统/菜单的 grab）。"""
-        gw = getattr(self, "_grab_widget", None)
-        if gw is None:
-            return
-        self._grab_widget = None
-        try:
-            if gw.winfo_exists():
-                gw.grab_release()
-        except Exception:
-            pass
-
     def _note_press(self, e, nid):
         # 按住 Shift / Ctrl 进行多选（批量删除），不进入拖拽逻辑
         if (e.state & 0x0001) or (e.state & 0x0004):
             self._note_select(e, nid)
             return
         # 普通按下：**立刻**取消其它选中项，只留当前这一条。
-        # 放在「按下」而不是「松手」做，是因为松手事件可能丢失（拖出窗口、被 grab 吞掉、
-        # 中途又触发了别的流程），那样多选高亮就会残留；Finder / 资源管理器也是按下即收拢。
+        # 放在「按下」而不是「松手」做，是因为松手事件可能丢失（拖出窗口、中途
+        # 触发了别的流程），那样多选高亮就会残留；Finder / 资源管理器也是按下即收拢。
         if self._note_sel != {nid}:
             self._note_sel = {nid}
             self._note_anchor = nid
             self._restyle_notes()
-        # 防呆：上一次拖拽若没走完释放流程，会残留局部 grab 占住鼠标事件，导致后续点击全部失效
-        self._release_stale_grab()
-        self._drag = {"nid": nid, "x": e.x_root, "y": e.y_root, "started": False, "grab": e.widget}
-        # 本地 grab：拖拽过程中即使指针移出笔记行，也能持续收到 B1-Motion / 释放事件
-        try:
-            e.widget.grab_set()
-            self._grab_widget = e.widget     # 记下来，下次按下时可兜底释放
-        except Exception:
-            pass
-
-    def _note_motion(self, e, nid):
-        d = getattr(self, "_drag", None)
-        if not d or d["nid"] != nid:
+        # 上一次拖拽的收尾：指针在窗口外松手时收不到 <ButtonRelease-1>，浮签会留在
+        # 屏幕上 —— 下一次按下列表行就是「复位」的时机（_drag_end 可重复调用）。
+        if getattr(self, "_drag_win", None) is not None:
+            self._drag_end()
+            self._drag = None
+        # ⚠️ 这里**不 grab**：Tk 的本地 grab 在 Windows 上就是 SetCapture，而拖拽一
+        # 开始就要新建那个无边框的「浮起标题」窗口 —— 新窗口抢焦点时系统会自己清掉
+        # capture（WM_CAPTURECHANGED），此后指针一跨到别的行上就再也收不到
+        # <B1-Motion>，表现为「浮签卡住不动、指示线不出、松手才突然生效」。
+        # motion / release 统一挂在顶层窗口上（见 __init__ 与 _drag_on_motion）：
+        # 事件从指针下的任意控件都会冒泡到顶层，跨行、跨栏、跨到编辑器都收得到。
+        # 内置说明笔记不建**可拖**的态：它钉在「系统」里，拖出去也留不住（下次启动
+        # 会被搬回来），中间那段时间就成了「数据看起来不对」。
+        # ⚠️ 但这里**不能**把 `_drag` 置空就 return ——「松手时把笔记装进编辑器」是
+        # `_finish_drag` 干的活，`_drag` 为空它第一行就退出了，表现就是「点说明笔记
+        # 只高亮、正文不换」，用户看到的是「打不开了」。留一条 started=False 的记录
+        # 正好复用那条收口逻辑（松手 → select_note），只是 motion 不许把它变成浮签。
+        n = next((x for x in self.data["notes"] if x["id"] == nid), None)
+        if n is not None and n.get("sample"):
+            self._drag = {"nid": nid, "x": e.x_root, "y": e.y_root,
+                          "started": False, "sample": True}
             return
-        if not d["started"]:
-            # 阈值提高到 8px：人手点击常有轻微抖动，太小会误判成拖拽导致点不中
-            if abs(e.x_root - d["x"]) > 8 or abs(e.y_root - d["y"]) > 8:
-                d["started"] = True
-                self._drag_start(nid)
-        if d["started"]:
-            self._drag_move(e.x_root, e.y_root)
-            self._drag_highlight(e.x_root, e.y_root)
+        self._drag = {"nid": nid, "x": e.x_root, "y": e.y_root, "started": False}
 
-    def _note_release(self, e, nid):
+    def _finish_drag(self, x_root, y_root, state=0):
+        """拖拽收口：按落点决定「移动文件夹 / 调整顺序 / 只是选中」。
+
+        唯一调用点是顶层那份 <ButtonRelease-1>（_drag_on_release）。
+        """
         d = getattr(self, "_drag", None)
-        if d and d["nid"] != nid:
-            # 按下与松开落在不同行（或残留状态）→ 丢弃，避免卡住后续点击
-            d = None
-        gw = d.get("grab") if d else None
-        try:
-            if gw:
-                gw.grab_release()
-        except Exception:
-            pass
-        self._grab_widget = None
+        if not d:
+            return
+        nid = d["nid"]
         moved = False
-        if d and d.get("started"):
-            fid = self._folder_under(e.x_root, e.y_root)
+        if d.get("started"):
+            # 松手点才是最终意图：不复用上一帧的 d["drop"] —— 指针最后一段常常
+            # 没有对应的 <B1-Motion>（松手太快，或系统把中间几帧合并了）。
+            tgt = self._note_drop_target(x_root, y_root, nid)
+            fid = self._folder_under(x_root, y_root)
             self._drag_end()
             if fid and fid not in SMART_FOLDERS:
                 self._move_note_to_folder(nid, fid)
                 moved = True
-        # 关键：只有真正把笔记拖进了某个文件夹才跳过选中。
+            elif tgt:
+                # 在列表里松手＝调整上下顺序（与「拖到文件夹」同一手势，按落点分流）
+                self._apply_note_reorder(tgt)
+                moved = True
+        else:
+            # 没到阈值＝一次普通点击：不建浮签，但也要把拖拽态收干净
+            self._drag_end()
+        # 落定后的选中：移动过的笔记**必须**成为唯一选中项（用户要求「移动后默认
+        # 选中移动的那条」）。以前这里对 `moved` 什么都不做，于是两套高亮同时成立 —
+        # 上一条仍是 `current_note`（active 色）、被拖的那条留在 `_note_sel`（seld 色），
+        # 列表上就亮着两行。
+        # 先收干净拖拽态：下面的选中可能切视图 / 重装编辑器，中途跑到的 Motion
+        # 不该再被当成「还在拖」。
+        self._drag = None
+        if moved:
+            self._select_after_move(nid)
         # Shift / Ctrl 多选时：保留已选集合，只把当前笔记同步为编辑器加载对象（不重建多选）
-        if (e.state & 0x0001) or (e.state & 0x0004):
+        elif state & 0x0001 or state & 0x0004:
             self.data["current_note"] = nid
             # 笔记 Shift/Ctrl 多选：只同步编辑器加载对象，保留多选集合、不动文件夹列表
             self._restyle_notes()
             self.load_editor()
         # 普通点击 / 拖拽中途松手：视为选中该笔记
-        elif not moved:
+        else:
             self.select_note(nid)
-        self._drag = None
+
+    def _select_after_move(self, nid):
+        """拖拽落定后，把被拖的那条收为**唯一**选中项。
+
+        两处调用来源共用它：拖进别的文件夹（`_move_note_to_folder`）与在列表里
+        改顺序（`_apply_note_reorder`）。
+
+        换文件夹后它可能已经不在当前视图里（看的就是源文件夹）—— 这时跟到它
+        新的家去。否则编辑器里装着这一篇、列表里一条都不亮，比「双亮」更难解释。
+        搜索态不跟：搜索是临时过滤，跳视图会让人莫名其妙，就地收拢即可。
+        """
+        n = next((x for x in self.data["notes"] if x["id"] == nid), None)
+        if n is None:
+            return
+        searching = bool(getattr(self, "search_var", None)
+                         and self.search_var.get().strip())
+        visible = any(x["id"] == nid for x in self.visible_notes())
+        if not visible and not searching and self._note_home_folder(n):
+            self._popup_goto_folder(nid)   # 逐级展开 + 切视图 + 选中 + 滚到眼前 + 装编辑器
+            return
+        if self.data.get("current_note") == nid:
+            # 拖的本来就是当前这篇：只收拢选中，不重装编辑器（会丢光标和滚动位置）
+            self._note_sel = {nid}
+            self._note_anchor = nid
+            self._sync_folder_sel_to_note(nid)
+            self._restyle_notes()
+        else:
+            self.select_note(nid, sync_folder=not searching)
+        self._scroll_note_into_view(nid)
+
+    # 拖拽期间的中转站。两者都挂在顶层窗口上（见 __init__），事件从指针下的任意
+    # 控件冒泡上来，跨行 / 跨栏都不丢；`_drag` 为空时立即返回，平时零成本。
+    def _drag_on_motion(self, e):
+        d = getattr(self, "_drag", None)
+        if not d:
+            return
+        if d.get("sample"):
+            # 说明笔记只有「松手选中」这一半，永远不升级成拖拽（见 _note_press）
+            return
+        if not d["started"]:
+            # 阈值 8px：人手点击常带几像素抖动，太小会把「点一下」误判成拖拽
+            if abs(e.x_root - d["x"]) > 8 or abs(e.y_root - d["y"]) > 8:
+                d["started"] = True
+                self._drag_start(d["nid"])
+        if d["started"]:
+            self._drag_move(e.x_root, e.y_root)
+            self._drag_highlight(e.x_root, e.y_root)
+
+    def _drag_on_release(self, e):
+        self._finish_drag(e.x_root, e.y_root, e.state)
 
     def _drag_start(self, nid):
         n = next((x for x in self.data["notes"] if x["id"] == nid), None)
         title = self.trunc(self.title_of(n) if n else "笔记", 16)
         dlg = tk.Toplevel(self.root)
         dlg.overrideredirect(True)
-        dlg.configure(bg=self.pal["sel"], bd=1, relief=tk.RAISED)
+        dlg.configure(bg=self.pal["sel"], bd=dpi.px(1), relief=tk.RAISED)
         tk.Label(dlg, text="   " + title, bg=self.pal["sel"], fg=self.pal["text"],
-                 font=(FONT[0], 12, "bold")).pack(padx=10, pady=6)
+                 font=(FONT[0], 12, "bold")).pack(padx=dpi.px(10), pady=dpi.px(6))
         dlg.geometry("+%d+%d" % (self._drag["x"], self._drag["y"]))
         self._drag_win = dlg
 
@@ -4887,6 +6694,19 @@ class UIMixin(object):
             self._drag_win.geometry("+%d+%d" % (x + 12, y + 8))
 
     def _drag_highlight(self, x, y):
+        d = getattr(self, "_drag", None)
+        tgt = self._note_drop_target(x, y, d["nid"]) if d else None
+        if tgt:
+            # 落在笔记列表里 → 显示插入位置，清掉文件夹高亮（两者只能亮一个）
+            if getattr(self, "_drag_target", None):
+                self._folder_restore(self._drag_target)
+                self._drag_target = None
+            self._show_drop_line(tgt["y"])
+            d["drop"] = tgt
+            return
+        self._hide_drop_line()
+        if d:
+            d["drop"] = None
         fid = self._folder_under(x, y)
         prev = getattr(self, "_drag_target", None)
         if prev == fid:
@@ -4906,6 +6726,175 @@ class UIMixin(object):
                 except Exception:
                     pass
         self._drag_target = fid
+
+    # ---------- 笔记列表拖拽排序 ----------
+    # 与「拖到文件夹」共用一套拖拽手势：指针停在中间列表里 = 调整上下顺序，
+    # 停在左侧文件夹行上 = 移动所属文件夹。二者靠指针位置区分，不需要两个修饰键。
+
+    @staticmethod
+    def _same_note_group(a, b):
+        """两条笔记是否处在同一个排序分组（置顶 / 星标都相同）。
+
+        跨组拖拽会让「置顶」「星标」的置顶语义失效：把普通笔记拖到置顶区，
+        松手后它又会被排序键弹回下面，看着像没反应。所以只在组内重排。
+        """
+        return (bool(a.get("pinned")) == bool(b.get("pinned")) and
+                bool(a.get("starred", False)) == bool(b.get("starred", False)))
+
+    def _note_drop_target(self, x, y, nid):
+        """指针在笔记列表里时，算出「插到哪两条之间」。
+
+        返回 None 表示不构成重排（指针不在列表里、搜索中、或位置没变化）。
+        返回的 y 是插入指示线在 `note_panel.inner` 里的纵坐标。
+        """
+        # 搜索结果是按匹配度/更新时间排的，拖它没有持久意义，直接不接
+        if hasattr(self, "search_var") and self.search_var.get().strip():
+            return None
+        cv = self.note_panel.canvas
+        x1, y1 = cv.winfo_rootx(), cv.winfo_rooty()
+        x2, y2 = x1 + cv.winfo_width(), y1 + cv.winfo_height()
+        if not (x1 <= x <= x2 and y1 <= y <= y2):
+            return None
+        notes = self.visible_notes()
+        drag = next((n for n in notes if n["id"] == nid), None)
+        if drag is None:
+            return None
+        group = [n for n in notes if self._same_note_group(n, drag)]
+        if len(group) < 2:
+            return None
+        pos_of = {n["id"]: i for i, n in enumerate(notes)}
+        # 指针落在哪一行的上半/下半 → 列表里的原始插入位置
+        yl = y - self.note_panel.inner.winfo_rooty()
+        raw = len(notes)
+        for i, n in enumerate(notes):
+            rec = self._rows.get(n["id"])
+            if not rec:
+                continue
+            wrap = rec["wrap"]
+            if yl < wrap.winfo_y() + wrap.winfo_height() / 2.0:
+                raw = i
+                break
+        # 把「全体里的插入位置」折算成「同分组内的插入位置」
+        before = sum(1 for n in group if pos_of[n["id"]] < raw)
+        old = group.index(drag)
+        pos = before - 1 if old < before else before
+        pos = max(0, min(len(group) - 1, pos))
+        if pos == old:
+            return None
+        rest = group[:old] + group[old + 1:]
+        rest.insert(pos, drag)
+        prev = rest[pos - 1] if pos > 0 else None
+        nxt = rest[pos + 1] if pos + 1 < len(rest) else None
+        # 指示线画在「松手后下一条」的上沿；拖到组尾则画在组内最后一条的下沿
+        if nxt is not None:
+            boundary = pos_of[nxt["id"]]
+        else:
+            boundary = pos_of[group[-1]["id"]] + 1
+        if boundary < len(notes):
+            rec = self._rows.get(notes[boundary]["id"])
+            line_y = rec["wrap"].winfo_y() if rec else 0
+        else:
+            rec = self._rows.get(notes[-1]["id"])
+            line_y = (rec["wrap"].winfo_y() + rec["wrap"].winfo_height()
+                      if rec else 0)
+        return {"nid": nid,
+                "prev": prev["id"] if prev else None,
+                "next": nxt["id"] if nxt else None,
+                "y": line_y}
+
+    def _show_drop_line(self, y):
+        """在行与行之间画一条 2px 强调色细线（place 在 inner 上，能盖住 packed 行）。"""
+        line = getattr(self, "_drop_line", None)
+        try:
+            alive = line is not None and line.winfo_exists()
+        except Exception:
+            alive = False
+        if not alive:
+            line = tk.Frame(self.note_panel.inner, bg=self.pal["accent"],
+                            height=dpi.px(2), bd=0)
+            self._drop_line = line
+        pad = CARD_PADX + dpi.px(2)
+        width = max(1, self.note_panel.inner.winfo_width() - 2 * pad)
+        line.configure(bg=self.pal["accent"])
+        line.place(x=pad, y=max(0, int(y) - dpi.px(1)),
+                   width=width, height=dpi.px(2))
+        try:
+            line.lift()
+        except Exception:
+            pass
+
+    def _hide_drop_line(self):
+        line = getattr(self, "_drop_line", None)
+        self._drop_line = None
+        if line is None:
+            return
+        try:
+            line.destroy()
+        except Exception:
+            pass
+
+    def _apply_note_reorder(self, tgt):
+        """把拖拽结果写回 `order`，并原地重排行（不整列重建）。"""
+        notes = {n["id"]: n for n in self.data["notes"]}
+        drag = notes.get(tgt.get("nid"))
+        prev = notes.get(tgt.get("prev"))
+        nxt = notes.get(tgt.get("next"))
+        if drag is None:
+            return
+        # 首次拖拽：先把全库现有顺序固化成数值，后面才能做「插到两位之间」
+        self.ensure_note_order()
+        p = self._note_order(prev) if prev else None
+        q = self._note_order(nxt) if nxt else None
+        if p is not None and q is not None:
+            if q - p > 1e-6:
+                val = (p + q) / 2.0
+            else:
+                # 二分到浮点精度尽头（连续往同一个缝里插很多次）→ 组内重编号
+                group = [n for n in self.visible_notes()
+                         if self._same_note_group(n, drag)]
+                base = min(self._note_order(n) or 0.0 for n in group)
+                for i, n in enumerate(group):
+                    n["order"] = base + i * 1024.0
+                val = drag["order"]
+        elif p is not None:
+            val = p + 1024.0
+        elif q is not None:
+            val = q - 1024.0
+        else:
+            val = 0.0
+        drag["order"] = float(val)
+        # 行序变了，「相邻」也跟着变：撞色的要重挑。行控不重建，所以只把变了的那
+        # 几行色条就地重画，不整列闪一下
+        accents, _ = resolve_adjacent_colors(self.visible_notes(), persist=True)
+        save_data(self.data)
+        self._reorder_note_rows()
+        for nid, c in accents.items():
+            self._set_row_accent(nid, c)
+        self._scroll_note_into_view(drag["id"])
+
+    def _reorder_note_rows(self):
+        """按新的可见顺序重新 pack 已有的行（控件不销毁，不闪）。"""
+        notes = self.visible_notes()
+        prev = None
+        for i, n in enumerate(notes):
+            rec = self._rows.get(n["id"])
+            if not rec:
+                continue
+            wrap = rec["wrap"]
+            if prev is not None:
+                try:
+                    wrap.pack_configure(after=prev)
+                except Exception:
+                    pass
+            try:
+                wrap.pack_configure(
+                    pady=(dpi.px(2) if i == 0 else CARD_GAP, 0))
+            except Exception:
+                pass
+            prev = wrap
+        self.note_panel.inner.update_idletasks()
+        self.note_panel._update()
+
 
     def _folder_restore(self, fid):
         row = self._folder_rows.get(fid)
@@ -4927,10 +6916,15 @@ class UIMixin(object):
         if prev:
             self._folder_restore(prev)
         self._drag_target = None
+        # 插入指示线是 place 上来的独立 Frame，不属于任何会被销毁的分支，
+        # 松手/中途取消都得自己收掉，否则那根 2px 线会一直挂在列表上。
+        self._hide_drop_line()
 
     def _folder_under(self, x, y):
         for fid, row in self._folder_rows.items():
-            if fid in SMART_FOLDERS:
+            # 智能分类是筛选视图、系统区只装说明笔记 —— 两者都不是笔记的落点，
+            # 指针停上去不高亮、松手也不移动（拖拽分流看这里）
+            if fid in SMART_FOLDERS or fid == SYSTEM_FOLDER:
                 continue
             ry = row.winfo_rooty()
             rh = row.winfo_height()
@@ -4960,6 +6954,10 @@ class UIMixin(object):
                 self.text.edit_reset()
             except Exception:
                 pass
+            # 换过正文之后，行号要整套重算（行数、折行位置都变了）；
+            # 查找框若开着，关键词留着、在新这篇里接着找。
+            self._gutter_schedule(0)
+            self._find_on_edit()
 
     def _load_editor_body(self):
         self.text.config(state=tk.NORMAL)
@@ -5124,7 +7122,7 @@ class UIMixin(object):
                           if locked else
                           "内置示例笔记 · 内容不可编辑（文字可以选中复制）"))
                 if locked:
-                    self._ro_action.pack(side=tk.LEFT, padx=(10, 0))
+                    self._ro_action.pack(side=tk.LEFT, padx=(dpi.px(10), 0))
                 else:
                     self._ro_action.pack_forget()
                 bar.pack(fill=tk.X, before=self.text)
@@ -5165,7 +7163,7 @@ class UIMixin(object):
                     self._cancel_after(job)
                 except Exception:
                     pass
-            self._ro_label.configure(fg=self.pal["accent"])
+            self._ro_label.configure(fg=self._ro_accent_fg())
             self._ro_flash_job = self._after(450, self._unflash_readonly_hint)
         except Exception:
             pass
@@ -5374,6 +7372,11 @@ class UIMixin(object):
                     self.text.mark_set("insert", "@%d,%d" % (int(event.x), int(event.y)))
                 except Exception:
                     pass
+                # 拖动中为了「常亮」把闪烁定时器停了，松手这一刻必须显式重启：
+                # 静止之后通常**不会再有**任何一次 _col_caret_show（滚动/重绘都
+                # 不一定发生），等它顺手带起来就是「选中后光标一直不闪」，
+                # 直到按退格触发 _col_delete → _col_paint 才重新起搏。
+                self._col_caret_start_blink()
         else:
             # 不是矩形松手 → 这一下是普通点选 / 拖选 / 双击 / Shift+点击。
             # 保险起见再收一次矩形（<<Selection>> 那条通常已经收过了）。
@@ -5589,12 +7592,18 @@ class UIMixin(object):
 
     # ---------- 列模式：选中的每一行都有一根闪烁的光标 ----------
     # Tk 的 Text 只有一个 insert 标记、只有一根系统光标，没有多光标 API —— 想让
-    # 「竖向选中的每一行」都有一根，只能自己画。三条实测决定了现在的做法：
+    # 「竖向选中的每一行」都有一根，只能自己画。几条实测决定了现在的做法：
     #   ① Canvas 覆盖层 + WS_EX_LAYERED 色键：透明是透明的，可画上去的线也跟着
     #      一起没了（Tk 的 Canvas 在色键模式下不出内容）→ 放弃。
     #   ② 每行一个 2px 小窗（Frame(text) + place + lift）→ 画得出来，位置精确。
-    #   ③ 给小窗加 WS_EX_TRANSPARENT，鼠标就穿透过去 —— 点在光标条上，正文
-    #      insert 照常落位（实测 1.4），不会「点了个寂寞」。
+    #      高度取 dlineinfo 的**行盒**（含 spacing1/3），不是 bbox 的字框 ——
+    #      后者会让光标比整行矮 8~16px。
+    #   ③ ⚠️ 别指望 WS_EX_TRANSPARENT 让鼠标穿透：它管绘制顺序、不管命中测试，
+    #      点在条上正文收不到（见 _col_caret_forward），只能转发事件。
+    #   ④ 闪烁「灭」相位用 place_forget 真藏，不涂底色：条有整行高，跨到
+    #      spacing 区域时涂 sel 色会留一条 2px 残影。
+    #   ⑤ 定时器与重绘解耦：重绘只 ensure 不重启，否则连续重绘会让 tick 永远
+    #      轮不到 —— 就是「选中后不闪，按退格才闪」。
     # 全程只碰 UI 窗口，一个字符都不动，序列化/落库零风险。
     def _col_caret_origin(self):
         """place 坐标系相对 bbox 坐标系的偏移（实测一次并缓存）。
@@ -5633,7 +7642,10 @@ class UIMixin(object):
             pool = self._col_caret_pool = []
         if pool:
             return pool.pop()
-        bar = tk.Frame(self.text, width=COL_CARET_W, bd=0, highlightthickness=0)
+        # 新建就带亮色：万一某条路径漏了 _col_caret_paint，也不会留一条
+        # SystemButtonFace 灰线（浅色稿纸上等于没画）。池子复用的条由 paint 统一刷。
+        bar = tk.Frame(self.text, width=COL_CARET_W, bd=0, highlightthickness=0,
+                       bg=self.pal.get("accent", "#333333"))
         try:
             bar.configure(cursor=self.text.cget("cursor"))
         except Exception:
@@ -5690,17 +7702,6 @@ class UIMixin(object):
         self._col_caret_cw = w
         return w
 
-    def _col_caret_base_bg(self):
-        """闪烁「灭」的那半拍用什么色盖住：跟着光标脚下的底色走。
-
-        有宽度列时光标正压在矩形高亮上，用稿纸白会留下一条白缝；零宽列（打完字
-        之后）底下就是稿纸本色。
-        """
-        col = self._col
-        if col and col["c1"] > col["c0"]:
-            return self.pal.get("sel", "#cfe0fb")
-        return self.pal.get("editor", "#ffffff")
-
     def _col_caret_show(self):
         """按 _col 在每一行画一根光标条。
 
@@ -5737,75 +7738,137 @@ class UIMixin(object):
                 linelen = int(t.index("%d.end" % ln).split(".")[1])
             except Exception:
                 continue
+            idx = "%d.%d" % (ln, c) if c <= linelen else "%d.end" % ln
             try:
-                # 列落在行内就直接问 bbox；超出这行（虚拟列）先取行尾再往外推
-                bb = t.bbox("%d.%d" % (ln, c)) if c <= linelen \
-                    else t.bbox("%d.end" % ln)
+                bb = t.bbox(idx)
+                # ⚠️ 高度必须取 dlineinfo 的「行盒」，不能用 bbox 的 height：
+                # bbox 只量字框（正文 20 / H1 27），spacing1/3 的段前段后距不算
+                # 在内，按字框画出来的光标会比整行矮 8~16px，像一根没长齐的短线。
+                # dlineinfo 的 y 是行盒顶（含 spacing1），与 bbox 同一坐标系。
+                di = t.dlineinfo(idx)
             except Exception:
-                bb = None
+                bb, di = None, None
             if not bb:
                 continue                    # 滚出视口：不画
             x = bb[0] + (c - linelen) * cw if c > linelen else bb[0]
-            y, h = bb[1], bb[3]
+            y, h = (di[1], di[3]) if di else (bb[1], bb[3])
             if y + h <= 0 or y >= H:
                 continue
             bar = self._col_caret_bar()
-            try:
-                bar.place(x=int(x) - dx, y=y - dy, width=COL_CARET_W, height=h)
-                tk.Misc.lift(bar)
-            except Exception:
-                continue
+            # 摆放参数交给 paint 统一执行：闪烁「灭」相位要 place_forget 真藏起来
+            #（涂成高亮底色会在新增的 spacing 区域留下一条 2px 残影）。
+            bar._caret_geom = (int(x) - dx, y - dy, COL_CARET_W, h)
             # 转发鼠标事件时要用：条在正文里的位置（bbox 坐标系，见 _col_caret_forward）
             bar._caret_xy = (int(x), y)
             used.append(bar)
         self._col_caret_used = used
         if used:
             self._col_caret_hide_native()
-            self._col_caret_blink(on=True)
+            if getattr(self, "_colsel", None) is not None:
+                # 拖动中：相位锁在「亮」，常亮不闪（和 VS Code 拖动时一样）。
+                # ⚠️ **不要在这里 cancel 定时器**：鼠标在窗口外松开时
+                # <ButtonRelease-1> 可能收不到，停掉的定时器就再没人重启了。
+                # 让它一直跑，由 _col_caret_tick 见到 _colsel 只保持亮不翻转。
+                self._col_caret_on = True
+            # ⚠️ 静止重绘（滚动 / Configure / 换肤 / 打字）**绝不重启定时器**，
+            # 也绝不把相位掰回亮：旧实现每次 show 都 blink(on=True) 取消并
+            # 重排 600ms，只要有一条路径以短间隔反复重绘，tick 就永远轮不到
+            # —— 光标条一直常亮，正是用户报的「选中后不闪，按退格才闪」
+            #（退格走 _col_delete → _col_paint，恰好把那条链断开了）。
+            # 这里只按当前相位上色 + 补一条定时器，呼吸不被打断。
+            self._col_caret_paint()
+            self._col_caret_ensure()
         else:
+            # 选中行全滚出视口：条收起来了，相位归亮、系统光标还回来；
+            # 定时器仍留着，滚回来时立刻接上呼吸。
+            self._col_caret_on = True
             self._col_caret_restore_insert()
+            self._col_caret_ensure()
 
     def _col_caret_paint(self):
-        """只切颜色、不重算坐标（闪烁每半拍都走这里，要便宜）。"""
-        bg = self.pal.get("accent", "#333333") if getattr(self, "_col_caret_on", True) \
-            else self._col_caret_base_bg()
-        for bar in getattr(self, "_col_caret_used", None) or ():
+        """按当前相位显示 / 隐藏所有条（闪烁每半拍一次，要便宜）。
+
+        ⚠️「灭」用 place_forget **真藏起来**，不是涂成高亮底色：光标条现在有整行
+        高，跨到了 spacing1/3 区域，那里没有 COLSEL_TAG 的底色，涂 `pal["sel"]`
+        会留一条 2px 的浅色残影 —— 看着就是「光标没闪，只是变了下颜色」。
+        系统光标灭的那半拍也是不画，行为一致。
+        """
+        on = bool(getattr(self, "_col_caret_on", True))
+        bg = self.pal.get("accent", "#333333")
+        # place / place_forget 理论上不派发 Text 的 <Configure>；万一派发了，
+        # busy 位会让 _col_caret_relayout 直接回去，不会绕回 show 无限递归。
+        self._col_caret_busy = True
+        try:
+            for bar in getattr(self, "_col_caret_used", None) or ():
+                g = getattr(bar, "_caret_geom", None)
+                if not g:
+                    continue
+                try:
+                    if on:
+                        if str(bar.cget("bg")) != str(bg):
+                            bar.configure(bg=bg)
+                        bar.place(x=g[0], y=g[1], width=g[2], height=g[3])
+                        tk.Misc.lift(bar)
+                    else:
+                        bar.place_forget()
+                except Exception:
+                    pass
+        finally:
+            self._col_caret_busy = False
+
+    def _col_caret_cancel(self):
+        """停掉闪烁定时器（拖动中常亮 / 手势重启 / 退出列模式）。"""
+        job = getattr(self, "_col_caret_job", None)
+        self._col_caret_job = None
+        if job is not None:
             try:
-                # 同上：同值也 configure 的话会白白派发一堆事件，闪烁是每半拍一次
-                if str(bar.cget("bg")) != str(bg):
-                    bar.configure(bg=bg)
+                # 走统一出口：_after 把 id 记在 _after_jobs 里，直接 after_cancel
+                # 会让那个集合每半拍攒一个死 id（列模式开一晚上就是上万个）。
+                self._cancel_after(job)
             except Exception:
                 pass
 
-    def _col_caret_blink(self, on=None):
-        """起 / 续闪烁定时器。节奏照抄系统光标：亮 insertontime、灭 insertofftime，
-        这样它和别处的光标是同一个呼吸频率，看着才像一根真光标。
+    def _col_caret_ensure(self):
+        """保证列模式开着时始终有一条定时器；已经在跑就原样留着。
+
+        节奏照抄系统光标：亮 insertontime、灭 insertofftime，这样它和别处的
+        光标是同一个呼吸频率。所有重绘路径都走这里，**绝不 cancel 再排** ——
+        理由见 _col_caret_show_inner。
         """
-        job = getattr(self, "_col_caret_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-            self._col_caret_job = None
-        if on is not None:
-            self._col_caret_on = on
+        if getattr(self, "_col_caret_job", None) is not None:
+            return
         if not self._col_active():
             return
         try:
-            ms = int(self.text.cget("insertontime" if self._col_caret_on
-                                    else "insertofftime"))
+            ms = int(self.text.cget("insertontime" if getattr(
+                self, "_col_caret_on", True) else "insertofftime"))
         except Exception:
             ms = 300
         self._col_caret_job = self._after(max(50, ms), self._col_caret_tick)
+
+    def _col_caret_start_blink(self):
+        """拖完松手：从「亮」相位重新起一个完整周期（见 _on_text_release）。
+
+        拖动中定时器是停着的，而松手之后往往**没有**任何一次 _col_caret_show
+        —— 不能指望「下一次重绘顺手把闪烁带起来」，必须在这里显式重启。
+        """
+        self._col_caret_cancel()
+        self._col_caret_on = True
+        self._col_caret_paint()
+        self._col_caret_ensure()
 
     def _col_caret_tick(self):
         self._col_caret_job = None
         if not self._col_active():
             return
-        self._col_caret_on = not self._col_caret_on
+        if getattr(self, "_colsel", None) is not None:
+            # 拖动中：保持亮、不翻转。定时器照跑，松手（或手势异常中断后
+            # _colsel 被清掉）不需要任何额外事件就能自动接上闪烁。
+            self._col_caret_on = True
+        else:
+            self._col_caret_on = not self._col_caret_on
         self._col_caret_paint()
-        self._col_caret_blink()
+        self._col_caret_ensure()
 
     def _col_caret_recycle(self):
         """把上一批条收进池子（不销毁：滚动和闪烁每半拍都走一遍创建销毁太吵）。"""
@@ -5855,13 +7918,8 @@ class UIMixin(object):
 
     def _col_caret_hide(self):
         """退出列模式：收起所有条、停掉定时器、把系统光标还回来。"""
-        job = getattr(self, "_col_caret_job", None)
-        if job is not None:
-            try:
-                self.root.after_cancel(job)
-            except Exception:
-                pass
-        self._col_caret_job = None
+        self._col_caret_cancel()
+        self._col_caret_on = True       # 下次进入列模式从「亮」相位起步
         self._col_caret_recycle()
         self._col_caret_restore_insert()
 
@@ -6395,6 +8453,62 @@ class UIMixin(object):
         self.toggle_todo_at(idx)
         return "break"
 
+    def _on_paste_fix_todo(self, event=None):
+        """粘贴后把这一段里的方框标签补齐（复制过来的待办勾不了，就是缺这一步）。
+
+        Tk 的 <<Copy>> 只带走字符，剪贴板里没有标签 —— 粘进来的 `⬜ / ✅` 是**裸
+        字符**：比旁边的方框小一号、颜色也淡，而且点击切换的 tag_bind 挂在 todo
+        标签上，点它完全没反应。
+
+        实例绑定先于类绑定（真正执行插入的那条）跑，此刻文字还没进来，所以只能先
+        记下行号，等这一轮事件处理完（after_idle）再扫；多扫一行是照顾「以换行
+        结尾的粘贴」—— 末尾那行空行也是这次粘出来的。
+        """
+        try:
+            start = int(str(self.text.index("insert")).split(".")[0])
+        except Exception:
+            return None
+
+        def fix():
+            try:
+                end = int(str(self.text.index("insert")).split(".")[0])
+                last = int(str(self.text.index("end-1c")).split(".")[0])
+            except Exception:
+                return
+            self._sync_todo_lines(start, min(last, end + 1))
+
+        self._after_idle(fix)
+        return None
+
+    def _on_click_untagged_todo(self, event=None):
+        """兜底：点到「有方框字符、却没有 todo 标签」的地方，就地补上并切换。
+
+        tag_bind 挂在标签上，没标签就点不动。粘贴已经由 `_on_paste_fix_todo` 补过，
+        但撤销、早期数据、别处拷来的文本都可能留下裸方框 —— 逐个入口去堵总会漏，
+        这里按**字符**兜住：点到的不是方框、或者标签齐全（那属于 tag_bind 的活）
+        就立刻放行。
+
+        实例绑定先于类绑定，而 tag_bind 是在类绑定里跑的，两者不会同时触发。
+        """
+        if event is None or self._alt_down(event):
+            return None              # Alt 是矩形选择（列模式）的起手，别抢
+        try:
+            idx = self.text.index("@%d,%d" % (event.x, event.y))
+            tags = self.text.tag_names(idx)
+        except Exception:
+            return None
+        if "todo" in tags or "todo_done" in tags:
+            return None              # 正常路径：交给 tag_bind
+        try:
+            if self.text.get(idx, idx + " +1c") not in TODO_MARKS:
+                return None
+        except Exception:
+            return None
+        if self._refuse_readonly():
+            return "break"
+        self.toggle_todo_at(idx)     # 切换时会把 todo / todo_done 一起补齐
+        return "break"
+
     def _add_hr(self, index=tk.END):
         """在正文里放一条分割线（结构项 ["hr"] 的渲染出口）。"""
         hr = HRule(self.text, self)
@@ -6486,7 +8600,11 @@ class UIMixin(object):
             last = int(str(self.text.index("end-1c")).split(".")[0])
         except Exception:
             return
-        for ln in range(1, last + 1):
+        self._sync_todo_lines(1, last)
+
+    def _sync_todo_lines(self, first, last):
+        """给 first..last 行（含）的行首方框补标签；越界交给 _tag_todo_prefix 自己忽略。"""
+        for ln in range(max(1, int(first)), int(last) + 1):
             self._tag_todo_prefix(str(ln))
 
     def _todo_gap_end(self, ln, txt, col):
@@ -6601,8 +8719,10 @@ class UIMixin(object):
             w = self.editor_frame.winfo_width() or 900
         right = TEXT_PADX
         try:
-            sb = self._vscroll.winfo_reqwidth() or 12
-            right = max(right, sb + JUMP_GAP + JUMP_W + 6)
+            # 浮动导航（JUMP_W）停在滚动条左侧：右占位 = 滚动条 + 间隙 + 胶囊。
+            # 用常量算，别读 winfo_reqwidth —— place 是显式给宽，reqwidth 取的是
+            # 主题默认值，两者在 166% 下能差 2~3px。
+            right = max(right, VSCROLL_W + JUMP_GAP + JUMP_W + 6)
         except Exception:
             pass
         return max(120, w - TEXT_PADX - right - 2)
@@ -6632,18 +8752,18 @@ class UIMixin(object):
     def _mk_code_ui(self, parent):
         """工具栏的「代码块」按钮：花括号图标 + 下拉箭头，点开选语言后插入代码块。
 
-        旧版画的是文字「{}」+ 箭头：文字按整行行距垂直居中，而花括号的字形重心
-        偏低（墨迹中心比其它图标低约 2.5px），看起来整枚图标沉到按钮下缘——
-        用户一眼就发现它和其它工具栏图标不在一条水平线上。
+        图标走**位图**（`icon/px/<size>/code.png`，运行时按皮肤染色），矢量画法
+        只作兜底。原因：Tk 8.6 的 canvas 线条没有抗锯齿，16px 的花括号整枚只有
+        2 个灰阶，腰部和斜线全是台阶 —— 用户报的「不够圆滑」就是这个。位图由
+        `target/make_brace_icon.py` 按 4 倍超采样画好再缩档，边缘是渐变的灰。
 
-        现在这个是**矢量**花括号（不是字形），与同排图标共用「16px 方格 + 1.7px
-        描边 + 同一中心线」的规范，墨迹中心与 todo / numbered 实测偏差 ≤0.5px，
-        不会再沉底；形状本身按 16px 的可见性重新定了几何（见 widgets._draw_icon）。
+        更早的两版：文字「{}」（字形重心偏低 2.5px，整枚图标沉到按钮下缘）、
+        纯矢量花括号（位置对齐了，但仍是硬边）。
         """
         b = RoundButton(parent, self.pal, "", command=self._pick_code_lang,
-                        icon="code", tail="chevron", padx=8, pady=4,
-                        base=self._tool_bg())
-        b.pack(side=tk.LEFT, padx=2, pady=3)
+                        icon="code", icon_img="code.png", tail="chevron",
+                        padx=dpi.px(8), pady=dpi.px(4), base=self._tool_bg())
+        b.pack(side=tk.LEFT, padx=dpi.px(2), pady=dpi.px(3))
         b.bind_events()
         self.fmt_buttons.append(b)
         self._add_tip(b, "代码块（选择语言）")
@@ -6672,8 +8792,37 @@ class UIMixin(object):
             m.add(label, command=lambda k=key: self.insert_code(k))
         m.popup(x, y)
 
-    def _center_dialog(self, win, min_w=360):
+    def _dlg_frame_pad(self, win):
+        """弹窗的系统标题栏 / 边框尺寸 (单侧边框宽, 顶部标题栏高)，像素。
+
+        `winfo_reqwidth/reqheight` 只算**客户区**，而 `wm geometry` 的 x/y 指的是
+        **窗口矩形**（含标题栏）的左上角 —— 夹取位置时必须按整窗算，否则窗口会从
+        屏幕上沿 / 下沿漏出去一条。量法：`winfo_rootx/y` 是客户区左上角，
+        `winfo_x/y` 是窗口矩形左上角，差就是装饰。
+
+        窗口还没映射（withdraw 中）时两个数都是默认值、差为 0，退回按实测值估：
+        Win10/11 在 100% 缩放下标题栏 31px、左右边框各 8px，跟着 `dpi.px` 一起放大。
+        """
+        try:
+            dx = int(win.winfo_rootx()) - int(win.winfo_x())
+            dy = int(win.winfo_rooty()) - int(win.winfo_y())
+        except Exception:
+            dx = dy = 0
+        if dx <= 0:
+            dx = dpi.px(8)
+        if dy <= 0:
+            dy = dpi.px(31)
+        return dx, dy
+
+    def _center_dialog(self, win, min_w=360, fit_body=None, center_y=None):
         """对话框居中于主窗口，并保证最小宽度。
+
+        `center_y=True`：整窗（含系统标题栏与下边框）**垂直居中**于主窗口客户区，
+        给顶栏那三张信息型弹窗（全局设置 / 数据管理 / 关于）用 —— 它们是一套，
+        高度各不相同，1/3 摆法会让窗口明显偏上、彼此切换时上下边缘还在跳。
+        默认 False 仍是老规则「纵向 1/3 处」，小型输入对话框放那儿更顺手。
+        `None` 表示沿用这张窗上次的选择，内容变高后重复居中（见 `_relayout_dialog`）
+        不会悄悄跳回 1/3。
 
         Windows 的标题栏文字会按窗口宽度裁剪：simpledialog 只按 prompt 计算宽度，
         窗口太窄时「新建文件夹」会被裁成只剩一个「新」字，所以这里自己定宽。
@@ -6681,8 +8830,17 @@ class UIMixin(object):
         可重复调用：内容高度变化后（如设置里预览文字换行变高）再调一次，
         窗口会跟着伸缩并保持居中——否则固定高度的窗口会把底部按钮挤出画面。
         先放开 minsize 下限，否则上一次的大尺寸会把窗口卡住、缩不回来。
+
+        `fit_body(avail_h)`：内容区的最终高度由调用方定（可选）。它拿到的是这块屏上
+        **客户区最多能有多高**，据此把内容收进可滚区、按需压扁，返回后这里按新高度
+        重摆一次。**每次都调**，不只装不下时才调 —— 可滚容器的画布有个默认高度
+        （Tk Canvas 默认 265px），不喂给它的话，装得下的内容也会缩在一个小窗口里滚。
+        不给这个回调就是老行为：内容多高窗口多高，装不下就溢出屏幕。
         """
         try:
+            if center_y is None:
+                center_y = bool(getattr(win, "_dlg_center_y", False))
+            win._dlg_center_y = bool(center_y)
             # 首次居中时窗口多半还没映射：geometry 请求和 WM 的 map 存在竞态，
             # Windows 偶尔会无视定位请求、把窗口摆在默认位置（0,0 附近）。
             # 先收起来再摆位、最后再放出来，WM 显示时拿到的就是最终位置。
@@ -6697,12 +8855,32 @@ class UIMixin(object):
             ry = self.root.winfo_rooty() or 0
             rw = self.root.winfo_width() or 900
             rh = self.root.winfo_height() or 620
-            x = max(rx + (rw - ww) // 2, 0)
-            y = max(ry + (rh - wh) // 3, 0)
-            scr_h = win.winfo_screenheight() or 0
-            if scr_h:
-                # 别让对话框底缘（含确定/取消按钮）伸出屏幕
-                y = min(y, max(scr_h - wh, 0))
+            # 夹到**主窗口所在那块屏**的工作区：多屏时 rx 可能是负数（副屏在主屏
+            # 左侧），而 Tk 的 winfo_screenheight 只报主屏 —— 老写法 max(..., 0)
+            # 会把副屏上弹出的对话框硬拽到主屏左上角。
+            area = work_area_at(rx + rw // 2, ry + rh // 2, fallback=win)
+            # 标题栏不属于客户区，但确实占屏幕：按整窗夹，见 _dlg_frame_pad
+            dx, dy = self._dlg_frame_pad(win)
+            pad = dpi.px(6)
+            _x, _y, avail_h = fit_dialog(area, 0, 0, ww, wh, dx, dy, pad)
+            if fit_body is not None:
+                # 让调用方按这块屏的可用高度定内容高度：装得下就等高于内容
+                # （滚动条自动隐藏），装不下（副屏 738 高 vs 设置窗 735 + 31 标题栏）
+                # 就收进可滚区，底部的按钮行始终留在屏幕里。
+                fit_body(avail_h)
+                win.update_idletasks()
+                ww = max(win.winfo_reqwidth(), min_w)
+                wh = win.winfo_reqheight()
+            # 横向居中于主窗口。纵向两档：小型输入窗仍按 1/3 处摆；信息型三张窗
+            # 按整窗（含标题栏 / 下边框）精确垂直居中 —— 中心对齐后，三张窗来回
+            # 切换只有上下边缘对称伸缩，不再整块往上偏。
+            if center_y:
+                y_want = ry + dialog_center_y(rh, wh, dy, dx)
+            else:
+                y_want = ry + (rh - wh) // 3
+            x, y, _avail = fit_dialog(
+                area, rx + (rw - ww) // 2, y_want,
+                ww, wh, dx, dy, pad)
             win.geometry("%dx%d+%d+%d" % (ww, wh, x, y))
             win.minsize(ww, wh)
             if mapped:
@@ -6727,19 +8905,20 @@ class UIMixin(object):
         """对话框底部的按钮行；cancel_cmd 为 None 时只显示一个确定按钮。"""
         p = self.pal
         btns = tk.Frame(win, bg=p["top"])
-        btns.pack(fill=tk.X, padx=16, pady=(12, 14))
+        btns.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(12), dpi.px(14)))
         if cancel_cmd is not None:
-            tk.Button(btns, text="取消", width=8, bg=p["editor"], fg=p["soft"], bd=1,
+            tk.Button(btns, text="取消", width=8, bg=p["editor"], fg=p["soft"], bd=dpi.px(1),
                       relief=tk.FLAT, font=(FONT[0], 11), cursor="hand2",
                       activebackground=p["hover"], activeforeground=p["selfg"],
-                      command=cancel_cmd).pack(side=tk.RIGHT, padx=(8, 0))
+                      command=cancel_cmd).pack(side=tk.RIGHT, padx=(dpi.px(8), 0))
         # 确定：默认强调色实底（危险操作改红色），悬停/按下向深色递进（不闪系统灰）
         ok_bg = MENU_DANGER if danger else p["accent"]
+        ok_fg = on_accent(ok_bg)     # 金色 accent 上白字会糊，按对比度取白 / 墨
         ok_active = (_mix_hex(ok_bg, "#000000", 0.12) if danger
                      else _mix_hex(p["accent"], p["selfg"], BTN_PRESS_MIX))
-        tk.Button(btns, text=ok_text, width=8, bg=ok_bg, fg="#ffffff", bd=0,
+        tk.Button(btns, text=ok_text, width=8, bg=ok_bg, fg=ok_fg, bd=0,
                   relief=tk.FLAT, font=(FONT[0], 11, "bold"), cursor="hand2",
-                  activebackground=ok_active, activeforeground="#ffffff",
+                  activebackground=ok_active, activeforeground=on_accent(ok_active),
                   command=ok_cmd).pack(side=tk.RIGHT)
         return btns
 
@@ -6761,7 +8940,7 @@ class UIMixin(object):
             wrap = DLG_TEXT_W
         tk.Label(win, text=message, bg=p["top"], fg=p["text"], anchor="w",
                  justify="left", font=(FONT[0], 12), wraplength=wrap).pack(
-                     fill=tk.X, padx=16, pady=(16, 6))
+                     fill=tk.X, padx=dpi.px(16), pady=(dpi.px(16), dpi.px(6)))
 
         def ok(_=None):
             res["v"] = True
@@ -6789,14 +8968,17 @@ class UIMixin(object):
         p = self.pal
         win = self._dlg_body(title)
         body = tk.Frame(win, bg=p["top"])
-        body.pack(fill=tk.X, padx=16, pady=(16, 6))
+        body.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(16), dpi.px(6)))
         color = MENU_DANGER if kind == "error" else p["accent"]
-        ic = tk.Canvas(body, width=20, height=20, bd=0,
+        ic = tk.Canvas(body, width=dpi.px(20), height=dpi.px(20), bd=0,
                        highlightthickness=0, bg=p["top"])
-        ic.pack(side=tk.LEFT, anchor="n", padx=(0, 10), pady=(1, 0))
-        ic.create_oval(1, 1, 19, 19, fill=color, outline="")
-        ic.create_text(10, 10, text=("!" if kind == "error" else "i"),
-                       fill="#ffffff", font=(FONT[0], 11, "bold"))
+        ic.pack(side=tk.LEFT, anchor="n", padx=(0, dpi.px(10)), pady=(dpi.px(1), 0))
+        # 画布已经是 dpi.px(20) 的物理尺寸，圆和字都要按同一比例落位
+        ic.create_oval(dpi.px(1), dpi.px(1), dpi.px(19), dpi.px(19),
+                       fill=color, outline="")
+        ic.create_text(dpi.px(10), dpi.px(10),
+                       text=("!" if kind == "error" else "i"),
+                       fill=on_accent(color), font=(FONT[0], 11, "bold"))
         tk.Label(body, text=message, bg=p["top"], fg=p["text"], anchor="w",
                  justify="left", font=(FONT[0], 12), wraplength=DLG_TEXT_W).pack(
                      side=tk.LEFT, fill=tk.X, expand=True)
@@ -6824,13 +9006,13 @@ class UIMixin(object):
         win = self._dlg_body(title)
         res = {"v": None}
         tk.Label(win, text=prompt, bg=p["top"], fg=p["text"], anchor="w",
-                 font=(FONT[0], 12)).pack(fill=tk.X, padx=16, pady=(16, 6))
+                 font=(FONT[0], 12)).pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(16), dpi.px(6)))
         var = tk.StringVar(value=initial)
         e = tk.Entry(win, textvariable=var, font=(FONT[0], 12), bg=p["editor"],
                      fg=p["text"], insertbackground=p["accent"], relief=tk.FLAT,
-                     highlightthickness=1, highlightbackground=p["line"],
+                     highlightthickness=dpi.px(1), highlightbackground=p["line"],
                      highlightcolor=p["accent"], width=30)
-        e.pack(fill=tk.X, padx=16, ipady=5)
+        e.pack(fill=tk.X, padx=dpi.px(16), ipady=dpi.px(5))
 
         def ok(_=None):
             res["v"] = var.get().strip()
@@ -6864,12 +9046,12 @@ class UIMixin(object):
 
         def field(label, var, focus=False):
             tk.Label(win, text=label, bg=p["top"], fg=p["text"], anchor="w",
-                     font=(FONT[0], 11)).pack(fill=tk.X, padx=16, pady=(10, 2))
+                     font=(FONT[0], 11)).pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(10), dpi.px(2)))
             e = tk.Entry(win, textvariable=var, font=(FONT[0], 12), bg=p["editor"],
                          fg=p["text"], insertbackground=p["accent"], relief=tk.FLAT,
-                         highlightthickness=1, highlightbackground=p["line"],
+                         highlightthickness=dpi.px(1), highlightbackground=p["line"],
                          highlightcolor=p["accent"], width=34)
-            e.pack(fill=tk.X, padx=16, ipady=5)
+            e.pack(fill=tk.X, padx=dpi.px(16), ipady=dpi.px(5))
             if focus:
                 e.focus_set()
             return e
@@ -6878,7 +9060,7 @@ class UIMixin(object):
         field("链接地址（http:// 可以省略）", uv, focus=True)
         hint = tk.Label(win, text="", bg=p["top"], fg=MENU_DANGER, anchor="w",
                         font=(FONT[0], 10))
-        hint.pack(fill=tk.X, padx=16, pady=(4, 0))
+        hint.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(4), 0))
 
         def ok(_=None):
             u = uv.get().strip()
@@ -6899,10 +9081,10 @@ class UIMixin(object):
         btns = self._dlg_buttons(win, ok, cancel)
         if removable:
             rm = tk.Button(btns, text="取消链接", width=9, bg=p["editor"], fg=MENU_DANGER,
-                           bd=1, relief=tk.FLAT, font=(FONT[0], 11), cursor="hand2",
+                           bd=dpi.px(1), relief=tk.FLAT, font=(FONT[0], 11), cursor="hand2",
                            activebackground=p["hover"], activeforeground=MENU_DANGER,
                            command=remove)
-            rm.pack(side=tk.LEFT, padx=(0, 8))
+            rm.pack(side=tk.LEFT, padx=(0, dpi.px(8)))
         win.bind("<Return>", ok)
         win.bind("<Escape>", cancel)
         win.protocol("WM_DELETE_WINDOW", cancel)
@@ -6914,10 +9096,12 @@ class UIMixin(object):
         win.wait_window()
         return res["v"]
 
-    def _ask_password(self, title, prompt):
+    def _ask_password(self, title, prompt, allow_empty=False):
         """口令输入框（掩码显示）。返回原样字符串，取消返回 None。
 
         不 strip：口令里的空格是口令的一部分，替用户"顺手清理"会让他下次登不进来。
+        `allow_empty=True` 时允许直接确定空口令（返回 ""），用于「导出备份」——
+        空口令 = 只做编码、不加密，导入时无需口令。取消仍返回 None，两者不混。
         """
         p = self.pal
         win = self._dlg_body(title)
@@ -6928,17 +9112,17 @@ class UIMixin(object):
         except Exception:
             wrap = DLG_TEXT_W
         tk.Label(win, text=prompt, bg=p["top"], fg=p["text"], anchor="w",
-                 justify="left", font=(FONT[0], 12), wraplength=min(wrap, 380)).pack(
-                     fill=tk.X, padx=16, pady=(16, 8))
+                 justify="left", font=(FONT[0], 12), wraplength=min(wrap, dpi.px(380))).pack(
+                     fill=tk.X, padx=dpi.px(16), pady=(dpi.px(16), dpi.px(8)))
         var = tk.StringVar()
         e = tk.Entry(win, textvariable=var, show="\u2022", font=(FONT[0], 12),
                      bg=p["editor"], fg=p["text"], insertbackground=p["accent"],
-                     relief=tk.FLAT, highlightthickness=1,
+                     relief=tk.FLAT, highlightthickness=dpi.px(1),
                      highlightbackground=p["line"], highlightcolor=p["accent"], width=30)
-        e.pack(fill=tk.X, padx=16, ipady=5)
+        e.pack(fill=tk.X, padx=dpi.px(16), ipady=dpi.px(5))
 
         def ok(_=None):
-            if not var.get():
+            if not var.get() and not allow_empty:
                 return
             res["v"] = var.get()
             win.destroy()
@@ -6975,7 +9159,7 @@ class UIMixin(object):
         res = {"v": None}
         tk.Label(win, text=prompt, bg=p["top"], fg=p["text"], anchor="w", justify="left",
                  font=(FONT[0], 12), wraplength=DLG_TEXT_W).pack(
-                     fill=tk.X, padx=16, pady=(16, 8))
+                     fill=tk.X, padx=dpi.px(16), pady=(dpi.px(16), dpi.px(8)))
 
         ids = {f["id"] for f in options}
         # parent 不在这批候选里的就是「这一层的根」。源文件夹整支已被排除，正常不会
@@ -6986,10 +9170,10 @@ class UIMixin(object):
         rows, order = {}, []
 
         outer = tk.Frame(win, bg=p["line"])     # 外面套 1px 描边框：内容不再是一片白
-        outer.pack(fill=tk.X, padx=16, pady=(0, 6))
+        outer.pack(fill=tk.X, padx=dpi.px(16), pady=(0, dpi.px(6)))
         panel = ScrollPanel(outer, p["editor"], p)
         panel.canvas.configure(height=min(max(len(options), 4), 9) * PICK_ROW_H)
-        panel.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        panel.pack(fill=tk.BOTH, expand=True, padx=dpi.px(1), pady=dpi.px(1))
 
         def kids_of(pid):
             return [f for f in options if f.get("parent") == pid]
@@ -7048,11 +9232,11 @@ class UIMixin(object):
             for a, is_last_branch in enumerate(anc_last):
                 x = a * PICK_INDENT + PICK_INDENT / 2.0
                 c.create_line(x, 0, x, mid if is_last_branch else PICK_ROW_H,
-                              fill=p["line"], width=1)
+                              fill=p["line"], width=dpi.fx(1))
             if anc_last:      # 根目录不画线，它上面没有东西
                 up = (depth - 1) * PICK_INDENT + PICK_INDENT / 2.0
                 c.create_line(up, mid, depth * PICK_INDENT + PICK_INDENT / 2.0, mid,
-                              fill=p["line"], width=1)
+                              fill=p["line"], width=dpi.fx(1))
 
         def make_row(f, depth, anc_last):
             kids = kids_of(f["id"])
@@ -7062,14 +9246,15 @@ class UIMixin(object):
                            cursor="hand2")
             row.pack(fill=tk.X)
             row.pack_propagate(False)
-            sp = tk.Frame(row, width=8, bg=p["editor"])
+            sp = tk.Frame(row, width=dpi.px(8), bg=p["editor"])
             sp.pack(side=tk.LEFT, fill=tk.Y)
             guide = tk.Canvas(row, width=depth * PICK_INDENT + PICK_INDENT // 2,
                               height=PICK_ROW_H, bd=0, highlightthickness=0,
                               bg=p["editor"])
             guide.pack(side=tk.LEFT)
             draw_guide(guide, anc_last, depth)
-            # 箭头：与左栏同一个控件（24×28 可点区、悬停浮底片），叶子同宽占位
+            # 箭头：与左栏同一个控件（24×28 可点区、16×16 悬停底片），叶子同宽占位
+            # ⚠️ 这里行高只有 PICK_ROW_H=28，可点区会顶满一整行，别再放大底片
             tw = TwistyButton(row, self.pal, collapsed=fid in collapsed,
                               available=bool(kids), base=p["editor"],
                               command=(lambda i=fid: toggle(i)))
@@ -7079,12 +9264,13 @@ class UIMixin(object):
             ic.pack(side=tk.LEFT, pady=pad_y)
             (self._draw_folder_icon_open if (kids and fid not in collapsed)
              else self._draw_folder_icon_closed)(ic)
+            dpi.scale_canvas(ic)
             name = tk.Label(row, text=f["name"], bg=p["editor"], fg=p["text"],
                             font=(FONT[0], 12), anchor="w")
-            name.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+            name.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(dpi.px(6), 0))
             cnt = tk.Label(row, text="%d 条" % len(self.folder_notes(fid)),
                            bg=p["editor"], fg=p["soft"], font=(FONT[0], 11),
-                           anchor="e", padx=10)
+                           anchor="e", padx=dpi.px(10))
             cnt.pack(side=tk.RIGHT)
             rows[fid] = {"row": row, "kids": bool(kids)}
             order.append(fid)

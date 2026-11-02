@@ -16,7 +16,8 @@ import json
 import time
 import sqlite3
 
-from md_conv import TODO_OFF, TODO_ON, TODO_MARKS, TODO_GAP, TODO_GAP_TAG, LI_INDENT
+from md_conv import (TODO_OFF, TODO_ON, TODO_MARKS, TODO_GAP, TODO_GAP_TAG,
+                     LI_INDENT, list_marker)
 import secret
 
 
@@ -64,6 +65,127 @@ def _resolve_db():
 
 # 应用中文名（窗口标题 / 示例笔记 / 导出备份文件名统一取这里）
 APP_NAME = "素笺"
+
+# 笔记列表左缘那条色条的颜色（8 色，明度接近，只用来「区分」而不是「报警」）。
+# 顺序即分配顺序：新建笔记时挑当前用得最少的那个，用完一轮才重复。
+NOTE_COLORS = ("#e0524f", "#e08a3c", "#4f9e63", "#3f9b96",
+               "#4a86d8", "#6a6fd0", "#9166c9", "#d2679b")
+
+
+def pick_note_color(notes, folder=None, avoid=()):
+    """挑一个颜色：先看「这个文件夹里还没出现过」，再看全局用得最少。
+
+    为什么不用「按 id 取哈希」：哈希会撞色，几十条笔记里同一个红色出现三四次，
+    「每条一个颜色」的目的就失效了。为什么不用「按行号轮转」：拖动排序、改标题
+    都会让整列换色，用户会以为笔记串了。存在笔记里 + 挑最少的，才同时满足
+    「稳定」和「均匀」。
+
+    为什么要先按文件夹筛一层：列表一次只显示一个文件夹，只按全局用量挑的话，
+    8 色分给 20 条笔记后，某个文件夹里恰好摊到两条同色的概率不低（用户看到的
+    就是「这两条一模一样」）。先避开本文件夹已用的颜色，撞色就只会出现在笔记数
+    超过 8 条、或者跨文件夹的「全部」视图里 —— 那种情况本来就不可能全不同。
+
+    `avoid` 是「这条笔记上下两位的颜色」：新建的笔记插在它们之间，撞上谁都得
+    再改一次，不如一开始就挑开。
+    """
+    cnt_all, cnt_here = {}, {}
+    for n in notes or ():
+        c = n.get("color")
+        if c not in NOTE_COLORS:
+            continue
+        cnt_all[c] = cnt_all.get(c, 0) + 1
+        if folder and n.get("folder") == folder:
+            cnt_here[c] = cnt_here.get(c, 0) + 1
+    pool = [c for c in NOTE_COLORS if not cnt_here.get(c)] or list(NOTE_COLORS)
+    if avoid:
+        # 只剩一两个候选色时不再强求：宁可撞色，也不能返回 None
+        pool = [c for c in pool if c not in avoid] or pool
+    # 同票（都是 0 或都一样多）时按调色板顺序，保证同一份数据每次算出同一个颜色
+    return min(pool, key=lambda c: (cnt_all.get(c, 0), NOTE_COLORS.index(c)))
+
+
+def ensure_note_color(n, notes=None):
+    """取这条笔记的色条颜色；没有就现挑一个写回 `n["color"]`。
+
+    颜色是**笔记的属性**而不是渲染参数：同一篇笔记无论在「全部」还是某个文件夹里、
+    无论排序怎么变，颜色都不变。老库 / 导入的笔记第一次渲染时就地补上。
+    """
+    c = n.get("color")
+    if c in NOTE_COLORS:
+        return c
+    c = pick_note_color(notes if notes is not None else [n], n.get("folder"))
+    n["color"] = c
+    return c
+
+
+def _ensure_note_colors(data):
+    """给所有还没有颜色的笔记补上颜色（老库升级 / 导入后）。返回是否改动过。"""
+    notes = data.get("notes") or []
+    changed = False
+    for n in notes:
+        if n.get("color") in NOTE_COLORS:
+            continue
+        n["color"] = pick_note_color(notes, n.get("folder"))
+        changed = True
+    return changed
+
+
+def _pick_distinct(cnt, prev, nxt):
+    """挑一个既不等于上一条、也尽量不等于下一条的颜色。
+
+    避下一条只是为了少改一次 —— A A B 这种排列里，中间那条若不看下一条，
+    很可能被挑成 B，于是又和后面撞上、还得再改一次。它不参与「不相邻」的保证。
+    """
+    pool = [c for c in NOTE_COLORS if c != prev]
+    if nxt is not None:
+        better = [c for c in pool if c != nxt]
+        if better:
+            pool = better
+    return min(pool, key=lambda c: (cnt.get(c, 0), NOTE_COLORS.index(c)))
+
+
+def resolve_adjacent_colors(ordered, persist=True):
+    """按**列表的显示顺序**消除相邻同色，返回 ({笔记 id: 颜色}, 是否有改动)。
+
+    为什么需要这一步：8 色分给 12 条笔记必然有重复色（调色板的上限），但「重复」
+    本身不致命 —— 致命的是两条同色的笔记紧挨着，扫一眼就像同一篇。所以只要撞上，
+    改后面那一条、前面的不动；从前往后走一遍，每一条都只受「上一条」这一个约束，
+    走完必定没有相邻同色（路径图的贪心着色，8 色绰绰有余）。
+
+    顺序由调用方给（也就是 visible_notes() 排出来的那个顺序），这里不猜排序：
+    置顶 / 星标会改变分组，搜索会改变成员，同一份颜色放在不同的行序里「相邻」
+    关系完全不同。
+
+    `persist=False` 只算这一次显示用什么颜色、不写回笔记：搜索结果是一份临时的
+    行序，为它改库里的颜色，一打字整列就跟着换色。
+    """
+    out = {}
+    seq = list(ordered or ())
+    if not seq:
+        return out, False
+    cur = [n.get("color") if n.get("color") in NOTE_COLORS else None
+           for n in seq]
+    cnt = {}
+    for c in cur:
+        if c:
+            cnt[c] = cnt.get(c, 0) + 1
+    changed = False
+    prev = None
+    for i, n in enumerate(seq):
+        c = cur[i]
+        nxt = cur[i + 1] if i + 1 < len(cur) else None
+        if c is None or c == prev:
+            if c is not None:
+                cnt[c] -= 1
+            c = _pick_distinct(cnt, prev, nxt)
+            cnt[c] = cnt.get(c, 0) + 1
+            changed = True
+            if persist:
+                n["color"] = c
+        out[n.get("id")] = c
+        prev = c
+    return out, changed
+
 
 # 加密笔记未解锁时，列表标题只露首字、后跟一个星号（如「周*」）——数据在
 # secret.HINT_KEY 里随密文块走；UI 层与动作层共用这份定义。
@@ -124,49 +246,133 @@ def _cb(checked, tags=()):
             ["t", TODO_GAP, [TODO_GAP_TAG]]]
 
 
-# 内置说明笔记里的快捷键表：(键, 说明)。顺序按「先文件、再格式、后结构、最后编辑」排，
-# 与 README 的快捷键表保持一致——改一处就要同步另一处，否则文档和程序里的说明会打架。
-SAMPLE_KEYS = [
-    ("Ctrl+N", "新建笔记"),
-    ("Ctrl+S", "立即保存"),
-    ("Ctrl+,", "打开全局设置"),
-    ("Ctrl+B", "加粗"),
-    ("Ctrl+I", "斜体"),
-    ("Ctrl+U", "下划线"),
-    ("Ctrl+Shift+S", "删除线"),
-    ("Ctrl+E", "行内代码"),
-    ("Ctrl+1", "一级标题"),
-    ("Ctrl+2", "二级标题"),
-    ("Ctrl+0", "回到正文"),
-    ("Ctrl+Shift+K", "插入代码块"),
-    ("Ctrl+Shift+T", "插入待办"),
-    ("Ctrl+Shift+-", "插入分割线"),
-    ("Ctrl+K", "插入 / 编辑超链接"),
-    ("Ctrl+D", "复制整行：光标所在行整行复制一份插到下面"),
-    ("Ctrl+Y", "删除整行：光标所在行整行删掉"),
-    ("Ctrl+Z", "撤销"),
-    ("Ctrl+Shift+Z", "重做"),
-    ("Ctrl+Tab", "下一个标签页（Ctrl+PageDown 同）"),
-    ("Ctrl+Shift+Tab", "上一个标签页（Ctrl+PageUp 同）"),
-    ("Ctrl+W", "关闭当前标签页"),
+# 内置说明笔记的快捷键表：(分组名, [(键, 说明), …])。
+#
+# 为什么分组：这张表 25 条，平铺成一张表就是「一屏扫不完的键名墙」——第一次打开的人
+# 找不到入口，回头查某个键也只能逐行读。按「文件 / 格式 / 插入 / 编辑与查找 / 标签页」
+# 切成五段，每段前面一行小标题，才扫得动。
+#
+# 顺序与 docs/快捷键.md 的表一致 —— 改一处就要同步另一处，
+# 否则程序里的说明和文档会打架。
+SAMPLE_KEY_GROUPS = [
+    ("文件", [
+        ("Ctrl+N", "新建笔记"),
+        ("Ctrl+S", "立即保存"),
+        ("Ctrl+,", "打开全局设置"),
+    ]),
+    ("格式", [
+        ("Ctrl+B", "加粗"),
+        ("Ctrl+I", "斜体"),
+        ("Ctrl+U", "下划线"),
+        ("Ctrl+Shift+S", "删除线"),
+        ("Ctrl+E", "行内代码"),
+        ("Ctrl+1", "一级标题"),
+        ("Ctrl+2", "二级标题"),
+        ("Ctrl+0", "回到正文"),
+    ]),
+    ("插入", [
+        ("Ctrl+Shift+K", "插入代码块"),
+        ("Ctrl+Shift+T", "插入待办"),
+        ("Ctrl+Shift+-", "插入分割线"),
+        ("Ctrl+K", "插入 / 编辑超链接"),
+    ]),
+    ("编辑与查找", [
+        ("Ctrl+Z", "撤销"),
+        ("Ctrl+Shift+Z", "重做"),
+        ("Ctrl+D", "复制整行：光标所在行整行复制一份插到下面"),
+        ("Ctrl+Y", "删除整行：光标所在行整行删掉"),
+        ("Ctrl+F", "本篇内查找（Enter 下一条 / Esc 关闭）"),
+        ("Ctrl+H", "查找替换（Enter 替换当前 / Ctrl+Enter 全部替换）"),
+        ("Ctrl+Shift+D", "涂鸦标注（Esc 退出，笔迹不保存）"),
+    ]),
+    ("标签页", [
+        ("Ctrl+Tab", "下一个标签页（Ctrl+PageDown 同）"),
+        ("Ctrl+Shift+Tab", "上一个标签页（Ctrl+PageUp 同）"),
+        ("Ctrl+W", "关闭当前标签页"),
+    ]),
 ]
 
-# markdown 输入快捷的说明表：键位说明 + 敲完之后的形态
+# markdown 输入快捷的说明表：(敲什么, 变成什么)。
+# 「右移两格」这类说明不再写进表里：新版每一条都是真列表项，缩进已经摆在眼前。
+# ⚠️ 说明要短：正文是 wrap=WORD，一行约 35 个汉字，长句子会在空格处提前折行。
 SAMPLE_MD = [
-    ("# + 空格", "一级标题"),
-    ("## + 空格", "二级标题"),
-    ("- + 空格", "项目符号（●），* 和 + 也可以，右移两格"),
-    ("-> + 空格", "三角列表（➤），右移两格"),
-    ("-[] + 空格", "待办勾选框，右移两格，接着写事情，点框即勾选"),
-    ("1. + 空格", "有序列表，右移两格，回车自动递增"),
-    ("> + 空格", "引用块：文字缩进两格，回车继续引用、空行再回车跳出"),
-    ("``` + 空格", "代码块；后面跟语言名（```python）敲回车也行"),
-    ("---", "回车后变成一条分割线"),
-    ("[文字](网址)", "超链接：敲空格或回车后只剩文字，悬停可看地址并修改"),
-    ("date()", "敲空格或回车 → 当前日期，如 2026-10-23"),
-    ("datetime()", "敲空格或回车 → 当前时刻，如 2026-10-23 18:50:25"),
-    ("$5+6=", "敲空格 → 出结果并去掉 $（5+6= 11）：四则、括号、^ 幂、% 取模、tan30；只认 $ 开头的"),
+    ("# + 空格", "一级标题，## 是二级"),
+    ("- + 空格", "项目符号，* 和 + 也行"),
+    ("-> + 空格", "三角列表"),
+    ("-[] + 空格", "待办勾选框，点框即勾选"),
+    ("1. + 空格", "有序列表，回车自动递增"),
+    ("> + 空格", "引用块，空行回车跳出"),
+    ("``` + 空格", "代码块，可跟语言名"),
+    ("---", "敲完回车，变成分割线"),
+    ("[文字](网址)", "超链接，只剩文字，悬停看地址"),
+    ("date()", "当前日期，如 2026-11-05"),
+    ("datetime()", "当前时刻，如 2026-11-05 09:30"),
+    ("$5+6=", "算结果并去掉 $，只认 $ 开头"),
 ]
+
+
+# ---------- 说明笔记的排版积木 ----------
+# 正文是「逐字符一项」的存储形状，手拼会写成一坨难读的列表字面量。
+# 这三个小工具把它拉回「一行 / 一条 / 一分隔」的层次，改文案时只动下面的段落函数。
+def _line(s="", tags=()):
+    """一行文字（自动补换行）。"""
+    return _t(s, tags) + [["t", "\n", []]]
+
+
+def _k(s):
+    """一枚键盘键：行内代码样式（等宽 + 灰底），与快捷键表里的键帽同一副长相。
+
+    正文里提到键的地方也用它，读的人不必再从「中文句子」里挑出哪截是要按的。
+    """
+    return _t(s, ["icode"])
+
+
+def _item(lead, desc="", kind="bullet"):
+    """一条列表项：标记 + 加粗小标题 + 说明。
+
+    标记取自 md_conv.list_marker，与编辑器敲出来的字符**一字不差** ——
+    说明笔记里的「● 」长什么样，用户照着敲就是什么样。
+    desc 既可以是字符串，也可以是一串 run（要在句子里夹键帽时传后者）。
+    """
+    out = _t(list_marker(kind), ())
+    if lead:
+        out += _t(lead, ["bold"])
+        out += _t("　")
+    out += _t(desc) if isinstance(desc, str) else list(desc)
+    return out + [["t", "\n", []]]
+
+
+def _hr():
+    """一条分割线。
+
+    block 后面必须紧跟一个换行：Tk 的嵌入窗口是「行内元素」，其后若直接接正文，
+    文字会贴在分割线右边；"\n" 把这一行封口，分割线才独占一行。
+    """
+    return [["hr"], ["t", "\n", []]]
+
+
+def _sample_intro():
+    """开篇：大标题 + 一张引用块做的「简介纸片」。"""
+    return (_line("欢迎使用" + APP_NAME, ["title"])
+            + _line("这是一款复刻 macOS 笔记的桌面程序：用你电脑自带的 Python 就能跑，"
+                    "所有内容自动存在本地的 notes_data.db，不联网、不上传。", ["quote"])
+            + [["t", "\n", []]])
+
+
+def _sample_start_section():
+    """「三步开始」：第一次打开的人真正要做的三件事。
+
+    ⚠️ 正文是 wrap=WORD（见 app_ui 里 Text 的构造）：Tk 只在**空格**处断行，
+    一串没有空格的汉字算一个「词」，整块放不下就整体掉到下一行，上一行留出一大段
+    空白。所以说明笔记里每一条都要短（正文一屏约 35 个汉字宽，一条控制在 30 字内），
+    否则宽窗口还行、把两栏拖窄就参差不齐。
+    """
+    out = _line("三步开始", ["h2"])
+    out += _item("写点什么", _k("Ctrl+N") + _t(" 新建一篇，停手半秒自动保存"))
+    out += _item("分门别类", "左侧是文件夹，右键可建子文件夹，笔记能拖进去")
+    out += _item("换个样子", _t("顶栏切深浅色，字体字号在全局设置里") + _k("Ctrl+,"))
+    out += [["t", "\n", []]]
+    return out
 
 
 def _sample_md_section():
@@ -175,118 +381,83 @@ def _sample_md_section():
     单独成节而不是塞进快捷键表：前者靠「在行首敲符号」，后者靠「按组合键」，
     学习路径不一样，混在一张表里反而不好找。
     """
-    out = _t("markdown 快捷输入", ["h2"]) + [["t", "\n", []]]
-    out += _t("在段首敲下面这些再敲一个空格，格式当场生效（最后几条不限行首，是敲完那一刻展开）：")
+    out = _line("markdown 快捷输入", ["h2"])
+    out += _line("在段首敲下面的符号，再敲一个空格，格式当场生效：")
+    half = len(SAMPLE_MD) - 3        # 最后三条不限行首，另起一段说明
+    for k, desc in SAMPLE_MD[:half]:
+        out += _item(k, desc)
     out += [["t", "\n", []]]
-    for k, desc in SAMPLE_MD:
-        out += _t(k, ["bold"]) + _t("　" + desc) + [["t", "\n", []]]
+    out += _line("下面几条不用在行首，敲完那一刻就展开：")
+    for k, desc in SAMPLE_MD[half:]:
+        out += _item(k, desc)
     out += [["t", "\n", []]]
     return out
 
 
 def _sample_keys_section():
-    """「快捷键」小节：H2 标题 + 一行一条（键名加粗）+ 结尾说明。
+    """「快捷键」小节：H2 + 五个分组，键名是行内代码做的「键帽」。
 
     seed 与老库升级共用这一段，避免「新库有表、老库没有」的分叉。
-    键与说明之间用全角空格隔开：中英混排下半角空格忽宽忽窄，全角空格稳定得多，
-    也不依赖等宽字体。
+    键名用行内代码（等宽 + 灰底）而不是加粗：加粗的键名和加粗的说明文字同权重，
+    一眼分不出哪个是要按的键；灰底小块像键盘上的一枚键帽，扫表时自动跳过。
+    键与说明之间用全角空格隔开：中英混排下半角空格忽宽忽窄，全角空格稳定得多。
+    键名右侧补空格补到等宽，说明文字才落在同一条竖线上 —— 24 行的表，起点参差
+    读起来就是「没排过版」。
     """
-    out = _t("快捷键", ["h2"]) + [["t", "\n", []]]
-    for k, desc in SAMPLE_KEYS:
-        out += _t(k, ["bold"]) + _t("　" + desc) + [["t", "\n", []]]
-    out += [["t", "\n", []]]
-    out += _t("这篇说明是内置的，不能编辑也不能删除；想试这些快捷键，新建一篇笔记即可。")
-    out += [["t", "\n", []]]
-    out += _t("想给某篇笔记上锁：在左侧列表里右键 →「设置加密口令…」，"
-              "之后每次打开都要输入口令。")
-    out += [["t", "\n", []]]
+    out = _line("快捷键", ["h2"])
+    width = max(len(k) for _name, rows in SAMPLE_KEY_GROUPS for k, _d in rows)
+    for name, rows in SAMPLE_KEY_GROUPS:
+        out += _line(name, ["bold"])
+        for k, desc in rows:
+            out += (_t(k + " " * (width - len(k)), ["icode"])
+                    + _t("　" + desc) + [["t", "\n", []]])
+        out += [["t", "\n", []]]
+    return out
+
+
+def _sample_footer():
+    """结尾：这篇为什么只读，以及上锁的入口。
+
+    ⚠️ 别在句子里塞「 → 」这类两侧带空格的箭头：正文是 wrap=WORD，空格就是断行点，
+    整句会在箭头后面断掉，下一行从行首重新开始，读起来像是两段。
+    """
+    out = _line("关于这篇说明", ["h2"])
+    out += _line("这篇是内置说明：不能编辑，也不能删除，随时回来查快捷键。"
+                 "想在真笔记里试手，新建一篇随便敲。")
+    out += _line("给笔记上锁：列表里右键「设置加密口令…」。")
+    out += _line("之后每次打开都要先输入口令。")
     return out
 
 
 def sample_content():
-    """内置示例笔记的完整正文（seed 与老库升级都从这一份取）。"""
-    return (_t("欢迎使用" + APP_NAME, ["title"]) + [["t", "\n", []]]
-            + _t("这是一款复刻 macOS 笔记的桌面程序，用你电脑自带的 Python 即可运行。")
-            + [["t", "\n", []]]
-            + _t("试着用顶部工具栏：加粗、标题、待办清单都支持。")
-            + [["t", "\n", []]]
-            + _t("所有内容自动保存在本地 notes_data.db。")
-            + [["t", "\n", []]]
-            + _sample_md_section()
-            + _sample_keys_section())
-
-
-def _drop_legacy_sample_line(content):
-    """摘掉旧版那行速记（`快捷键：Ctrl+N 新建、…`），返回新的 content。
-
-    注意 content 是「逐字符一项」存的，一条文字段落由几十个单字项拼成，不能拿
-    单项文本去 startswith——那只会在第一个字上就判错。这里先把连续的字项拼成
-    段落，再判断整段前缀，命中就整段连它后面的换行一起丢掉。
-    """
-    out = []
-    i, n = 0, len(content)
-    while i < n:
-        it = content[i]
-        if it[0] != "t" or it[1] == "\n":
-            out.append(it)
-            i += 1
-            continue
-        j = i
-        seg = []
-        while j < n and content[j][0] == "t" and content[j][1] != "\n":
-            seg.append(content[j])
-            j += 1
-        if not "".join(x[1] for x in seg).startswith("快捷键：Ctrl+N"):
-            out.extend(seg)
-        elif j < n and content[j][0] == "t" and content[j][1] == "\n":
-            j += 1                      # 连同段落后的换行一起摘掉，免得多出一个空行
-        i = j
-    return out
-
-
-# 说明笔记里由程序生成的尾部小节的标题；整段替换时用来找边界
-_SAMPLE_TAIL_HEADINGS = ("markdown 快捷输入", "快捷键")
-
-
-def _content_before_sample_tail(content):
-    """返回「程序生成的尾部小节」之前的内容；没有这些小节时返回 None。
-
-    边界要同时认两个标题：只认「快捷键」的话，新版把 markdown 那节当成用户内容
-    保留下来，再追加一次就重复了。
-    """
-    for i, it in enumerate(content):
-        if not (it[0] == "t" and len(it) > 2 and "h2" in it[2]):
-            continue
-        seg, j = [], i
-        while j < len(content) and content[j][0] == "t" and content[j][1] != "\n":
-            seg.append(content[j][1])
-            j += 1
-        if "".join(seg).strip() in _SAMPLE_TAIL_HEADINGS:
-            return content[:i]
-    return None
+    """内置说明笔记的完整正文（seed 与老库升级都从这一份取）。"""
+    return (_sample_intro()
+            + _sample_start_section() + _hr()
+            + _sample_md_section() + _hr()
+            + _sample_keys_section() + _hr()
+            + _sample_footer())
 
 
 def _upgrade_sample_note(data):
-    """老库里的内置说明笔记同步尾部两节（markdown 说明 + 快捷键表）。
+    """老库里的内置说明笔记跟着程序走：正文与 `sample_content()` 不一致就整篇换掉。
 
-    幂等，但用的是**整段替换**而不是只追加：新增的快捷键（Ctrl+E 之类）要能进到
-    老库里已经存在的这一节，只追加会永远停在旧表上。
-    替换范围限定在程序生成的两节之内，前面的说明文字原样保留。
+    为什么是整篇替换，而不是像以前那样「只换尾部两节」：
+      * 这篇笔记在编辑器里是**只读**的，用户改不动它，所以不存在「保留用户改动」
+        这种顾虑 —— 以前留着前半段，只是为了让「很早以前的版本」里那几句手写
+        正文不至于丢，代价是每次重排版式（比如这次把简介改成引用块、加了「三步
+        开始」）老用户都看不到，新旧两版并存，说明文档自己先不一致了；
+      * 只换尾部还得按标题找边界，标题一改就找不着，得再补一份「老标题」清单。
+    整篇对齐一份 `sample_content()`，判据只剩「内容一样不一样」，没有边界可错。
+
+    幂等：内容一致就原样返回 False（不触发落库）。
     """
-    want_tail = _sample_md_section() + _sample_keys_section()
+    want = sample_content()
     changed = False
     for n in data.get("notes", []):
         if not n.get("sample"):
             continue
-        content = list(n.get("content") or [])
-        head = _content_before_sample_tail(content)
-        if head is None:
-            # 还没有这两节（很老的库）：先摘掉旧版那行速记，再接上新表
-            new = _drop_legacy_sample_line(content) + want_tail
-        else:
-            new = head + want_tail
-        if new != content:
-            n["content"] = new
+        if list(n.get("content") or []) != want:
+            n["content"] = want
             changed = True
     return changed
 
@@ -321,6 +492,12 @@ def plain_of(n):
 # 顺序即左栏的显示顺序；名字是唯一真相，老库里的旧名由 _ensure_smart_folders 统一。
 SMART_FOLDERS = ("f_all", "f_star", "f_lock")
 SMART_FOLDER_NAMES = {"f_all": "全部笔记", "f_star": "星标笔记", "f_lock": "加密笔记"}
+
+# 「系统」文件夹：程序自带的一格，专放内置说明笔记。用户不能改名、删除、移动它，
+# 也不能把别的笔记拖进去。判定只认固定 id —— 它本来就是唯一的，多存一个字段
+# 只会多出一份「id 说一套、标记说另一套」的可能（三个智能分类也这么做）。
+SYSTEM_FOLDER = "f_system"
+SYSTEM_FOLDER_NAME = "系统"
 
 # 文件夹最多几层（根层算第 1 层）。再深就缩进到看不见了，超过即不准再往下建。
 # 这个值只在建子文件夹时判定一次，读到更深的历史数据（比如别人导来的备份）时
@@ -527,6 +704,78 @@ def _ensure_smart_folders(data):
     return changed
 
 
+def _ensure_system_folder(data):
+    """确保「系统」文件夹在、名字对、排在第一个真实文件夹位（「工作」上面），且说明笔记归它。返回是否有改动。
+
+    幂等，启动时每次跑一遍：老库里说明笔记还躺在「工作」下，导入来的备份压根没有
+    这一格，两处都靠它补齐。**只补不删** —— 用户笔记与其它文件夹一个都不动。
+
+    两个方向都要管：
+      * 带 `sample` 标记的说明笔记 → 收进系统区；
+      * 普通笔记误落进系统区（导入的脏数据 / 早先手动拖进去的）→ 退回「工作」。
+        系统区承诺「只放这一篇」，留一条别人的笔记在这儿，用户既不能改名也不能
+        删除这个文件夹，那篇笔记就等于被锁进了一个动不了的角落。
+    """
+    old = data.get("folders") or []
+    folders = [f for f in old if isinstance(f, dict)]
+    changed = len(folders) != len(old)
+    me = next((f for f in folders if f.get("id") == SYSTEM_FOLDER), None)
+    if me is None:
+        me = {"id": SYSTEM_FOLDER, "name": SYSTEM_FOLDER_NAME}
+        folders.append(me)
+        changed = True
+    if me.get("name") != SYSTEM_FOLDER_NAME:
+        me["name"] = SYSTEM_FOLDER_NAME
+        changed = True
+    # 系统区只能是根层的一格：parent / collapsed / smart 都是「普通文件夹」或
+    # 「筛选视图」才有的状态，落在它身上会让渲染和收放逻辑各说各话
+    for k in ("parent", "collapsed", "smart"):
+        if k in me:
+            me.pop(k)
+            changed = True
+    # 永远占着「第一个真实文件夹」这一格（紧接三个智能分类、在「工作」上面）：
+    # 它是常驻的一格，位置得钉住 —— 新建文件夹排到它后面，备份导入也可能把它带到
+    # 中间来，这里统一收口
+    rest = [f for f in folders if f is not me]
+    pos = next((i for i, f in enumerate(rest)
+                if f.get("id") not in SMART_FOLDERS), len(rest))
+    reordered = rest[:pos] + [me] + rest[pos:]
+    if reordered != folders:
+        folders = reordered
+        changed = True
+    data["folders"] = folders
+    # 普通笔记的退路：优先「工作」；本机连它都没有（极端的导入场景）就退到
+    # 第一个普通文件夹 —— 总比留一格指向不存在的文件夹、笔记只在「全部」里可见好
+    real_ids = [f["id"] for f in folders if f.get("id") != SYSTEM_FOLDER]
+    fallback = "f_work" if "f_work" in real_ids else (real_ids[0] if real_ids else "f_work")
+    for n in (data.get("notes") or []):
+        if not isinstance(n, dict):
+            continue
+        if n.get("sample"):
+            if n.get("folder") != SYSTEM_FOLDER:
+                n["folder"] = SYSTEM_FOLDER
+                changed = True
+        elif n.get("folder") == SYSTEM_FOLDER:
+            n["folder"] = fallback
+            changed = True
+    return changed
+
+
+def new_sample_note(now=None, folder=SYSTEM_FOLDER):
+    """造一篇内置说明笔记。
+
+    三个地方用它，必须共用同一份：新库 seed、导入备份后重建（备份里不导出说明笔记，
+    见 backup.encode）、以及测试。分开写的话「新库里的说明」和「恢复出来的说明」
+    迟早长成两副样子。
+
+    默认落在「系统」文件夹：它只装这一篇，和用户自己的笔记区隔开。
+    """
+    now = now if now is not None else time.time() * 1000
+    return {"id": uid(), "folder": folder, "sample": True,
+            "content": sample_content(),
+            "pinned": True, "starred": False, "created": now, "updated": now}
+
+
 def seed():
     now = time.time() * 1000
     return {
@@ -534,13 +783,12 @@ def seed():
             {"id": "f_all", "name": "全部笔记", "smart": True},
             {"id": "f_star", "name": "星标笔记", "smart": True},
             {"id": "f_lock", "name": "加密笔记", "smart": True},
+            {"id": SYSTEM_FOLDER, "name": SYSTEM_FOLDER_NAME},
             {"id": "f_work", "name": "工作"},
             {"id": "f_life", "name": "个人"},
         ],
         "notes": [
-            {"id": uid(), "folder": "f_work", "sample": True,
-             "content": sample_content(),
-             "pinned": True, "starred": False, "created": now, "updated": now},
+            new_sample_note(now),
             {"id": uid(), "folder": "f_work",
              "content": (_t("周会待办", ["title"]) + [["t", "\n", []]]
                          + _cb(False) + _t("整理上周进度\n")
@@ -698,9 +946,11 @@ class Store(object):
                 created REAL,
                 updated REAL,
                 pos     INTEGER DEFAULT 0,
+                ord     REAL,
                 sample  INTEGER DEFAULT 0,
                 links   TEXT,
-                sec     TEXT);
+                sec     TEXT,
+                color   TEXT);
             CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder);
             CREATE INDEX IF NOT EXISTS idx_notes_star   ON notes(starred);
         """)
@@ -708,6 +958,11 @@ class Store(object):
         cols = {r[1] for r in c.execute("PRAGMA table_info(notes)")}
         if "pos" not in cols:
             c.execute("ALTER TABLE notes ADD COLUMN pos INTEGER DEFAULT 0")
+        # 老库补列（本版新增 ord）：笔记列表的「手动顺序」。
+        # 必须允许 NULL —— 老数据的值是 NULL，排序时才回落到「更新时间」；
+        # 若给个 DEFAULT 0，所有老笔记会挤在同一档，顺序反而全乱。
+        if "ord" not in cols:
+            c.execute("ALTER TABLE notes ADD COLUMN ord REAL")
         # 老库补列（本版新增 sample）：内置示例笔记的「不可删除」标记。
         # 没有它的话保护只在当前这次运行里有效，重启后就丢了。
         if "sample" not in cols:
@@ -720,6 +975,10 @@ class Store(object):
             c.execute("ALTER TABLE notes ADD COLUMN links TEXT")
         if "sec" not in cols:
             c.execute("ALTER TABLE notes ADD COLUMN sec TEXT")
+        # 老库补列（本版新增 color）：笔记列表左缘那条色条的颜色（#rrggbb）。
+        # 留空即可 —— 读出来是 NULL，界面第一次渲染时由 ensure_note_color 补上。
+        if "color" not in cols:
+            c.execute("ALTER TABLE notes ADD COLUMN color TEXT")
         # 老库补列（本版新增多级文件夹）：
         #   parent    —— 父文件夹 id（根层为空）
         #   collapsed —— 树里这一支收起来了没有（纯展示状态，但要跟走窗口重开）
@@ -812,9 +1071,9 @@ class Store(object):
                 f["collapsed"] = True
             d["folders"].append(f)
         for (nid, folder, content, plain, pinned, starred, created, updated,
-             sample, links, sec) in self.con.execute(
+             ordv, sample, links, sec, color) in self.con.execute(
                 "SELECT id, folder, content, plain, pinned, starred, created, updated,"
-                " sample, links, sec FROM notes ORDER BY pos, id"):
+                " ord, sample, links, sec, color FROM notes ORDER BY pos, id"):
             sealed = False
             sec_obj = None
             if sec:
@@ -832,6 +1091,10 @@ class Store(object):
             note = {"id": nid, "folder": folder, "content": body,
                     "pinned": bool(pinned), "starred": bool(starred),
                     "created": created or 0.0, "updated": updated or 0.0}
+            if ordv is not None:
+                note["order"] = ordv
+            if color:
+                note["color"] = color
             if sample:
                 note["sample"] = True
             if sealed:
@@ -888,9 +1151,9 @@ class Store(object):
                 sec_obj = n.get("sec")
                 sealed = isinstance(sec_obj, dict) and bool(sec_obj.get("data"))
                 c.execute("INSERT OR REPLACE INTO notes"
-                          "(id,folder,content,plain,pinned,starred,created,updated,pos,sample,"
-                          " links,sec)"
-                          " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                          "(id,folder,content,plain,pinned,starred,created,updated,pos,"
+                          " ord,sample,links,sec,color)"
+                          " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                           (nid, n.get("folder"),
                            "" if sealed else json.dumps(n.get("content") or [],
                                                         ensure_ascii=False),
@@ -898,9 +1161,11 @@ class Store(object):
                            1 if n.get("pinned") else 0,
                            1 if n.get("starred") else 0,
                            n.get("created") or 0.0, n.get("updated") or 0.0, pos,
+                           n.get("order"),
                            1 if n.get("sample") else 0,
                            json.dumps(n.get("links") or {}, ensure_ascii=False),
-                           json.dumps(sec_obj, ensure_ascii=False) if sealed else ""))
+                           json.dumps(sec_obj, ensure_ascii=False) if sealed else "",
+                           n.get("color") or ""))
                 self._sig[nid] = sig
                 self._pos[nid] = pos
             for k in [k for k in self._sig if k not in seen]:
@@ -931,6 +1196,7 @@ class Store(object):
         sec = n.get("sec")
         return (n.get("updated"), n.get("starred"), n.get("pinned"),
                 n.get("folder"), len(n.get("content") or []), n.get("sample"),
+                n.get("order"), n.get("color"),
                 len(n.get("links") or {}),
                 (sec or {}).get("tag") if isinstance(sec, dict) else None)
 

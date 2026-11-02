@@ -12,17 +12,21 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog
 
+import dpi
+import win_frame
+
 from store import (APP_NAME, uid, _t, seed, store, save_data,
-                   SMART_FOLDERS,
+                   SMART_FOLDERS, SYSTEM_FOLDER, pick_note_color, _ensure_note_colors,
                    folder_children, folder_depth, folder_ancestors,
                    set_all_collapsed, subtree_ids, MAX_FOLDER_DEPTH)
-from theme import FONT
+from theme import FONT, on_accent
 from widgets import (CodeBlock, HRule, PopupMenu,
                      DLG_TEXT_W, SAVE_DEBOUNCE_MS, ROW_REFRESH_DEBOUNCE_MS,
-                     _png_icon_photo, _popover_bg, _popover_border, _mix_hex)
+                     _icon_photo, _popover_bg, _popover_border, _mix_hex)
 from md_conv import (detect_prefix, find_urls, find_time_call, is_hr, parse_fence,
                      MD_LINK_RE,
                      LI_INDENT, BULLET_MARK, NUM_MARK, TRI_MARK, split_list_prefix,
+                     LIST_KINDS, list_marker, renumber_prefix,
                      TODO_OFF, TODO_LEGACY, TODO_MARKS, TODO_GAP, TODO_GAP_TAG, _MARK_NBSP)
 import exporter
 import pdf_export
@@ -32,6 +36,7 @@ import calc
 import alarm
 from mention import find_mention, note_url, note_id_of_url, mention_text, rank
 from mention_ui import MentionPopup
+from doodle import DoodleLayer
 
 
 # 导出格式：(键, 对话框里的名字, 扩展名)
@@ -53,9 +58,11 @@ class ActionsMixin(object):
     def export_data(self):
         """把文件夹 + 笔记 + 外观偏好导出成一份备份（backup.py 的 schema 2）。
 
-        默认写 `.json.gz`：这类文件基本只用来存档/换机，压完通常只有明文的
-        三分之一；想「打开看看、手改两笔」就选第二项 `.json`。两种都能直接导回来
-        —— 读的时候按文件头的魔数判断压没压过，后缀被改过也认。
+        默认导出 `.json.gz`（沿用一直以来的文件格式）：整份是真 gzip，解压后
+        是**编码容器** —— 里面只有一串 data，看不到笔记正文；导入时程序按文件头
+        自动还原，不需要用户记开关。口令可以留空（留空就是纯编码、谁都能导回来）；
+        填了口令才是真加密，导入时要输同一个口令。明文 `.plain.json` 只作为
+        调试 / 人肉改数据的显式选项保留。
 
         格式本身（版本闸门、校验和、正文压缩、prefs/state 分离）全在 backup.py，
         这里不拼 JSON：导出端和导入端必须是同一套定义，各写一半就会重演
@@ -66,24 +73,42 @@ class ActionsMixin(object):
         path = filedialog.asksaveasfilename(
             parent=self.root, title="导出备份", defaultextension=".json.gz",
             initialfile=default, initialdir=os.path.expanduser("~"),
-            filetypes=[("素笺备份（压缩，体积小）", "*.json.gz"),
-                       ("JSON 备份（明文，可读可手改）", "*.json"),
+            filetypes=[("素笺备份（编码 / 加密，压缩）", "*.json.gz"),
+                       ("明文 JSON（调试 / 手工修改）", "*.plain.json"),
                        ("所有文件", "*.*")])
         if not path:
             return
+        plain = str(path).lower().endswith(".plain.json")
+        password = ""
+        if not plain:
+            pw = self._ask_password(
+                "导出备份",
+                "备份内容会被编码：解压后打开也看不到笔记正文，\n"
+                "导入时程序会自动还原。\n\n"
+                "直接点确定 = 不设口令（推荐）；\n"
+                "填写口令 = 额外加密，导入时需要它，忘记后无法恢复。",
+                allow_empty=True)
+            if pw is None:
+                return
+            password = pw
         try:
-            nbytes = backup.dump(path, backup.encode(self.data))
+            payload = backup.encode(self.data)
+            nbytes = (backup.dump(path, payload) if plain else
+                      backup.dump_container(path, payload, password=password))
         except Exception as e:
             self._show_error("导出失败", "写入文件失败：\n%s" % e)
             return
+        kind = "明文 JSON" if plain else ("已加密" if password else "已编码")
         # 外观是不是真的带上了，如实报告：没配过就一个字都不提，别让人以为存了
         nprefs = sum(1 for k in backup.PREFS_KEYS
                      if k in (self.data.get("settings") or {}))
         tail = "，含 %d 项外观设置" % nprefs if nprefs else ""
+        # 数量按**实际导出**的算，不是库里的条数：内置说明笔记不进备份（见 backup.encode），
+        # 拿 len(self.data["notes"]) 报数会多出 1 条，用户去文件里数却对不上。
         self._show_info("导出完成",
-                        "已导出 %d 个文件夹、%d 条笔记%s\n文件大小 %.0f KB\n%s" %
-                        (len(self.data["folders"]), len(self.data["notes"]), tail,
-                         nbytes / 1024.0, path))
+                        "已导出 %d 个文件夹、%d 条笔记%s\n%s · %.0f KB\n%s" %
+                        (len(payload["folders"]), len(payload["notes"]), tail,
+                         kind, nbytes / 1024.0, path))
 
     # ---------- 导出当前笔记（纯文本 / Markdown / PDF） ----------
 
@@ -149,19 +174,36 @@ class ActionsMixin(object):
         self._show_info("导出完成", "已导出为 %s（%s）\n%s" % (label, extra, path))
 
     def import_data(self):
-        """从备份导入：schema 1 / 2、压缩 / 明文都认；可选「覆盖」或「合并」。
+        """从备份导入：schema 1 / 2、压缩 / 明文 / 编码 / 加密都认；可选覆盖或合并。
 
-        解码（版本闸门、校验和、正文还原）在 backup.decode，落库前的整理在
+        编码态（空口令导出）在 backup.load 里按文件头自动剥壳还原，用户零感知；
+        只有加密态会抛 NeedPassword，这里才弹一次口令框。旧备份、pending 兜底
+        快照同样走原来的路径。解码在 backup.decode，落库整理在
         backup.overwrite / backup.merge —— 这里只负责问路和收尾。
         """
         path = filedialog.askopenfilename(
             parent=self.root, title="选择备份文件", initialdir=os.path.expanduser("~"),
-            filetypes=[("素笺备份", "*.json *.json.gz *.gz"), ("所有文件", "*.*")])
+            filetypes=[("素笺备份", "*.json *.json.gz *.gz *.sjbak"),
+                       ("所有文件", "*.*")])
         if not path:
             return
         try:
             raw = backup.load(path)
             d, warnings = backup.decode(raw)
+        except backup.NeedPassword:
+            pw = self._ask_password(
+                "导入备份", "这份备份设了口令，请输入导出时用的口令：")
+            if pw is None:
+                return
+            try:
+                raw = backup.load(path, password=pw)
+                d, warnings = backup.decode(raw)
+            except backup.BackupError as e:
+                self._show_error("导入失败", str(e))
+                return
+            except Exception as e:
+                self._show_error("导入失败", "文件读不出来：\n%s" % e)
+                return
         except backup.BackupError as e:
             self._show_error("导入失败", str(e))
             return
@@ -180,6 +222,9 @@ class ActionsMixin(object):
         before = len(self.data["notes"])
         new = (backup.overwrite(d, self.data) if mode == "overwrite"
                else backup.merge(d, self.data))
+        # 备份里没带颜色的（老备份 / 别的工具造的）在落库前一次补齐：
+        # 放到界面渲染时补的话，颜色只留在内存里，下次启动重新分配还可能换色
+        _ensure_note_colors(new)
         try:
             store().reset(new)
         except Exception as e:
@@ -199,8 +244,11 @@ class ActionsMixin(object):
                          len(new["folders"]), len(new["notes"]), tail))
 
     def clear_all_data(self):
-        """清空所有数据并回到初次打开的状态（4 个文件夹 + 示例笔记）。"""
-        mine = [f for f in self.data["folders"] if not f.get("smart")]
+        """清空所有数据并回到初次打开的状态（工作 / 个人 + 系统 + 智能分类 + 示例笔记）。"""
+        # 系统区不在「自建文件夹」之列：清空后它照样在（seed 里带着），
+        # 统计里不能算进去，否则弹窗说删 3 个、清完还剩 1 个。
+        mine = [f for f in self.data["folders"]
+                if not f.get("smart") and f.get("id") != SYSTEM_FOLDER]
         n_notes = len(self.data["notes"])
         if not self._ask_confirm(
                 "清空数据",
@@ -212,11 +260,13 @@ class ActionsMixin(object):
                 "再次确认",
                 "这是最后一次确认：\n"
                 "所有笔记与文件夹都会被永久删除，无法恢复，\n"
-                "程序会回到初次打开时的状态（4 个文件夹）。\n\n"
+                "程序会回到初次打开时的状态：\n"
+                "「工作」「个人」两个文件夹，加上自带的「系统」。\n\n"
                 "确认清空？",
                 ok_text="确认清空", danger=True):
             return
         new = seed()
+        _ensure_note_colors(new)      # 示例笔记也要有各自的色条
         store().reset(new)
         self._apply_new_data(new)
         self._show_info("已完成", "数据已清空，界面已恢复到初始状态。")
@@ -307,15 +357,57 @@ class ActionsMixin(object):
         n = next((x for x in self.data["notes"] if x["id"] == nid), None)
         if not n:
             return
+        if n.get("sample"):
+            # 兜底（拖拽入口已经拦过）：内置说明留在「系统」里，别处留不住它
+            return
         n["folder"] = fid
         n["updated"] = __import__("time").time() * 1000
+        n["order"] = self.top_note_order(n)
         save_data(self.data)
-        # 就地刷新列表与所有文件夹计数（不重建文件夹行 → 不闪烁）
+        # 就地刷新列表与所有文件夹计数（不重建文件夹行 → 不闪烁）。
+        # ⚠️ 计数徽章是 _refresh_folder_counts 里的 CountBadge（Canvas 自绘的圆 /
+        # 胶囊），**没有 -text 选项**：早先这里手写 lbl.configure(text=...) 会抛
+        # TclError，拖拽移动和右键移动都断在这一步（后面的选中收口根本没跑）。
         self.refresh_notes()
-        for f in self.data["folders"]:
-            lbl = self._folder_count_labels.get(f["id"])
-            if lbl:
-                lbl.configure(text=str(len(self.folder_notes(f["id"]))))
+        self._refresh_folder_counts()
+
+    # ---------- 右键「移动到文件夹…」 ----------
+
+    def _note_move_targets(self, exclude=()):
+        """这一篇笔记可以移去哪些文件夹，返回文件夹字典列表（不是 id）。
+
+        智能分类是筛出来的视图、「系统」只装内置说明，两处都留不住普通笔记；
+        单篇移动时再把自己当前的「家」排掉 —— 选它等于什么都没发生，还会
+        白白改一遍 updated / order，把这篇顶到列表最前面。
+        """
+        excl = set(exclude)
+        return [f for f in self.data["folders"]
+                if not f.get("smart") and f["id"] not in SMART_FOLDERS
+                and f["id"] != SYSTEM_FOLDER and f["id"] not in excl]
+
+    def _popup_move_note(self, nid):
+        """右键 → 从整棵文件夹树里挑一个目标，把这一篇搬过去。
+
+        与拖拽的分工：拖拽是「左栏看得见就顺手一扔」，收着的子层得先逐级展开；
+        这里直接用 `_ask_choose_folder` 的树，收起来的分支在弹窗里也能展开选。
+        真正改数据仍走 `_move_note_to_folder`（同一套落库 / 计数 / 刷新），
+        收口走 `_select_after_move` —— 移动后默认选中这一条，在当前视图里看不见
+        就跟着切到新家，和拖拽落定后的手感一致。
+        """
+        n = next((x for x in self.data["notes"] if x["id"] == nid), None)
+        if not n or self.is_sample_note(n):
+            return
+        targets = self._note_move_targets(exclude=[n.get("folder")])
+        if not targets:
+            self._show_info("提示", "没有其他文件夹可以移入。")
+            return
+        title = self.trunc(self.title_of(n), 24)
+        tid = self._ask_choose_folder("移动到文件夹",
+                                      "把「%s」移动到：" % title, targets)
+        if not tid or tid == n.get("folder"):
+            return
+        self._move_note_to_folder(nid, tid)
+        self._select_after_move(nid)
 
     def _popup(self, event, nid):
         n = next((x for x in self.data["notes"] if x["id"] == nid), None)
@@ -345,7 +437,22 @@ class ActionsMixin(object):
         if goto:
             m.add(goto[0], icon="folder", enabled=goto[1],
                   command=lambda: self._popup_goto_folder(nid))
-        if not self.is_sample_note(n):
+        # 「移动到文件夹…」：拖拽只认左栏**此刻看得见**的那一行，收着的子层得先
+        # 逐级展开；右键给一条直达路径，从整棵文件夹树里挑（见 _popup_move_note）。
+        # 不能移的两种情况照系统文件夹菜单的规矩办：项留着、置灰、写明原因，
+        # 凭空少一行会让人以为「是不是没点到」。
+        sample = self.is_sample_note(n)
+        targets = ([] if sample else
+                   self._note_move_targets(exclude=[n.get("folder")]))
+        if sample:
+            move_label = "移动到文件夹…（内置说明不可移）"
+        elif not targets:
+            move_label = "移动到文件夹…（没有其他文件夹）"
+        else:
+            move_label = "移动到文件夹…"
+        m.add(move_label, icon="move", enabled=bool(targets),
+              command=lambda: self._popup_move_note(nid))
+        if not sample:
             sealed = secret.is_blob(n.get("sec"))
             if sealed:
                 unlocked = bool(self._note_key(nid) and n.get("content"))
@@ -361,7 +468,6 @@ class ActionsMixin(object):
                 m.add("设置加密口令…", icon="lock",
                       command=lambda: self.set_note_password(nid))
         m.add_separator()
-        sample = self.is_sample_note(n)
         m.add("删除笔记（内置示例，不可删）" if sample else "删除笔记",
               icon="trash", danger=True, enabled=not sample,
               command=lambda: self._popup_delete(nid))
@@ -500,14 +606,28 @@ class ActionsMixin(object):
         if pop is None or not pop.is_open():
             if hit[1]:                       # 已经带查询词了：说明不是刚敲的空格
                 return
-            pop = MentionPopup(self.root, self.pal, on_pick=self._mention_pick)
+            # 弹框自带搜索框：键盘输入走 on_query 重算候选；关面板走 on_close
+            # 统一收口；关闭时把焦点还给正文，避免打字落进已销毁的输入框。
+            pop = MentionPopup(self.root, self.pal,
+                               on_pick=self._mention_pick,
+                               on_query=self._mention_apply_query,
+                               on_close=self._mention_close,
+                               focus_back=self.text)
             self._mention_pop = pop
             self._mention_start = hit[0]
             x, y = self._mention_anchor_xy()
             pop.open(self._mention_candidates(""), x, y)
             return
         self._mention_start = hit[0]
-        pop.set_items(self._mention_candidates(hit[1]))
+        if not pop.search_focused():
+            pop.set_query(hit[1])
+
+    def _mention_apply_query(self, query):
+        """搜索框里（或正文里同步过来的）查询词变了：重算候选。"""
+        pop = getattr(self, "_mention_pop", None)
+        if pop is None or not pop.is_open():
+            return
+        pop.set_items(self._mention_candidates(query))
 
     def _mention_recheck(self, event=None):
         """光标动了（方向键 / 滚轮）：推迟到 idle 再核对 —— 实例绑定先于类绑定，
@@ -518,7 +638,13 @@ class ActionsMixin(object):
         return None
 
     def _mention_refilter(self):
-        """正文又变了一个字：重算候选（走 <<Modified>>，中文输入也能跟得上）。"""
+        """正文又变了一个字：重算候选（走 <<Modified>>，中文输入也能跟得上）。
+
+        ⚠️ 焦点在弹框搜索框里时，正文里的 `@ ` 不会变（用户敲的字都进了搜索框），
+        此时拿正文的空查询词去同步会**盖掉**用户已经输入的搜索词。只更新插入起点，
+        查询词交给搜索框自己的 on_query。焦点没抢到（仍在正文）时走老路：把正文
+        里的查询词同步进搜索框，顺带触发同一份重算。
+        """
         pop = getattr(self, "_mention_pop", None)
         if pop is None or not pop.is_open():
             return
@@ -527,7 +653,8 @@ class ActionsMixin(object):
             self._mention_close()
             return
         self._mention_start = hit[0]
-        pop.set_items(self._mention_candidates(hit[1]))
+        if not pop.search_focused():
+            pop.set_query(hit[1])
 
     def _mention_at(self, ln=None):
         """光标前是不是一个待补全的 `@查询`；是就返回 (起点 index, 查询词)。"""
@@ -618,6 +745,9 @@ class ActionsMixin(object):
             self.text.see("insert")
         finally:
             self.text.edit_separator()
+        # 焦点可能刚从弹框的搜索框还回来，也可能一直在正文；显式落一次，
+        # 保证插入完接着打字是打在 `@标题` 后面，而不是留在已销毁的输入框上。
+        self.text.focus_set()
         self.mark_modified()
 
     def _mention_key(self, event):
@@ -650,6 +780,37 @@ class ActionsMixin(object):
         if pop is not None:
             pop.close()
         self._mention_start = None
+
+    # ---------- 涂鸦标注（临时模态，关闭即丢弃） ----------
+
+    def doodle_active(self):
+        """涂鸦蒙层是否开着。所有会换掉正文的入口都拿它守卫。"""
+        d = getattr(self, "_doodle", None)
+        return bool(d is not None and d.active)
+
+    def toggle_doodle(self):
+        """⋯ 菜单 / Ctrl+Shift+D：进入或退出涂鸦标注。
+
+        涂鸦不改笔记内容（笔迹在独立窗口里，退出即 destroy），所以只读笔记、
+        甚至没选中笔记（空编辑区）都能进；退出一律按进入时的快照还原。
+        """
+        d = getattr(self, "_doodle", None)
+        if d is not None and d.active:
+            d.close()
+            return
+        d = DoodleLayer(self, self.pal)
+        try:
+            ok = d.open()
+        except Exception:
+            # 建窗失败：open() 把「锁正文」放在最后一步，这里只需把可能建出来的
+            # 半截窗口收掉，不会出现一个被 DISABLED 锁死的编辑器。
+            try:
+                d.close()
+            except Exception:
+                pass
+            return
+        if ok:
+            self._doodle = d
 
     # ---------- 只读：内置示例说明笔记 ----------
     # 放行的按键：导航、选择、复制 / 全选，以及全局快捷键。
@@ -750,6 +911,10 @@ class ActionsMixin(object):
             self._sync_line_tags()
             self.mark_modified()
             self.text.edit_modified(False)
+            # 行号 / 查找高亮都依赖「正文现在的样子」：行数变了要重画，命中位置
+            # 变了要重找。两个方法自己会判开关，没开行号 / 没开查找框时是空操作。
+            self._gutter_schedule()
+            self._find_on_edit()
             # `@ 关联笔记`：候选面板开着时，每敲一个字都要重排（中文走输入法也
             # 一样会点亮 <<Modified>>，所以挂在 on_edit 上而不是键盘事件上）
             if getattr(self, "_mention_pop", None) is not None:
@@ -844,6 +1009,10 @@ class ActionsMixin(object):
         和每次编辑后都会调用，把首行的行级样式统一成 title。旧数据里首行可能
         存的是 body / h2 / quote，打开即纠正；空首行只清残留（打字后由
         _sync_line_tags 补上）。标题换行符刻意不带 title（spacing 不插空行）。
+
+        ⚠️ 这里**不做**任何首行专属的间距修正：title 的 spacing1/3(8/8) 必须完整
+        生效，选中标题时上下才对称；顶部多出的 8px 已由 TEXT_PADY(12) 让出来。
+        旧版在此挂 firstline 把 spacing1 压成 0，已移除（见 widgets.TEXT_PADY）。
         """
         try:
             ls, le = "1.0", "1.end"
@@ -1199,10 +1368,12 @@ class ActionsMixin(object):
         临时叠加，存进库里就是一段永远抹不掉的黄底；后者根本不是正文内容。
         `colsel`（竖向选择的矩形高亮）是最新的一个 —— 它纯粹是「刚才选过哪块」的
         显示状态，落库只会让重开时莫名多出一片蓝底。
+        `firstline` 是旧版（2026-11-05 前）挂在首行压 spacing1 的排版标签，
+        现已不再挂载；名字留在过滤表里只为兼容旧库可能存在的残留记录。
         """
         tag = str(tag)
         return (tag.startswith(self.LI_TAG_PREFIX)
-                or tag in ("find", "locked_ph", "colsel"))
+                or tag in ("find", "locked_ph", "colsel", "firstline"))
 
     def serialize(self):
         # 未解锁的加密笔记：编辑器里躺的是「文字已加密」这句占位话，它不是正文，
@@ -1391,35 +1562,245 @@ class ActionsMixin(object):
         self._show_info("提示", "第一行是笔记标题，不能加列表项。\n列表请从第二行开始。")
         return True
 
-    def insert_bullet(self):
+    def apply_list_kind(self, kind):
+        """工具栏四个列表按钮的共同入口：切换 / 互转 / 批量应用。
+
+        规则（P0）：
+          · 光标所在行（有选区则选区覆盖的每一行）都已经是目标类型 → **整块取消**
+            列表标记（再点一次就是关掉，和 B/I/U 的切换语义一致）；
+          · 否则统一转成目标类型；已经是目标类型的行原样不动；
+          · 第 1 行是标题行，永远跳过；选区从标题行开始时只处理后面的行。
+
+        多行一起处理而不是逐行「点一次加一个标记」：用户选中五行再点「有序列表」，
+        想要的是五行都变成列表，而不是五行各自叠一个 1.。
+        """
         if not self.current_note():
             return
         if self._refuse_readonly():
             return
-        line = self.text.index("insert").split(".")[0]
-        if self._title_line_blocked(line):
+        if kind is not None and kind not in LIST_KINDS:
             return
+        lines = [ln for ln in self._touched_lines()
+                 if str(ln) != self.TITLE_LINE]
+        if not lines:
+            self._title_line_blocked(self.TITLE_LINE)
+            return
+        kinds = [self._list_kind_at(ln) for ln in lines]
+        target = None if all(k == kind for k in kinds) else kind
         self.text.config(state=tk.NORMAL)
-        self.text.insert(line + ".0", BULLET_MARK)
+        self.text.edit_separator()
+        try:
+            for ln in lines:
+                self._set_list_kind(ln, target)
+            if target == "numbered":
+                for ln in lines:
+                    self._renumber_numbered_block(ln, sep=False)
+        finally:
+            self.text.edit_separator()
+        self._sync_list_indent()
         self.mark_modified()
 
-    def insert_check(self):
-        if not self.current_note():
+    def _list_kind_at(self, ln):
+        """该行的列表类型；普通正文返回 None。"""
+        try:
+            txt = self.text.get("%d.0" % ln, "%d.end" % ln)
+        except Exception:
+            return None
+        # 空项（刚回车出来、还没打字）也算这一类：否则再点一次按钮会叠标记。
+        return split_list_prefix(txt, allow_empty=True)[0]
+
+    def _set_list_kind(self, ln, kind):
+        """把一行改成 kind（None = 清除标记）。调用方负责撤销边界与收尾。
+
+        缩进跟着行原有缩进走（老行没有缩进时补 LI_INDENT）：同一组列表互转之后
+        仍站在同一条竖线上，嵌套层级也不会被「转成有序列表」这一步压平。
+        """
+        try:
+            txt = self.text.get("%d.0" % ln, "%d.end" % ln)
+        except Exception:
             return
-        if self._refuse_readonly():
+        old_kind, prefix = split_list_prefix(txt, allow_empty=True)
+        if kind == old_kind and kind is not None:
+            return
+        if kind is None and old_kind is None:
+            return
+        if old_kind:
+            indent = prefix[:len(prefix) - len(prefix.lstrip("\u3000 "))]
+            self.text.delete("%d.0" % ln, "%d.0 +%dc" % (ln, len(prefix)))
+        else:
+            indent = txt[:len(txt) - len(txt.lstrip("\u3000 "))]
+        # 从待办转出去时，整行的删除线要一起摘掉；框本身的 todo 标签随字符删除。
+        self.text.tag_remove("done", "%d.0" % ln, "%d.end" % ln)
+        if kind is None:
+            return
+        indent = indent or LI_INDENT
+        if kind == "check":
+            # 方框必须走 _add_checkbutton：todo / todo_done / todo_gap 三个标签
+            # 都挂在那里，裸插字符的框点不动（见 _tag_todo_prefix 的说明）。
+            self.text.insert("%d.0" % ln, indent, ())
+            self._add_checkbutton(checked=False,
+                                  index="%d.%d" % (ln, len(indent)))
+        else:
+            # 显式空标签集：行首插入不指定标签会继承上一行的行级样式（引用 / 标题）。
+            self.text.insert("%d.0" % ln, list_marker(kind, indent), ())
+
+    def _numbered_line_info(self, ln):
+        """有序列表行 → (前缀, 缩进)；不是有序列表返回 None。"""
+        try:
+            txt = self.text.get("%d.0" % ln, "%d.end" % ln)
+        except Exception:
+            return None
+        # 回车续接出来的新项还没有正文，但它**在编号序列里**：不认的话整块
+        # 重编号会在新项处断开（1,2,2,3 永远修不成 1,2,3,4）。
+        kind, prefix = split_list_prefix(txt, allow_empty=True)
+        if kind != "numbered":
+            return None
+        indent = prefix[:len(prefix) - len(prefix.lstrip("\u3000 "))]
+        return prefix, indent
+
+    def _renumber_numbered_block(self, ln, sep=True):
+        """把 ln 所在的**连续有序列表块**重编成 1..n（P1 自动重编号）。
+
+        「连续」按缩进分组：只给**和 ln 同一缩进**的行编号。比它更深的行
+        （子列表 / 缩进续写）跳过但不打断父级编号；遇到空行、同层或更浅的
+        正文、别的列表类型才断开。缩进不同视为子列表，不并进同一组编号。
+
+        只在序号真的变化时才动文本：每次回车都无脑重写一遍会把撤销栈和选区
+        搅乱，也会让本来正确的「1,2,3 回车」多出一次无意义的写库。
+        """
+        try:
+            ln = int(ln)
+        except (TypeError, ValueError):
+            return False
+        base = self._numbered_line_info(ln)
+        if base is None:
+            return False
+        base_indent = len(base[1])
+
+        def depth(n):
+            """该行的缩进深度；空行返回 None（空行是列表的硬边界）。"""
+            info = self._numbered_line_info(n)
+            if info is not None:
+                return len(info[1])
+            try:
+                txt = self.text.get("%d.0" % n, "%d.end" % n)
+            except Exception:
+                return None
+            if not txt.strip():
+                return None
+            return len(txt) - len(txt.lstrip("\u3000 "))
+
+        def continues(n):
+            """n 行是否还在这个列表块里。
+
+            比基准缩进更深的行（子列表 / 缩进续写）**不打断**父级编号：
+            1. 父项
+               1. 子项
+            2. 父项
+            重编父级时要跨过子项继续数 1、2，而不是数到 1 就停。
+            """
+            d = depth(n)
+            if d is None:
+                return False
+            if self._numbered_line_info(n) is None:
+                return d > base_indent
+            return d >= base_indent
+
+        top = ln
+        while continues(top - 1):
+            top -= 1
+        bottom = ln
+        while continues(bottom + 1):
+            bottom += 1
+        changes = []
+        i = 0
+        for n in range(top, bottom + 1):
+            info = self._numbered_line_info(n)
+            if info is None or len(info[1]) != base_indent:
+                continue
+            i += 1
+            prefix = info[0]
+            new_prefix = renumber_prefix(prefix, i)
+            if new_prefix != prefix:
+                changes.append((n, prefix, new_prefix))
+        if not changes:
+            return False
+        self.text.config(state=tk.NORMAL)
+        if sep:
+            self.text.edit_separator()
+        for n, prefix, new_prefix in changes:
+            self.text.delete("%d.0" % n, "%d.0 +%dc" % (n, len(prefix)))
+            self.text.insert("%d.0" % n, new_prefix, ())
+        if sep:
+            self.text.edit_separator()
+        return True
+
+    def _indent_len_at(self, ln):
+        """该行行首的缩进字符数（全角空格 / 半角空格都算一格）。"""
+        try:
+            txt = self.text.get("%d.0" % ln, "%d.end" % ln)
+        except Exception:
+            return 0
+        return len(txt) - len(txt.lstrip("\u3000 "))
+
+    def _nearest_numbered_at_indent(self, ln, indent):
+        """从 ln 往两边找最近的一条**该缩进层级**的有序列表行。
+
+        删掉一行后，原来那一行现在装着它的下一行（可能是个更深的子项）。
+        直接拿当前行去重编会编错层级 —— 删父项时该继续编的是后面的父项，
+        不是顶上来的子项。这里按「被删行的缩进」找同级的那一条。
+        """
+        try:
+            last = int(self.text.index("end-1c").split(".")[0])
+        except Exception:
+            return None
+        for step in (1, -1):
+            n = ln if step > 0 else ln - 1
+            while 1 <= n <= last:
+                info = self._numbered_line_info(n)
+                if info is not None and len(info[1]) == indent:
+                    return n
+                try:
+                    txt = self.text.get("%d.0" % n, "%d.end" % n)
+                except Exception:
+                    break
+                if not txt.strip():
+                    break                       # 空行 = 列表块结束
+                if info is not None and len(info[1]) < indent:
+                    break                       # 更浅的列表 = 已经走出这一层
+                if info is None and self._indent_len_at(n) < indent:
+                    break
+                n += step
+        return None
+
+    def _common_list_kind(self):
+        """当前光标 / 选区所有行共同的列表类型；混合或普通正文返回 None。"""
+        lines = [ln for ln in self._touched_lines()
+                 if str(ln) != self.TITLE_LINE]
+        if not lines:
+            return None
+        kinds = [self._list_kind_at(ln) for ln in lines]
+        if kinds[0] is None or any(k != kinds[0] for k in kinds):
+            return None
+        return kinds[0]
+
+    def renumber_selected_lists(self):
+        """右键菜单「重新编号」：把选区覆盖到的有序列表块从头重编一遍。"""
+        if not self.current_note() or self._refuse_readonly():
+            return
+        lines = [ln for ln in self._touched_lines()
+                 if str(ln) != self.TITLE_LINE]
+        if not lines or not any(self._list_kind_at(ln) == "numbered"
+                                for ln in lines):
             return
         self.text.config(state=tk.NORMAL)
-        sel = self.text.tag_ranges("sel")
-        # 框锚在**行首**，不跟光标走：待办是行级标记（一个框领一整句），
-        # 和列表 / 序号按钮同一个规矩。以前插在光标处，光标停在句子中间时
-        # 框就落在字里 —— 看着像个正常待办，回车却续接不出来，点它也只是
-        # 把后面那截划掉。选中文字时以选区起点所在的行为准。
-        ln = str(self.text.index(sel[0] if sel else "insert")).split(".")[0]
-        if self._title_line_blocked(ln):
-            return
-        if split_list_prefix(self.text.get(ln + ".0", ln + ".end"))[0] == "check":
-            return                      # 这一行已经是待办了，别叠第二个框
-        self._add_checkbutton(checked=False, index=ln + ".0")
+        self.text.edit_separator()
+        try:
+            for ln in lines:
+                self._renumber_numbered_block(ln, sep=False)
+        finally:
+            self.text.edit_separator()
+        self._sync_list_indent()
         self.mark_modified()
 
     def insert_code(self, lang=""):
@@ -1449,7 +1830,7 @@ class ActionsMixin(object):
     def _add_code_block(self, lang="", code="", index=tk.END):
         blk = CodeBlock(self.text, self, lang=lang, code=code)
         self._codes.append(blk)
-        self.text.window_create(index, window=blk, padx=0, pady=6)
+        self.text.window_create(index, window=blk, padx=0, pady=dpi.px(6))
         # 宽度必须先定：高度是按「这个宽度下代码的实际显示行数」算出来的
         blk.set_width(self._code_width(), fit=False)
         self._after_idle(blk.fit)
@@ -1474,30 +1855,6 @@ class ActionsMixin(object):
             self._codes.remove(blk)
         except ValueError:
             pass
-        self.mark_modified()
-
-    def insert_numbered(self):
-        if not self.current_note():
-            return
-        if self._refuse_readonly():
-            return
-        line = self.text.index("insert").split(".")[0]
-        if self._title_line_blocked(line):
-            return
-        self.text.config(state=tk.NORMAL)
-        self.text.insert(line + ".0", NUM_MARK)
-        self.mark_modified()
-
-    def insert_triangle(self):
-        if not self.current_note():
-            return
-        if self._refuse_readonly():
-            return
-        line = self.text.index("insert").split(".")[0]
-        if self._title_line_blocked(line):
-            return
-        self.text.config(state=tk.NORMAL)
-        self.text.insert(line + ".0", TRI_MARK)
         self.mark_modified()
 
     def _title_line_break(self):
@@ -1660,6 +2017,9 @@ class ActionsMixin(object):
             # 空列表项 → 结束列表：删除标记，保留普通换行
             if marker:
                 self.text.delete(ln + ".0", ln + ".%d" % len(marker))
+            # 删掉的是有序列表里的空项时，它后面的项要顶上来（1,2,空,4 →
+            # 1,2,3）。当前行已经变成普通空行，所以从下一行开始找块。
+            self._renumber_numbered_block(int(ln) + 1, sep=False)
             self.mark_modified()
             return
         # 续接同格式。marker 带着当前行原有的缩进（新行有「缩进 + 标记」，
@@ -1674,6 +2034,10 @@ class ActionsMixin(object):
             cur = int(m.group(1)) if m else 1
             nxt = re.sub(r"\d+", str(cur + 1), marker or "", count=1) or NUM_MARK
             self.text.insert(tk.INSERT, "\n" + nxt)
+            # 在列表中间回车会把后面几项整体顶下去：1,2,3 里在第 1 项后回车
+            # 得到 1,2,2,3。这里把整块重编一遍，落成 1,2,3,4（P1 自动重编号）。
+            self._renumber_numbered_block(
+                self.text.index("insert").split(".")[0])
         self.mark_modified()
         return "break"
 
@@ -1782,9 +2146,12 @@ class ActionsMixin(object):
             self.mark_modified()
             return
         if kind == "numbered":
-            # 补成「缩进 + 序号 + 不换行空格」，与 insert_numbered / 回车续接的形态一致
+            # 补成「缩进 + 序号 + 不换行空格」，与工具栏/回车续接的形态一致
             self.text.delete(ln + ".0", "%s.%d" % (ln, consume))
             self.text.insert(ln + ".0", LI_INDENT + "%d.%s" % (extra or 1, _MARK_NBSP))
+            # 在列表中间敲出一个新序号（比如 1,2 之间敲 "5. "）时整块重编，
+            # 落成 1,2,3 而不是 1,5,2（P1 自动重编号）。
+            self._renumber_numbered_block(ln, sep=False)
             self.mark_modified()
             return
         if kind == "fence":
@@ -2023,6 +2390,9 @@ class ActionsMixin(object):
             for txt, tags in segs:
                 if txt:
                     self.text.insert("insert", txt, tags)
+        # 复制的是一段有序列表时，副本的序号会和原块重号：整块重编成连续的
+        # 1..n（P1 自动重编号）。
+        self._renumber_numbered_block(last + 1, sep=False)
         self.text.edit_separator()
         self._after_line_op()
 
@@ -2035,6 +2405,9 @@ class ActionsMixin(object):
         lines = self._touched_lines()
         if not lines:
             return
+        # 记下被删行的缩进：删除后同一行号会装上原来的下一行，可能已经是
+        # 更深的子项。重编号要回到「被删掉的那一层」，不能跟着子项走。
+        indent_hint = self._indent_len_at(min(lines))
         self.text.config(state=tk.NORMAL)
         self.text.edit_separator()
         for ln in sorted(lines, reverse=True):
@@ -2049,6 +2422,19 @@ class ActionsMixin(object):
                     self.text.delete("1.0", "1.end")
             else:
                 self.text.delete("%d.0" % ln, nxt)
+        # 删掉列表中间一项后，后面几项要顶上来重新编号（1,2,3 删掉 2 → 1,2）。
+        # 从被删位置所在的行开始找：它现在装着原来的下一行；删的是最后一行时
+        # 退到新的末行，让上一个列表块也能收尾。
+        # 放在收口分隔线**之前**，删除与重编号同属一次撤销。
+        try:
+            anchor = min(lines)
+            last = int(self.text.index("end-1c").split(".")[0])
+            target = self._nearest_numbered_at_indent(min(anchor, last),
+                                                      indent_hint)
+            if target is not None:
+                self._renumber_numbered_block(target, sep=False)
+        except Exception:
+            pass
         self.text.edit_separator()
         # 被删的行里可能带着代码块 / 分割线窗口。Tk 会把窗口从正文里摘掉，
         # 记账列表（宽度同步用）里的那几条要跟着去掉，否则每次拉宽窗口都在
@@ -2699,12 +3085,17 @@ class ActionsMixin(object):
     def _alarm_photo(self):
         """正文里那枚小闹钟。尺寸固定，全程序共用一张。
 
+        颜色取调色板的 star（琥珀）：既保留「提醒/警示」语义，又随主题走
+        （深色主题下 star 自动提亮，不会像原色黑图标那样糊进深色稿纸）。
+
         ⚠️ 必须挂在实例上保活：PhotoImage 一旦被 GC，Tk 里那个位置就变成空白，
         而且不会当场报错 —— 要等下一次重绘才显形，极难查。
         """
         if not hasattr(self, "_alarm_img"):
             try:
-                self._alarm_img = _png_icon_photo(self.root, "notice.png", 16)
+                color = (self.pal or {}).get("star", "#f5a623")
+                self._alarm_img = _icon_photo(self.root, "notice.png",
+                                             dpi.px(16), color)
             except Exception:
                 self._alarm_img = None
         return self._alarm_img
@@ -2729,6 +3120,31 @@ class ActionsMixin(object):
             return False
         self._alarms_get()[name] = d
         return True
+
+    def _refresh_alarm_images(self):
+        """换肤后刷新正文里已嵌入的闹钟图标（按 star 染色）。
+
+        闹钟位图嵌在 Text 内、全程序共用一张缓存的 PhotoImage；只把缓存置空，
+        那些已经嵌入正文的实例不会自动跟着变 —— Tk 是按引用持有旧图对象。这里重新
+        取一张新色图，再把每个已嵌入位置 image_configure 到新图。名字（name）不变，
+        所以序列化落库不受影响。
+
+        切笔记时 self._alarms 已被置空，遍历的键就只是当前笔记里真实存在的闹钟。
+        """
+        # 先清缓存，让 _alarm_photo 按新主题 star 重新染色
+        self._alarm_img = None
+        new_img = self._alarm_photo()
+        if new_img is None:
+            return
+        text = getattr(self, "text", None)
+        if text is None or not hasattr(text, "image_configure"):
+            return
+        for name in list(self._alarms_get().keys()):
+            try:
+                text.image_configure(name, image=new_img)
+            except Exception:
+                # 名字已不在正文（例如刚切了笔记但 _alarms 还没清）就跳过
+                pass
 
     def insert_alarm(self):
         """工具栏「任务提醒」：填内容 + 时间，然后在光标处放一枚小闹钟。"""
@@ -2777,19 +3193,19 @@ class ActionsMixin(object):
         win.resizable(False, False)
         win.configure(bg=border)
         body = tk.Frame(win, bg=bg)
-        body.pack(fill=tk.BOTH, expand=True, padx=1, pady=1)
+        body.pack(fill=tk.BOTH, expand=True, padx=dpi.px(1), pady=dpi.px(1))
 
         def label(t):
             tk.Label(body, text=t, bg=bg, fg=soft,
-                     font=(FONT[0], 9)).pack(anchor="w", padx=14, pady=(9, 0))
+                     font=(FONT[0], 9)).pack(anchor="w", padx=dpi.px(14), pady=(dpi.px(9), 0))
 
         def entry(value):
             e = tk.Entry(body, bg=ed, fg=text_fg, insertbackground=accent,
                          relief=tk.FLAT, font=(FONT[0], 10), width=34,
-                         highlightthickness=1,
+                         highlightthickness=dpi.px(1),
                          highlightbackground=_mix_hex(ed, border, 0.7),
                          highlightcolor=accent)
-            e.pack(fill=tk.X, padx=14, pady=(3, 0), ipady=3)
+            e.pack(fill=tk.X, padx=dpi.px(14), pady=(dpi.px(3), 0), ipady=dpi.px(3))
             e.insert(0, value)
             return e
 
@@ -2808,13 +3224,13 @@ class ActionsMixin(object):
         cal_on = [True]                      # 「到点提醒」关掉后日历一起灰掉
 
         cal = tk.Frame(body, bg=bg)
-        cal.pack(fill=tk.X, padx=10, pady=(2, 0))
+        cal.pack(fill=tk.X, padx=dpi.px(10), pady=(dpi.px(2), 0))
 
         def mini(parent, text, cmd, size=13, color=None):
             """日历头部的小按钮（‹ › 今天）。用 Label 而不是 Button：
             Button 自带边框、内边距和按下高亮，在这个扁平的对话框里很扎眼。"""
             lb = tk.Label(parent, text=text, bg=bg, fg=color or soft,
-                          font=(FONT[0], size), bd=0, padx=7, pady=0,
+                          font=(FONT[0], size), bd=0, padx=dpi.px(7), pady=0,
                           cursor="hand2")
             lb.bind("<Button-1>", lambda _e: cmd())
             lb.bind("<Enter>", lambda _e: lb.configure(fg=accent))
@@ -2844,30 +3260,30 @@ class ActionsMixin(object):
             paint()
 
         mini(head, "今天", goto_today, size=9, color=accent).pack(side=tk.RIGHT,
-                                                                padx=(0, 6))
+                                                                padx=(0, dpi.px(6)))
         # 先左后右地 pack：‹ 最左、标题居中、› 紧跟。标题给固定 width，翻月时
         # 字数变化（10月→11月）不会把两个箭头推来推去。
-        mini(head, "‹", lambda: turn(-1)).pack(side=tk.LEFT, padx=(6, 0))
+        mini(head, "‹", lambda: turn(-1)).pack(side=tk.LEFT, padx=(dpi.px(6), 0))
         ttl = tk.Label(head, text="", bg=bg, fg=text_fg, font=(FONT[0], 10),
                        bd=0, padx=0, pady=0, width=9, anchor="w")
         ttl.pack(side=tk.LEFT)
         mini(head, "›", lambda: turn(1)).pack(side=tk.LEFT)
 
         net = tk.Frame(cal, bg=bg)
-        net.pack(fill=tk.X, pady=(1, 0))
+        net.pack(fill=tk.X, pady=(dpi.px(1), 0))
         for c in range(7):
             # uniform 让七列等宽：否则「30」那种两位数会把整列撑宽，格子歪掉
             net.columnconfigure(c, weight=1, uniform="cal")
         for c, wtxt in enumerate(alarm.WEEKDAYS):
             tk.Label(net, text=wtxt, bg=bg, fg=soft, font=(FONT[0], 8),
-                     bd=0, padx=0, pady=0).grid(row=0, column=c, pady=(0, 1))
+                     bd=0, padx=0, pady=0).grid(row=0, column=c, pady=(0, dpi.px(1)))
 
         cells = []
         for r in range(6):
             for c in range(7):
                 lb = tk.Label(net, text="", bg=bg, fg=text_fg,
                               font=(FONT[0], 9), bd=0, padx=0, pady=0)
-                lb.grid(row=r + 1, column=c, sticky="nsew", ipady=1)
+                lb.grid(row=r + 1, column=c, sticky="nsew", ipady=dpi.px(1))
                 cells.append(lb)
 
         def paint_cell(i, hovered=False):
@@ -2877,8 +3293,8 @@ class ActionsMixin(object):
                 return
             cur = datetime.date(shown[0], shown[1], d)
             if cur == chosen[0]:
-                # 选中的一天：实心 accent + 白字。比加个圈更醒目，也不占格子
-                lb.configure(text=str(d), bg=accent, fg="#ffffff",
+                # 选中的一天：实心 accent + 自动对比的文字色（金色 accent 上白字会糊）
+                lb.configure(text=str(d), bg=accent, fg=on_accent(accent),
                              cursor="hand2" if cal_on[0] else "")
             elif hovered and cal_on[0]:
                 lb.configure(text=str(d), bg=_mix_hex(bg, text_fg, 0.10),
@@ -2910,7 +3326,7 @@ class ActionsMixin(object):
 
         label("提醒时间")
         trow = tk.Frame(body, bg=bg)
-        trow.pack(fill=tk.X, padx=14, pady=(2, 0))
+        trow.pack(fill=tk.X, padx=dpi.px(14), pady=(dpi.px(2), 0))
 
         def spin(lo, hi, value):
             """时/分选择框。format 两位补零，防止显示出 `8` 这种不齐的数字。"""
@@ -2920,17 +3336,17 @@ class ActionsMixin(object):
                             bg=ed, fg=text_fg, insertbackground=accent,
                             buttonbackground=_mix_hex(ed, text_fg, 0.10),
                             disabledbackground=bg, disabledforeground=soft,
-                            highlightthickness=1,
+                            highlightthickness=dpi.px(1),
                             highlightbackground=_mix_hex(ed, border, 0.7),
                             highlightcolor=accent)
             sp.delete(0, tk.END)
             sp.insert(0, "%02d" % value)
-            sp.pack(side=tk.LEFT, ipady=2)
+            sp.pack(side=tk.LEFT, ipady=dpi.px(2))
             return sp
 
         sp_h = spin(0, 23, hh0)
         tk.Label(trow, text=":", bg=bg, fg=text_fg,
-                 font=(FONT[0], 11)).pack(side=tk.LEFT, padx=2)
+                 font=(FONT[0], 11)).pack(side=tk.LEFT, padx=dpi.px(2))
         sp_m = spin(0, 59, mm0)
 
         def set_now():
@@ -2943,8 +3359,8 @@ class ActionsMixin(object):
                             bd=0, bg=_mix_hex(bg, text_fg, 0.10), fg=text_fg,
                             activebackground=_mix_hex(bg, text_fg, 0.18),
                             activeforeground=text_fg, font=(FONT[0], 9),
-                            padx=9, pady=1, cursor="hand2")
-        btn_now.pack(side=tk.LEFT, padx=(8, 0))
+                            padx=dpi.px(9), pady=dpi.px(1), cursor="hand2")
+        btn_now.pack(side=tk.LEFT, padx=(dpi.px(8), 0))
 
         # 到点提醒：不勾就是「只做标记」（at=0，永远不响）。原来的表达方式是
         # 「时间框留空」，换成 Spinbox 之后没有空值，只能用一个显式开关。
@@ -2954,7 +3370,7 @@ class ActionsMixin(object):
                              activebackground=bg, activeforeground=text_fg,
                              selectcolor=_mix_hex(bg, text_fg, 0.12),
                              cursor="hand2", highlightthickness=0)
-        chk.pack(side=tk.LEFT, padx=(14, 0))
+        chk.pack(side=tk.LEFT, padx=(dpi.px(14), 0))
 
         def toggle(*_a):
             # 不提醒时连日期一起灰掉：留着能编辑却不生效，比直接禁用更让人困惑
@@ -2969,10 +3385,10 @@ class ActionsMixin(object):
 
         err = tk.Label(body, text="", bg=bg, fg=p.get("danger", "#c0392b"),
                        font=(FONT[0], 9), anchor="w")
-        err.pack(fill=tk.X, padx=14, pady=(7, 0))
+        err.pack(fill=tk.X, padx=dpi.px(14), pady=(dpi.px(7), 0))
 
         row = tk.Frame(body, bg=bg)
-        row.pack(fill=tk.X, padx=14, pady=(9, 12))
+        row.pack(fill=tk.X, padx=dpi.px(14), pady=(dpi.px(9), dpi.px(12)))
         out = [None]
 
         def ok(_e=None):
@@ -3007,14 +3423,14 @@ class ActionsMixin(object):
             return "break"
 
         tk.Button(row, text="确定", command=ok, relief=tk.FLAT, bd=0,
-                  bg=accent, fg="#ffffff", activebackground=accent,
-                  activeforeground="#ffffff", font=(FONT[0], 10),
-                  padx=16, pady=4, cursor="hand2").pack(side=tk.RIGHT)
+                  bg=accent, fg=on_accent(accent), activebackground=accent,
+                  activeforeground=on_accent(accent), font=(FONT[0], 10),
+                  padx=dpi.px(16), pady=dpi.px(4), cursor="hand2").pack(side=tk.RIGHT)
         tk.Button(row, text="取消", command=cancel, relief=tk.FLAT, bd=0,
                   bg=_mix_hex(bg, text_fg, 0.10), fg=text_fg,
                   activebackground=_mix_hex(bg, text_fg, 0.18),
                   activeforeground=text_fg, font=(FONT[0], 10),
-                  padx=16, pady=4, cursor="hand2").pack(side=tk.RIGHT, padx=(0, 8))
+                  padx=dpi.px(16), pady=dpi.px(4), cursor="hand2").pack(side=tk.RIGHT, padx=(0, dpi.px(8)))
 
         for w in (e_text, sp_h, sp_m):
             w.bind("<Return>", ok)
@@ -3105,7 +3521,8 @@ class ActionsMixin(object):
             return
         data = self._alarms_get().get(name) or {}
         title, sub = alarm.tips(data, self._alarm_is_fired(data))
-        self._alarm_tip_show(event.x_root + 14, event.y_root + 18, title, sub)
+        self._alarm_tip_show(event.x_root + dpi.px(14), event.y_root + dpi.px(18),
+                             title, sub)
 
     def _alarm_tip_show(self, x, y, title, sub):
         p = self.pal
@@ -3116,19 +3533,23 @@ class ActionsMixin(object):
             win.attributes("-topmost", True)
             win.configure(bg=_popover_border(p))
             body = tk.Frame(win, bg=_popover_bg(p))
-            body.pack(padx=1, pady=1)
+            body.pack(padx=dpi.px(1), pady=dpi.px(1))
             # ⚠️ Label 的 padx/pady 只吃单值（"6 0" 会报 bad screen distance），
             # 上下不对称要靠 pack 的 pady 来表达
-            for txt, fg, size, gap in ((title, p.get("text", "#222222"), 10, (6, 0)),
-                                       (sub, p.get("soft", "#76767e"), 9, (1, 6))):
+            for txt, fg, size, gap in ((title, p.get("text", "#222222"), 10,
+                                        (dpi.px(6), 0)),
+                                       (sub, p.get("soft", "#76767e"), 9,
+                                        (dpi.px(1), dpi.px(6)))):
                 tk.Label(body, text=txt, bg=_popover_bg(p), fg=fg,
                          font=(FONT[0], size), bd=0, justify="left", anchor="w",
-                         wraplength=300, padx=10).pack(fill=tk.X, pady=gap)
+                         wraplength=dpi.px(300), padx=dpi.px(10)).pack(fill=tk.X, pady=gap)
             win.update_idletasks()
-            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
             w, h = win.winfo_reqwidth(), win.winfo_reqheight()
-            win.geometry("+%d+%d" % (max(0, min(int(x), sw - w - 4)),
-                                     max(0, min(int(y), sh - h - 4))))
+            # 夹进**闹钟所在那块屏**的工作区（多屏时 winfo_screenwidth 只报主屏，
+            # 副屏上悬停会把它拽到主屏左缘）
+            area = win_frame.work_area_at(x, y, fallback=win)
+            px, py = win_frame.clamp_pos(area, x, y, w, h, pad=dpi.px(4))
+            win.geometry("+%d+%d" % (px, py))
             self._alarm_tip_win = win
         except Exception:
             self._alarm_tip_win = None
@@ -3265,26 +3686,28 @@ class ActionsMixin(object):
             pass
         win.configure(bg=border)
         body = tk.Frame(win, bg=bg)
-        body.pack(padx=1, pady=1)
+        body.pack(padx=dpi.px(1), pady=dpi.px(1))
         # Label 的 padx/pady 只吃单值，上下留白一律走 pack 的 pady
         tk.Label(body, text="任务提醒 · " + (alarm.fmt_at(data.get("at")) or "未设时间"),
                  bg=bg, fg=accent, font=(FONT[0], 9), bd=0,
-                 padx=14, anchor="w").pack(fill=tk.X, pady=(10, 0))
+                 padx=dpi.px(14), anchor="w").pack(fill=tk.X, pady=(dpi.px(10), 0))
         tk.Label(body, text=data.get("text") or "", bg=bg,
                  fg=p.get("text", "#222222"), font=(FONT[0], 11), bd=0,
-                 padx=14, anchor="w", justify="left",
-                 wraplength=260).pack(fill=tk.X, pady=(2, 0))
+                 padx=dpi.px(14), anchor="w", justify="left",
+                 wraplength=dpi.px(260)).pack(fill=tk.X, pady=(dpi.px(2), 0))
         row = tk.Frame(body, bg=bg)
-        row.pack(fill=tk.X, padx=14, pady=(9, 11))
+        row.pack(fill=tk.X, padx=dpi.px(14), pady=(dpi.px(9), dpi.px(11)))
         tk.Button(row, text="知道了", command=win.destroy, relief=tk.FLAT, bd=0,
-                  bg=accent, fg="#ffffff", activebackground=accent,
-                  activeforeground="#ffffff", font=(FONT[0], 9),
-                  padx=14, pady=3, cursor="hand2").pack(side=tk.RIGHT)
+                  bg=accent, fg=on_accent(accent), activebackground=accent,
+                  activeforeground=on_accent(accent), font=(FONT[0], 9),
+                  padx=dpi.px(14), pady=dpi.px(3), cursor="hand2").pack(side=tk.RIGHT)
         try:
             win.update_idletasks()
-            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
             w, h = win.winfo_reqwidth(), win.winfo_reqheight()
-            win.geometry("+%d+%d" % (sw - w - 28, sh - h - 96))
+            # 摆在**主窗口所在那块屏**的右下角。取工作区（已扣任务栏）再留 66px，
+            # 100% 缩放下与旧值（屏幕高 - 96）落在同一个位置；多屏时不会跑到主屏去。
+            ax, ay, aw, ah = win_frame.work_area(self.root)
+            win.geometry("+%d+%d" % (ax + aw - w - 28, ay + ah - h - dpi.px(66)))
         except Exception:
             pass
         return win
@@ -3517,15 +3940,23 @@ class ActionsMixin(object):
         f = self.data["current_folder"]
         # 智能分类不能当真实归属：在「星标笔记 / 加密笔记」下新建时若记成 f_star，
         # 这条笔记会不属于任何真实文件夹（只在「全部」里出现），所以一律落到「工作」。
-        folder = "f_work" if f in SMART_FOLDERS else f
+        # 系统区同理：那一格只装内置说明，新笔记进去就再也拖不出来。
+        switched = f in SMART_FOLDERS or f == SYSTEM_FOLDER
+        folder = "f_work" if switched else f
         import time
         now = time.strftime("%Y-%m-%d", time.localtime())
         n = {"id": uid(), "folder": folder,
              "content": _t(now, ["title"]) + [["t", "\n", []]],
              "pinned": False, "created": time.time() * 1000,
              "updated": time.time() * 1000}
+        # 色条颜色在**新建这一刻**就定下来（挑当前用得最少的），之后排序、拖动、
+        # 改名都不再变；等界面渲染时再补会让这条笔记的颜色随「当时的用量」漂移。
+        n["color"] = pick_note_color(self.data["notes"], folder)
+        # ⚠️ 不传 folder：新建的笔记要排在**当前视图**的第一个，而「全部笔记 / 星标」
+        # 这类聚合视图是跨文件夹排序的。只跟同文件夹的比，别的文件夹里更小的 order
+        # 就会把它压下去 —— 用户看到的就是「新建完出现在列表中间」。
+        n["order"] = self.top_note_order(n)
         self.data["notes"].insert(0, n)
-        switched = f in SMART_FOLDERS
         if switched:
             self.data["current_folder"] = folder
             self.refresh_folders()
@@ -3536,7 +3967,7 @@ class ActionsMixin(object):
         self._note_anchor = n["id"]
         save_data(self.data)
         if switched:
-            # 智能文件夹里新建会切换视图（列表内容整体变了）→ 只能整列重建
+            # 智能分类 / 系统区里新建都会切换视图（列表内容整体变了）→ 只能整列重建
             self.refresh_notes()
         else:
             # 普通文件夹：只把新行插到队首，其余笔记原地保留，不再整列重建闪烁
@@ -3598,6 +4029,7 @@ class ActionsMixin(object):
             return
         n["pinned"] = not n["pinned"]
         n["updated"] = __import__("time").time() * 1000
+        n["order"] = self.top_note_order(n)
         save_data(self.data)
         self.refresh_notes()
         self.load_editor()
@@ -3609,6 +4041,7 @@ class ActionsMixin(object):
             self._show_info("提示", "请先选择一条笔记。")
             return
         n["starred"] = not n.get("starred", False)
+        n["order"] = self.top_note_order(n)
         save_data(self.data)
         # 就地更新文件夹计数（不重建文件夹行 → 不闪烁）
         self._refresh_folder_counts()
@@ -3637,6 +4070,9 @@ class ActionsMixin(object):
             if not pf or pf.get("smart"):
                 self._show_info("提示", "只能在普通文件夹里建子文件夹。")
                 return
+            if parent == SYSTEM_FOLDER:
+                self._show_info("提示", "「系统」文件夹是程序自带的，不能在它下面建子文件夹。")
+                return
             # 层数上限：往下再深一层就缩进到看不见了
             if folder_depth(parent, self.data["folders"]) + 1 > MAX_FOLDER_DEPTH:
                 self._show_info("提示", "文件夹最多 %d 层，不能再往下建了。"
@@ -3658,7 +4094,18 @@ class ActionsMixin(object):
                         if x["id"] in kin or x["id"] == parent), default=-1)
             self.data["folders"].insert(last + 1, f)
         else:
-            self.data["folders"].append(f)
+            # 根层新文件夹排在所有根层真实文件夹之后。「系统」钉在第一个真实文件夹
+            # 位上（见 store._ensure_system_folder），直接 append 或插在它前面都会
+            # 让系统那一格跑来跑去。
+            last = -1
+            for i, x in enumerate(self.data["folders"]):
+                if (x["id"] not in SMART_FOLDERS and x["id"] != SYSTEM_FOLDER
+                        and not x.get("parent")):
+                    last = i
+            if last < 0:                    # 还没有自建文件夹：挨着「系统」往后放
+                last = next((i for i, x in enumerate(self.data["folders"])
+                             if x["id"] == SYSTEM_FOLDER), len(self.data["folders"]) - 1)
+            self.data["folders"].insert(last + 1, f)
         save_data(self.data)
         # 就地插这一行，别重建整列：整列重建 = 所有行销毁再建一遍（控件全换新的），
         # 看上去就是「新建完一个，别的文件夹全跳一下」。父行长出三角那点事交给
@@ -3733,6 +4180,9 @@ class ActionsMixin(object):
         if not f or f.get("smart"):
             self._show_info("提示", "「全部笔记 / 星标笔记 / 加密笔记」是智能分类，不能删除。")
             return
+        if fid == SYSTEM_FOLDER:
+            self._show_info("提示", "「系统」文件夹是程序自带的，不能删除。")
+            return
         # 删的是一整棵子树：子文件夹及其里的笔记一起删。留着的话它们变成没有父的
         # 孤儿，只在 normalize_folder_parents 里被提到根层 —— 用户眼里就是
         # 「删了一个，边上多出来几个」。
@@ -3781,6 +4231,9 @@ class ActionsMixin(object):
         f = next((x for x in self.data["folders"] if x["id"] == fid), None)
         if not f:
             return
+        if fid == SYSTEM_FOLDER:
+            self._show_info("提示", "「系统」文件夹的名字是程序固定的，不能改。")
+            return
         name = self._ask_text("重命名文件夹", "文件夹名称：", f["name"])
         if not name:
             return
@@ -3820,9 +4273,21 @@ class ActionsMixin(object):
             self._restyle_folders()
         m = PopupMenu(self.root, self.pal)
         if len(self._folder_sel) > 1:
-            m.add("删除选中的 %d 个文件夹" % len(self._folder_sel), icon="trash",
-                  danger=True,
+            # 多选里可能混着智能分类 / 系统区（Shift 区间很容易顺手带上）。
+            # 计数只算真能删的那些 —— 否则承诺「删除 3 个」最后只少了 1 个。
+            deletable = [i for i in self._folder_sel
+                         if i not in SMART_FOLDERS and i != SYSTEM_FOLDER]
+            m.add("删除选中的 %d 个文件夹" % len(deletable), icon="trash",
+                  danger=True, enabled=bool(deletable),
                   command=lambda: self._delete_folders(list(self._folder_sel)))
+        elif fid == SYSTEM_FOLDER:
+            # 系统区是程序自带的一格：三项都列出来、全部置灰。菜单里凭空少几行
+            # 会让人以为「是不是没点到」，写明原因反而省一次尝试。
+            m.add("重命名（系统文件夹不可改）", icon="pencil", enabled=False)
+            m.add("新建子文件夹（系统文件夹下不能建）", icon="folder", enabled=False)
+            m.add("移动笔记到…（系统文件夹不可移）", icon="folder", enabled=False)
+            m.add_separator()
+            m.add("删除文件夹（系统文件夹不可删）", icon="trash", enabled=False)
         else:
             m.add("重命名", icon="pencil", command=lambda: self.rename_folder(fid))
             if not f.get("smart"):
@@ -3854,15 +4319,20 @@ class ActionsMixin(object):
         if f.get("smart"):
             self._show_info("提示", "智能分类是筛选出来的视图，不能整体移动。")
             return
+        if fid == SYSTEM_FOLDER:
+            self._show_info("提示", "「系统」文件夹只放内置说明，里面的笔记不能移出。")
+            return
         notes = self.folder_notes(fid)
         if not notes:
             self._show_info("提示", "文件夹「%s」下没有笔记。" % f["name"])
             return
         # 自己的子文件夹不算目标：挪进子层之后父视图照样能看见它们（父级含子树计数），
         # 看起来像「什么都没动」，但笔记的归属确实变了 —— 这种操作不给人做。
+        # 系统区同样排除：它只装说明笔记，别人的笔记挪进去等于锁进一个动不了的角落。
         kin = set(subtree_ids(fid, self.data["folders"]))
         targets = [x for x in self.data["folders"]
-                   if not x.get("smart") and x["id"] not in kin]
+                   if not x.get("smart") and x["id"] not in kin
+                   and x["id"] != SYSTEM_FOLDER]
         if not targets:
             self._show_info("提示", "没有其他文件夹可以移入。")
             return

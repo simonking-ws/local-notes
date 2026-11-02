@@ -23,6 +23,8 @@
     还会制造悬空引用。覆盖导入采纳 prefs，合并导入保留本机外观。
   * 每条笔记带 `rev`（正文 + 链接 + 密文的指纹）。合并时 rev 相同 = 同一篇，
     跳过 → 「同一个备份导两次」变成幂等操作；id 撞了但内容不同才换新 id。
+  * 内置说明笔记（`sample`）**不导出**：它是程序自带的使用说明，不是用户的内容；
+    导入时按当前版本重建，免得旧备份里那张过时的快捷键表跟着到处跑。
   * 文件夹 id 冲突不再「直接跳过丢掉备份里的那个」，而是建一张
     「备份 id → 本机 id」的映射表，`notes.folder` 和 `parent` 都按它重写。
   * 正文从「逐字符 runs」压成 `text` + `spans` + `blocks`：一个字符一条
@@ -35,20 +37,38 @@
 都走同一条 decode 路径（v1 的 `settings` 按键分拣到 prefs / state）。
 """
 
+import base64
 import datetime
 import gzip
 import hashlib
+import hmac
+import io
 import json
 import os
+import struct
 import time
 
-from store import (SMART_FOLDERS, _ensure_smart_folders, normalize_folder_parents,
-                   uid)
+from store import (SMART_FOLDERS, SYSTEM_FOLDER, _ensure_smart_folders,
+                   _ensure_system_folder, normalize_folder_parents,
+                   new_sample_note, uid)
 
 # 备份文件里的格式标识与 schema 版本。
 # `schema` 每次改动**不兼容**的结构时才加一；加字段不用动它（老版本会忽略新键）。
 FORMAT = "sujian.backup"
 SCHEMA = 2
+
+# 导出容器的格式标识与版本。容器是**另一层**，和上面的快照 schema 无关：
+# 剥壳还原出来的仍是完完整整的 schema 2 快照 dict，decode() 一个字都不用改。
+# 独立 format 还有个好处：谁要是把容器直接丢给 decode()，会被明确拒绝，
+# 而不是「少了 folders / notes」这种让人摸不着头脑的报错。
+CONTAINER_FORMAT = "sujian.backup.container"
+CONTAINER_VERSION = 1
+# 备份会被长期存档，离线爆破成本低，KDF 比单篇笔记（secret.py 的 20 万）更狠一档。
+# 只在导出 / 导入各付一次，不落在任何热路径上。
+CONTAINER_ITERATIONS = 600000
+_MIN_ITER, _MAX_ITER = 100000, 5000000
+_DOMAIN = b"sujian.backup.container.v1"
+_SALT_LEN, _NONCE_LEN = 16, 12
 
 # settings 里的两类键：
 #   prefs —— 外观偏好，跟着人走。覆盖导入时采纳备份里的值。
@@ -59,11 +79,26 @@ STATE_KEYS = ("tabs", "side_w", "list_w", "alarm_fired", "current_folder", "curr
 # 只存在于备份文件里的笔记字段（导入时展开成 content 后要剔掉，别流进内存数据）
 _V2_ONLY = ("text", "spans", "blocks", "rev")
 _NOTE_KNOWN = frozenset(("id", "folder", "content", "created", "updated",
-                         "pinned", "starred", "sample", "links", "sec") + _V2_ONLY)
+                         "pinned", "starred", "sample", "links", "sec",
+                         "color") + _V2_ONLY)
 
 
 class BackupError(ValueError):
     """备份文件读不了 / 不是备份 / 版本太新。调用方直接把它的话术显示给用户。"""
+
+
+def _clean_color(v):
+    """笔记色条颜色：#rrggbb 就规范化成小写，其它一律当没有（返回 ""）。
+
+    不按 `NOTE_COLORS` 白名单卡死：以后调色板换色时，旧备份里的颜色应当还能
+    原样读回来，而不是被悄悄抹掉。真正的约束只有「能当 Canvas 的 fill 用」。
+    """
+    if not isinstance(v, str):
+        return ""
+    s = v.strip()
+    if len(s) == 7 and s[0] == "#" and all(c in "0123456789abcdefABCDEF" for c in s[1:]):
+        return s.lower()
+    return ""
 
 
 # ---------- 时间 / 摘要 ----------
@@ -294,6 +329,9 @@ def _encode_note(n):
             out[k] = True
     if isinstance(n.get("links"), dict) and n["links"]:
         out["links"] = n["links"]
+    col = _clean_color(n.get("color"))
+    if col:
+        out["color"] = col
     sec = n.get("sec")
     if isinstance(sec, dict) and sec.get("data"):
         out["sec"] = sec
@@ -317,7 +355,18 @@ def _encode_folder(f):
 
 
 def encode(data, extra=None, exported_at=None):
-    """内存数据 → schema 2 快照（含 checksum）。`extra` 里的键会一起算进校验和。"""
+    """内存数据 → schema 2 快照（含 checksum）。`extra` 里的键会一起算进校验和。
+
+    **内置说明笔记（`sample`）不导出**：它是程序自带的一份使用说明，不是用户的内容
+    —— 换机、存档、给别人一份，带过去都只是噪音（对面一导入就多出一篇讲过时的
+    快捷键表，还得跟本机自带的那篇较劲）。导入后由 `overwrite` 按当前版本重建一篇，
+    永远是最新的排版。判据只认 `sample` 这个标记：用户自己写的笔记哪怕标题也叫
+    「欢迎使用素笺」，没打标记就照常导出（改名 = 收下它，保护解除的规则见
+    store._mark_sample_note）。
+
+    「系统」文件夹同理不导出：它和里面的说明笔记是一套的，导入时由
+    `_ensure_system_folder` 补回来。把它写进备份只会让对面多出一格空文件夹。
+    """
     settings = data.get("settings") or {}
     prefs = dict((k, settings[k]) for k in PREFS_KEYS if k in settings)
     payload = {
@@ -327,9 +376,9 @@ def encode(data, extra=None, exported_at=None):
         "prefs": prefs,
         "styles": dict(data.get("styles") or {}),
         "folders": [_encode_folder(f) for f in (data.get("folders") or [])
-                    if isinstance(f, dict)],
+                    if isinstance(f, dict) and f.get("id") != SYSTEM_FOLDER],
         "notes": [_encode_note(n) for n in (data.get("notes") or [])
-                  if isinstance(n, dict)],
+                  if isinstance(n, dict) and not n.get("sample")],
     }
     if extra:
         payload.update(extra)
@@ -337,14 +386,14 @@ def encode(data, extra=None, exported_at=None):
     return payload
 
 
-def dump(path, payload):
-    """落盘。`.gz` 后缀走 gzip（体积通常只有 1/3~1/5），其它按明文写。
+def _write_file(path, data):
+    """按后缀决定要不要套一层 gzip 落盘（`dump` 与容器导出共用）。
 
-    gzip 头里的 mtime 固定写 0、**文件名也不写**：GzipFile 默认把 `fileobj.name`
-    塞进头里，那样「同样的数据导出两次」字节就不一样（连改个文件名的存档都算新版本）。
-    现在这份数据在哪台机器、哪个目录、什么时候导出，压缩后的字节都完全一致。
+    `.gz` 后缀必须是**真的 gzip 文件**：文件管理器、解压工具、以及 backup.load
+    的魔数识别都按这个约定来。gzip 头里 mtime 固定 0、文件名也不写 —— GzipFile
+    默认会把 `fileobj.name` 塞进头里，那样「同样的数据导出两次」字节就不一样
+    （连改个文件名存档都算新版本）。
     """
-    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
     if str(path).lower().endswith(".gz"):
         with open(path, "wb") as raw:
             with gzip.GzipFile(filename="", fileobj=raw, mode="wb",
@@ -356,8 +405,197 @@ def dump(path, payload):
     return os.path.getsize(path)
 
 
-def load(path):
-    """读文件 → dict。压缩与否看**魔数**而不是后缀（用户改过名也照样能读）。"""
+def dump(path, payload):
+    """落盘。`.gz` 后缀走 gzip（体积通常只有 1/3~1/5），其它按明文写。
+
+    内部自动快照（pending / 升级前备份）、以及用户显式要的明文 `.plain.json`
+    都走这里，写出来的仍是原来的老格式，不套容器。
+    """
+    data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    return _write_file(path, data)
+
+
+# ---------- 导出容器：编码（空口令）/ 可选口令加密 ----------
+#
+# 需求：导出的备份即使被文本编辑器打开，也不该是一眼能读的笔记正文；导入时
+# 程序自己认出来、自己还原，用户不用记任何开关。
+#
+#   * 空口令 = **编码态**（mode="coded"）：密钥从一个公开常量 + 文件头里的 salt
+#     推出来，任何人拿着程序都能还原。它的作用是「不让内容裸奔」，不是保密。
+#   * 非空口令 = **加密态**（mode="sealed"）：PBKDF2 派生，口令错了打不开。
+#     允许留空就是上面那条路径，导出时不需要被迫设一个口令。
+#
+# 两种模式共用同一套结构，差别只有「密钥怎么来」，所以还原逻辑只有一份：
+# 先验 tag（Encrypt-then-MAC，硬拦），再解 data，再 gunzip，最后 json.loads
+# 交回原来的 decode()。encode / decode / overwrite / merge 全都不用动。
+#
+# 顺序是「先压后加」：密文的字节熵很高，压了也是白压（还会白涨 base64 的 33%）。
+# gzip 沿用 dump() 的 filename="" / mtime=0，压缩结果可复现。
+
+
+class NeedPassword(BackupError):
+    """容器是加密态，导入前得先问用户要口令。单独一类，界面才知道要弹框。"""
+
+
+def _b64e(b):
+    return base64.b64encode(b).decode("ascii")
+
+
+def _b64d(s):
+    return base64.b64decode((s or "").encode("ascii"))
+
+
+def _codec_subkeys(key):
+    """加解密 / 认证用两把不同的子密钥，别把 PBKDF2 输出直接当密钥流。"""
+    return (hmac.new(key, b"sujian.enc", hashlib.sha256).digest(),
+            hmac.new(key, b"sujian.mac", hashlib.sha256).digest())
+
+
+def _codec_stream(enc_key, nonce, n):
+    """SHA256 当伪随机函数的 CTR 模式：每块 = SHA256(enc_key || nonce || 计数器)。"""
+    out = bytearray()
+    counter = 0
+    while len(out) < n:
+        out += hashlib.sha256(enc_key + nonce + struct.pack(">Q", counter)).digest()
+        counter += 1
+    return bytes(out[:n])
+
+
+def _codec_xor(a, b):
+    """大整数异或，比 Python 逐字节循环快一个数量级（长备份差别明显）。"""
+    return (int.from_bytes(a, "big") ^ int.from_bytes(b, "big")).to_bytes(len(a), "big")
+
+
+def _codec_key(blob, password):
+    salt = _b64d(blob.get("salt"))
+    if blob.get("mode") == "coded":
+        # 公开常量派生：salt 就在文件头里，谁都能算出同一把 key —— 这正是「编码」
+        # 而非「加密」的定义。留着 salt 是为了两种模式共用一套头结构。
+        return hashlib.sha256(_DOMAIN + b"|coded|" + salt).digest()
+    iters = int(blob.get("iter") or CONTAINER_ITERATIONS)
+    if not (_MIN_ITER <= iters <= _MAX_ITER):
+        # 头里的迭代数在验 tag 之前就能被改：改到 10 亿会把导入直接卡死。
+        # 这里设上下限，纯粹是防这种DoS，不是安全边界（伪造 tag 仍需要口令）。
+        raise BackupError("备份头里的派生参数不合法，文件可能已损坏。")
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"),
+                               salt, iters, 32)
+
+
+def _codec_aad(blob):
+    """认证串覆盖**全部**头字段 + 密文，含 format / mode / iter / salt / nonce。
+
+    用长度前缀而不是 b"|".join：头里一旦有变长字段（口令提示之类），拼接就会有
+    「a|bc」和「ab|c」撞车的歧义。长度前缀把每个字段的边界写死，改一个字节、
+    改模式、把 iter 调小、把 format 改成明文格式，tag 都会对不上。
+    """
+    parts = (_DOMAIN,
+             str(blob.get("format") or "").encode("utf-8"),
+             str(blob.get("container") or "").encode("ascii"),
+             str(blob.get("mode") or "").encode("ascii"),
+             str(blob.get("iter") or "").encode("ascii"),
+             _b64d(blob.get("salt")), _b64d(blob.get("nonce")),
+             _b64d(blob.get("data")))
+    return b"".join(struct.pack(">I", len(x)) + x for x in parts)
+
+
+def seal_payload(payload, password=""):
+    """快照 dict → 容器 dict。`password` 为空就是编码态，导入无需口令。"""
+    if not isinstance(payload, dict):
+        raise BackupError("要导出的快照不是对象。")
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    buf = io.BytesIO()
+    with gzip.GzipFile(filename="", fileobj=buf, mode="wb",
+                       compresslevel=6, mtime=0) as gz:
+        gz.write(raw)
+    gz_bytes = buf.getvalue()
+
+    mode = "sealed" if password else "coded"
+    salt = os.urandom(_SALT_LEN)
+    nonce = os.urandom(_NONCE_LEN)
+    blob = {"format": CONTAINER_FORMAT, "container": CONTAINER_VERSION,
+            "mode": mode,
+            "iter": CONTAINER_ITERATIONS if mode == "sealed" else 0,
+            "salt": _b64e(salt), "nonce": _b64e(nonce),
+            "data": "", "tag": ""}
+    enc_key, mac_key = _codec_subkeys(_codec_key(blob, password or ""))
+    blob["data"] = _b64e(_codec_xor(
+        gz_bytes, _codec_stream(enc_key, nonce, len(gz_bytes))))
+    blob["tag"] = _b64e(hmac.new(mac_key, _codec_aad(blob),
+                                 hashlib.sha256).digest())
+    return blob
+
+
+def dump_container(path, payload, password=""):
+    """导出一份编码 / 加密备份，`.gz` 路径下整份文件是真 gzip（默认的 `.json.gz`）。
+
+    两层 gzip 各管一件事，别合并：
+      * **内层**（seal_payload 里）：把快照明文压小了再编码 —— 密文压不动，
+        所以必须「先压后加」，这层决定备份体积；
+      * **外层**（这里）：用户要的 `.json.gz` 文件格式。解压后是容器 JSON，
+        只有 format / mode / 一串 data，看不到笔记正文。外层压的是 base64
+        高熵字节、省不了多少体积，但后缀写了 `.gz` 就得是真 gzip，否则资源
+        管理器、解压工具和 load() 的魔数识别会一起错位。
+
+    剥壳顺序由 load() 负责：先按 `\x1f\x8b` 魔数 gunzip → json.loads → 认出
+    容器 → unseal_payload 验 tag → 内层 gunzip。所以旧版 `.json.gz`（gzip 里
+    直接是明文快照 JSON）和新的容器格式共用同一个后缀，靠内容区分。
+    """
+    blob = seal_payload(payload, password)
+    return _write_file(path, json.dumps(blob, ensure_ascii=False,
+                                       indent=2).encode("utf-8"))
+
+
+def unseal_payload(blob, password=None):
+    """容器 dict → 快照 dict。先验认证再解密；任何一步不过都抛 BackupError。"""
+    if not isinstance(blob, dict) or blob.get("format") != CONTAINER_FORMAT:
+        raise BackupError("不是素笺的备份容器。")
+    try:
+        ver = int(blob.get("container") or 0)
+    except Exception:
+        ver = 0
+    if ver != CONTAINER_VERSION:
+        raise BackupError(
+            "这份备份来自更新的程序版本（容器 v%s，本程序只认到 v%d）。\n"
+            "请先升级程序，再用它导入。" % (blob.get("container"), CONTAINER_VERSION))
+    mode = blob.get("mode")
+    if mode not in ("coded", "sealed"):
+        raise BackupError("备份容器的模式不认识，文件可能已损坏。")
+    if mode == "sealed" and not password:
+        raise NeedPassword("这份备份设了口令，请输入口令后重试。")
+    try:
+        key = _codec_key(blob, password or "")
+        enc_key, mac_key = _codec_subkeys(key)
+        want = _b64d(blob.get("tag"))
+        got = hmac.new(mac_key, _codec_aad(blob), hashlib.sha256).digest()
+    except BackupError:
+        raise
+    except Exception:
+        raise BackupError("备份文件头损坏。")
+    if not hmac.compare_digest(want, got):
+        # 口令错和文件被改对攻击者必须是同一句话，别给区分的线索。
+        # 且这是**硬拦**：decode() 的 checksum 只警告、允许强行继续，那是完整性
+        # 提示，跟这里的认证完全不是一回事。
+        raise BackupError("口令不正确，或备份文件已损坏。")
+    try:
+        ct = _b64d(blob["data"])
+        gz = _codec_xor(ct, _codec_stream(enc_key, _b64d(blob["nonce"]), len(ct)))
+        return json.loads(gzip.decompress(gz).decode("utf-8-sig"))
+    except Exception:
+        raise BackupError("备份内容已损坏，无法还原。")
+
+
+def is_container(raw):
+    """文件里读出来的东西是不是本模块的容器（识别按内容，不按后缀）。"""
+    return isinstance(raw, dict) and raw.get("format") == CONTAINER_FORMAT
+
+
+def load(path, password=None):
+    """读文件 → dict。压缩与否看**魔数**而不是后缀（用户改过名也照样能读）。
+
+    容器（编码 / 加密）在这里自动剥壳还原成普通快照 dict，调用方拿到的形状
+    和读一份老明文备份完全一样 —— 所以 decode() 及后面所有逻辑都不用改。
+    `password` 只加密态用得着；加密态没给口令时抛 NeedPassword。
+    """
     try:
         with open(path, "rb") as f:
             head = f.read(2)
@@ -370,13 +608,16 @@ def load(path):
         else:
             with open(path, "rb") as f:
                 raw = f.read()
-        return json.loads(raw.decode("utf-8-sig"))
+        obj = json.loads(raw.decode("utf-8-sig"))
     except UnicodeDecodeError:
         raise BackupError("文件不是 UTF-8 文本，可能不是素笺的备份文件。")
     except ValueError as e:
         raise BackupError("不是有效的 JSON：\n%s" % e)
     except Exception as e:
         raise BackupError("读取失败：\n%s" % e)
+    if is_container(obj):
+        return unseal_payload(obj, password)
+    return obj
 
 
 # ---------- 解码（导入） ----------
@@ -494,6 +735,11 @@ def _clean_note(n, folder_id, now):
         out["links"] = links
     else:
         out.pop("links", None)
+    col = _clean_color(n.get("color"))
+    if col:
+        out["color"] = col
+    else:
+        out.pop("color", None)
     sec = n.get("sec")
     if isinstance(sec, dict) and sec.get("data"):
         out["sec"] = sec
@@ -532,7 +778,13 @@ def merge_styles(cur_styles, styles):
 
 
 def overwrite(d, cur=None):
-    """覆盖式导入：内容全替换，外观采用备份里的值。"""
+    """覆盖式导入：内容全替换，外观采用备份里的值。
+
+    说明笔记单独补：`encode` 不导出它（见那里的理由），所以「覆盖」之后库里不能真的
+    没有这篇 —— 它是唯一一份使用说明，缺了就再也找不回来。新备份里没有、老备份里
+    有，两种都照顾：已经带着（老备份）就原样用，没带就当场按**当前版本**重建一篇，
+    排版和快捷键表跟着程序走。
+    """
     cur = cur or {}
     now = time.time() * 1000
     folders = [dict(f) for f in (d.get("folders") or [])
@@ -554,10 +806,16 @@ def overwrite(d, cur=None):
         if not rec.get("id"):
             rec["id"] = uid()
         notes.append(rec)
-    return {"folders": folders, "notes": notes,
-            "current_folder": "f_all", "current_note": None,
-            "settings": merge_prefs(cur.get("settings"), d.get("prefs"), adopt=True),
-            "styles": merge_styles(cur.get("styles"), d.get("styles"))}
+    if not any(n.get("sample") for n in notes):
+        notes.insert(0, new_sample_note(now))
+    out = {"folders": folders, "notes": notes,
+           "current_folder": "f_all", "current_note": None,
+           "settings": merge_prefs(cur.get("settings"), d.get("prefs"), adopt=True),
+           "styles": merge_styles(cur.get("styles"), d.get("styles"))}
+    # 备份里没有「系统」文件夹（encode 不导出），说明笔记也由上面重建 ——
+    # 这一句把它俩接上：补出文件夹、把 sample 收进去，钉在第一个真实文件夹位
+    _ensure_system_folder(out)
+    return out
 
 
 def merge(d, cur):
@@ -632,11 +890,13 @@ def merge(d, cur):
         notes.append(rec)
         have_ids.add(nid)
         have_rev[r] = nid
-    return {"folders": folders, "notes": notes,
-            "current_folder": cur.get("current_folder", "f_all"),
-            "current_note": cur.get("current_note"),
-            "settings": merge_prefs(cur.get("settings"), d.get("prefs"), adopt=False),
-            "styles": merge_styles(cur.get("styles"), d.get("styles"))}
+    out = {"folders": folders, "notes": notes,
+           "current_folder": cur.get("current_folder", "f_all"),
+           "current_note": cur.get("current_note"),
+           "settings": merge_prefs(cur.get("settings"), d.get("prefs"), adopt=False),
+           "styles": merge_styles(cur.get("styles"), d.get("styles"))}
+    _ensure_system_folder(out)      # 本机老库里可能还没这一格（备份也不会带过来）
+    return out
 
 
 def summary(d):

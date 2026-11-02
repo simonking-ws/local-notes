@@ -59,12 +59,12 @@ _MARK_NBSP = "\u00a0\u00a0"
 BULLET_GLYPH = "\u25cf"                # ● 实心圆点
 BULLET_GLYPH_OLD = "\u2022"            # • 旧版小圆点（存量笔记里还有）
 
-_M_BULLET = BULLET_GLYPH + _MARK_NBSP  # "●␣␣"
-_M_TRI = "\u27a4" + _MARK_NBSP         # "➤␣␣"（Office 项目符号风格）
+BULLET_BODY = BULLET_GLYPH + _MARK_NBSP  # "●␣␣"
+TRI_BODY = "\u27a4" + _MARK_NBSP         # "➤␣␣"（Office 项目符号风格）
 
-BULLET_MARK = LI_INDENT + _M_BULLET
+BULLET_MARK = LI_INDENT + BULLET_BODY
 NUM_MARK = LI_INDENT + "1." + _MARK_NBSP
-TRI_MARK = LI_INDENT + _M_TRI
+TRI_MARK = LI_INDENT + TRI_BODY
 
 # 符号 -> 列表种类。「•」和「●」是两代项目符号（都认），「▸」「➤」同理
 _MARK_KIND = {BULLET_GLYPH: "bullet", BULLET_GLYPH_OLD: "bullet",
@@ -126,9 +126,43 @@ TODO_GAP = _MARK_NBSP
 # 方框后面那个间隙的标签：只借字号撑行高，不带颜色（勾选态的绿底不该铺到间隙上）。
 TODO_GAP_TAG = "todo_gap"
 
+# 四种行级列表。顺序就是工具栏上的排列顺序，右键菜单也照这个顺序摆。
+LIST_KINDS = ("bullet", "numbered", "triangle", "check")
 
-def split_list_prefix(txt):
+
+def list_marker(kind, indent=LI_INDENT):
+    """返回某一类列表的完整行首标记（含缩进）。
+
+    工具栏插入、列表互转、markdown 快捷三条路都从这里取标记，四者的字符形态
+    才不会各写一份、慢慢走样。待办一律给**未勾**态：勾选态是用户点出来的，
+    转换出来的新待办不该一出生就是「已完成」。
+    """
+    if kind == "bullet":
+        return indent + BULLET_BODY
+    if kind == "numbered":
+        return indent + "1." + _MARK_NBSP
+    if kind == "triangle":
+        return indent + TRI_BODY
+    if kind == "check":
+        return indent + TODO_OFF + TODO_GAP
+    raise ValueError("unknown list kind: %r" % (kind,))
+
+
+def renumber_prefix(prefix, n):
+    """把有序列表前缀里的序号换成 n，缩进与标记后的空白原样保留。
+
+    只替换第一串数字：缩进是空格、标记后是 NBSP，前缀里唯一的数字就是序号。
+    """
+    return re.sub(r"\d+", str(n), prefix, count=1)
+
+
+def split_list_prefix(txt, allow_empty=False):
     """拆出整行开头的列表前缀，返回 (kind, prefix)。
+
+    `allow_empty` 默认 False：只有标记没有正文的行**不算**列表（回车续接出来的
+    空项按普通空行处理，再按一次回车就退出列表）。工具栏的切换 / 互转 / 重编号
+    需要认出这些空项，否则「点一下取消」会在空项上再叠一个标记，所以那些入口
+    显式传 True。
 
     prefix **含该行原有的缩进**，调用方原样拼回去即可保持缩进一致。
     长度恒等于正文里被它占掉的那一段 —— 拿它去定位「正文首字」是安全的，
@@ -170,7 +204,7 @@ def split_list_prefix(txt):
         pre = _unstick(body[:j])
         pre = TODO_LEGACY.get(pre[:1], pre[:1]) + pre[1:]
         return (kind, lead + pre)
-    if j == i or j >= len(body):
+    if j == i or (j >= len(body) and not allow_empty):
         return (None, "")
     pre = _unstick(body[:j])
     # 项目符号的老字形（•）在出口统一成现行字形（●）：调用方拿 prefix 与原文
