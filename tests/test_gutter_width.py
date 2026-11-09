@@ -39,6 +39,15 @@ class GutterWidthTest(unittest.TestCase):
         """字号变了要跟着变：栏宽 = 位数 × 单字宽 + 固定留白。"""
         self.assertEqual(widgets.gutter_width(16, 1) - widgets.gutter_width(8, 1), 32)
 
+    def test_mark_slot_extra_is_fixed(self):
+        """行号右侧标签槽的加宽是固定 extra，不随行数变（列宽稳定仍成立）。"""
+        SLOT = 22
+        widths = {widgets.gutter_width(UNIT, n, extra=SLOT)
+                  for n in (1, 9, 100, 9999)}
+        self.assertEqual(len(widths), 1)
+        self.assertEqual(widgets.gutter_width(UNIT, 1, extra=SLOT),
+                         widgets.gutter_width(UNIT, 1) + SLOT)
+
     def test_bad_input_does_not_explode(self):
         """总行数拿不到时（0 / None 边角）按 1 算，不能抛。"""
         self.assertEqual(widgets.gutter_width(UNIT, 0), widgets.gutter_width(UNIT, 1))

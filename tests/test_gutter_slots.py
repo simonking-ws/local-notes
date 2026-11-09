@@ -61,22 +61,76 @@ class HitAtTest(unittest.TestCase):
                      (196, 214, 5, "i7"), (214, 243, 7, "i15")]
 
     def test_hit_returns_target_line(self):
-        self.assertEqual(widgets.gutter_hit_at(self.hits, 5), (1, "i1"))
-        self.assertEqual(widgets.gutter_hit_at(self.hits, 185), (5, "i6"))
-        self.assertEqual(widgets.gutter_hit_at(self.hits, 230), (7, "i15"))
+        self.assertEqual(widgets.gutter_hit_at(self.hits, 5), (1, "i1", False))
+        self.assertEqual(widgets.gutter_hit_at(self.hits, 185), (5, "i6", False))
+        self.assertEqual(widgets.gutter_hit_at(self.hits, 230), (7, "i15", False))
 
     def test_boundary_is_half_open(self):
         """区间是 [top, bottom)：178 不算上一格，落到下一格。"""
-        self.assertEqual(widgets.gutter_hit_at(self.hits, 178), (5, "i6"))
-        self.assertEqual(widgets.gutter_hit_at(self.hits, 214), (7, "i15"))
+        self.assertEqual(widgets.gutter_hit_at(self.hits, 178), (5, "i6", False))
+        self.assertEqual(widgets.gutter_hit_at(self.hits, 214), (7, "i15", False))
+
+    def test_padding_flag_is_passed_through(self):
+        """正文下方那一格的号是虚号：hit 要把它标出来，点击才不会跑去标末行。"""
+        hits = [(240, 269, 12, "p12", True), (269, 298, 12, "p13", True)]
+        self.assertEqual(widgets.gutter_hit_at(hits, 250), (12, "p12", True))
+        # 旧的四元组登记仍当实号处理（兼容历史数据 / 老探针）
+        self.assertEqual(widgets.gutter_hit_at([(0, 29, 1, "i1")], 5), (1, "i1", False))
 
     def test_gap_returns_none(self):
-        self.assertEqual(widgets.gutter_hit_at(self.hits, 100), (None, None))
-        self.assertEqual(widgets.gutter_hit_at(self.hits, 999), (None, None))
+        self.assertEqual(widgets.gutter_hit_at(self.hits, 100), (None, None, False))
+        self.assertEqual(widgets.gutter_hit_at(self.hits, 999), (None, None, False))
 
     def test_empty(self):
-        self.assertEqual(widgets.gutter_hit_at([], 5), (None, None))
-        self.assertEqual(widgets.gutter_hit_at(None, 5), (None, None))
+        self.assertEqual(widgets.gutter_hit_at([], 5), (None, None, False))
+        self.assertEqual(widgets.gutter_hit_at(None, 5), (None, None, False))
+
+
+class PaintCellsTest(unittest.TestCase):
+    """徽标挂哪一格：一行占多格时只挂**行首格**（见 widgets.gutter_paint_cells）。
+
+    号本身是每格都画的（号 = 格序号），这个函数只决定 gmark 徽标 / 折叠箭头
+    画在哪里 —— 每格都挂的话，标记一行会让整块旁边亮成一片。
+    """
+
+    def test_normal_lines_all_marked(self):
+        self.assertEqual(widgets.gutter_paint_cells([(1, False), (2, False), (3, False)]),
+                         [True, True, True])
+
+    def test_tall_title_marks_first_slot_only(self):
+        """首行标题 44px 吃掉两格：徽标只挂第一格（点号 1，圈就在 1 旁边）。"""
+        self.assertEqual(
+            widgets.gutter_paint_cells([(1, False), (1, False), (2, False), (3, False)]),
+            [True, False, True, True])
+
+    def test_code_block_span(self):
+        """内嵌代码块占五六格：徽标只在行首那一格，中间不重复画圈。"""
+        cells = [(4, False)] + [(5, False)] * 5 + [(6, False)]
+        self.assertEqual(widgets.gutter_paint_cells(cells),
+                         [True, True, False, False, False, False, True])
+
+    def test_padding_keeps_every_slot(self):
+        """正文下方空白格每格都算行首（号接着数下去），只是不挂徽标。"""
+        self.assertEqual(widgets.gutter_paint_cells([(3, False), (3, True), (3, True)]),
+                         [True, True, True])
+
+
+class SlotNumberTest(unittest.TestCase):
+    """B 方案：号 = 格序号 + 1，一格一个，滚动只改起点，绝不跳号 / 重号。"""
+
+    def test_numbers_are_consecutive(self):
+        k0, k1 = widgets.gutter_slots(0, 29, 290)
+        self.assertEqual(k0, 0)
+        self.assertEqual(k1, 9)                      # 290/29 → 10 格
+        self.assertEqual([k + 1 for k in range(k0, k1 + 1)], list(range(1, 11)))
+
+    def test_scrolled_numbers_start_from_real_slot(self):
+        """往下滚 3 格：号从 4 起，仍然连续 —— 标题占两格也不会出现空号。"""
+        k0, k1 = widgets.gutter_slots(-87, 29, 290)
+        self.assertEqual(k0, 3)
+        nums = [k + 1 for k in range(k0, k1 + 1)]
+        self.assertEqual(nums[0], 4)
+        self.assertEqual(nums, list(range(4, nums[-1] + 1)))
 
 
 if __name__ == "__main__":

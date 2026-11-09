@@ -19,7 +19,7 @@ def _res_dir():
 
 _RES = _res_dir()
 
-FONT = ("PingFang SC", 13) if True else None  # 中文优先，回退雅黑
+FONT = ("PingFang SC", 13)  # 中文优先，回退雅黑
 # 若系统无 PingFang，则退回微软雅黑
 try:
     import tkinter.font as tkfont
@@ -698,11 +698,6 @@ def skin_look():
         return out
     except Exception:
         return {}
-
-
-def skin_accent(fallback=None):
-    """WorkBuddy **当前**的主题色（按钮 / 链接用的那个强调色）；读不到返回 fallback。"""
-    return skin_look().get("accent") or fallback
 
 
 def _doodle_veil(pal):

@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import time
+import colorsys
 import sqlite3
 import unicodedata
 
@@ -68,10 +69,56 @@ def _resolve_db():
 # 应用中文名（窗口标题 / 示例笔记 / 导出备份文件名统一取这里）
 APP_NAME = "素笺"
 
+# 回收站：一个**虚拟视图**（不落在 folders 表里），删掉的笔记 / 文件夹原样存进
+# 独立的 recycle_bin 表，7 天后自动清理。放在左下角常驻入口（见 app_ui）。
+# ⚠️ 不复用 SYSTEM_FOLDER 那套「文件夹 id」：回收站不是真实归属，把笔记塞进去
+# 会污染搜索 / 计数 / 备份；独立表也不动备份 schema（备份里不含回收站内容）。
+RECYCLE_FOLDER = "f_recycle"
+RECYCLE_TTL_DAYS = 7
+RECYCLE_TTL_MS = RECYCLE_TTL_DAYS * 24 * 60 * 60 * 1000
+
 # 笔记列表左缘那条色条的颜色（8 色，明度接近，只用来「区分」而不是「报警」）。
 # 顺序即分配顺序：新建笔记时挑当前用得最少的那个，用完一轮才重复。
 NOTE_COLORS = ("#e0524f", "#e08a3c", "#4f9e63", "#3f9b96",
                "#4a86d8", "#6a6fd0", "#9166c9", "#d2679b")
+
+# 相邻两条色条在色相环上至少差这么多度。8 色里有好几组「看着是一个色系」的：
+# 红/橙 27°、绿/青 42°、蓝/蓝紫 22°、蓝紫/紫 29°、品红/红 30°。只挡完全同色
+# 不够，挨在一起仍然分不出是两篇。80° 保证一眼能分出色相，且每种颜色至少还有
+# 3 个远色系候选，不会挑不出来。
+NOTE_COLOR_MIN_GAP = 80.0
+
+
+def _note_hue(color):
+    """取 #rrggbb 的色相角（0~360）；灰 / 非法 / 调色板外的颜色返回 None。"""
+    if not isinstance(color, str) or len(color) != 7 or not color.startswith("#"):
+        return None
+    try:
+        r, g, b = (int(color[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+    except ValueError:
+        return None
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    if s < 0.12 or l < 0.15 or l > 0.90:
+        return None
+    return h * 360.0
+
+
+def note_color_gap(a, b):
+    """两个颜色在色相环上的最短夹角（0~180）；量不到色相就当 180（不算冲突）。
+
+    只比色相不比明度：这 8 色明度本来就接近，靠色相拉开最有效。老数据里若有
+    调色板外的颜色，也别误判成冲突 —— 否则每次刷新都会被改一次。
+    """
+    ha, hb = _note_hue(a), _note_hue(b)
+    if ha is None or hb is None:
+        return 180.0
+    d = abs(ha - hb)
+    return min(d, 360.0 - d)
+
+
+def note_colors_are_far(a, b):
+    """相邻色条是否「色差够大」——判定口径的单一出口，UI 测试也复用它。"""
+    return note_color_gap(a, b) >= NOTE_COLOR_MIN_GAP
 
 
 def pick_note_color(notes, folder=None, avoid=()):
@@ -87,8 +134,8 @@ def pick_note_color(notes, folder=None, avoid=()):
     就是「这两条一模一样」）。先避开本文件夹已用的颜色，撞色就只会出现在笔记数
     超过 8 条、或者跨文件夹的「全部」视图里 —— 那种情况本来就不可能全不同。
 
-    `avoid` 是「这条笔记上下两位的颜色」：新建的笔记插在它们之间，撞上谁都得
-    再改一次，不如一开始就挑开。
+    `avoid` 是「这条笔记上下两位的颜色」：新建的笔记插在它们之间，撞上谁（或
+    跟谁同色系）都得再改一次，不如一开始就挑开。
     """
     cnt_all, cnt_here = {}, {}
     for n in notes or ():
@@ -100,8 +147,10 @@ def pick_note_color(notes, folder=None, avoid=()):
             cnt_here[c] = cnt_here.get(c, 0) + 1
     pool = [c for c in NOTE_COLORS if not cnt_here.get(c)] or list(NOTE_COLORS)
     if avoid:
-        # 只剩一两个候选色时不再强求：宁可撞色，也不能返回 None
-        pool = [c for c in pool if c not in avoid] or pool
+        # 连相近色系一起避开；只剩一两个候选色时不再强求：宁可撞色，也不能返回 None
+        far = [c for c in pool
+               if all(note_colors_are_far(c, other) for other in avoid)]
+        pool = far or pool
     # 同票（都是 0 或都一样多）时按调色板顺序，保证同一份数据每次算出同一个颜色
     return min(pool, key=lambda c: (cnt_all.get(c, 0), NOTE_COLORS.index(c)))
 
@@ -133,26 +182,30 @@ def _ensure_note_colors(data):
 
 
 def _pick_distinct(cnt, prev, nxt):
-    """挑一个既不等于上一条、也尽量不等于下一条的颜色。
+    """挑一个与上一条、下一条都不同色系的颜色。
 
     避下一条只是为了少改一次 —— A A B 这种排列里，中间那条若不看下一条，
-    很可能被挑成 B，于是又和后面撞上、还得再改一次。它不参与「不相邻」的保证。
+    很可能被挑成 B（或与 B 同色系），于是又和后面撞上、还得再改一次。
+    它不参与「不相邻」的保证。
     """
-    pool = [c for c in NOTE_COLORS if c != prev]
+    pool = [c for c in NOTE_COLORS if note_colors_are_far(c, prev)]
+    if not pool:                      # 兜底：宁可撞色系，也得返回一个合法色
+        pool = [c for c in NOTE_COLORS if c != prev] or list(NOTE_COLORS)
     if nxt is not None:
-        better = [c for c in pool if c != nxt]
+        better = [c for c in pool if note_colors_are_far(c, nxt)]
         if better:
             pool = better
     return min(pool, key=lambda c: (cnt.get(c, 0), NOTE_COLORS.index(c)))
 
 
 def resolve_adjacent_colors(ordered, persist=True):
-    """按**列表的显示顺序**消除相邻同色，返回 ({笔记 id: 颜色}, 是否有改动)。
+    """按**列表的显示顺序**让相邻两条色条色差够大，返回 ({笔记 id: 颜色}, 是否有改动)。
 
     为什么需要这一步：8 色分给 12 条笔记必然有重复色（调色板的上限），但「重复」
-    本身不致命 —— 致命的是两条同色的笔记紧挨着，扫一眼就像同一篇。所以只要撞上，
-    改后面那一条、前面的不动；从前往后走一遍，每一条都只受「上一条」这一个约束，
-    走完必定没有相邻同色（路径图的贪心着色，8 色绰绰有余）。
+    本身不致命 —— 致命的是两条颜色挨在一起分不出是两篇。这里不只挡完全同色，
+    还挡同色系（红/橙、绿/青、蓝/紫……色相夹角 < NOTE_COLOR_MIN_GAP）：撞上了
+    就改后面那一条、前面的不动；从前往后走一遍，每一条都只受「上一条」这一个
+    约束，走完必定没有相邻同色系（路径图的贪心着色，8 色绰绰有余）。
 
     顺序由调用方给（也就是 visible_notes() 排出来的那个顺序），这里不猜排序：
     置顶 / 星标会改变分组，搜索会改变成员，同一份颜色放在不同的行序里「相邻」
@@ -176,7 +229,7 @@ def resolve_adjacent_colors(ordered, persist=True):
     for i, n in enumerate(seq):
         c = cur[i]
         nxt = cur[i + 1] if i + 1 < len(cur) else None
-        if c is None or c == prev:
+        if c is None or not note_colors_are_far(c, prev):
             if c is not None:
                 cnt[c] -= 1
             c = _pick_distinct(cnt, prev, nxt)
@@ -202,6 +255,84 @@ BUSY_TIMEOUT_S = 2.0
 
 # 保存失败时写出的兜底快照前缀（与「导出备份」同格式，事后可用「导入数据」捞回）
 PENDING_PREFIX = "pending_"
+
+
+def _recycle_row(row):
+    """把 DB 行解成 {id, kind, payload, deleted_at, origin}；坏 JSON 当空快照。"""
+    rid, kind, payload, deleted_at, origin = row
+    try:
+        obj = json.loads(payload) if payload else None
+    except Exception:
+        obj = None
+    return {"id": rid, "kind": kind, "payload": obj or {},
+            "deleted_at": deleted_at or 0.0, "origin": origin or ""}
+
+
+def _recycle_note_lines(n):
+    """从快照的 content runs 里取前几行纯文本（保留换行，plain_of 会把换行抹平）。"""
+    buf, lines = [], [""]
+    for it in (n.get("content") or []):
+        try:
+            tag = it[0]
+        except Exception:
+            continue
+        if tag == "t":
+            for ch in (it[1] if len(it) > 1 else ""):
+                if ch == "\n":
+                    lines.append("")
+                elif ch in TODO_MARKS:
+                    continue
+                else:
+                    lines[-1] += ch
+        elif tag == "code":
+            for ch in (it[2] if len(it) > 2 else ""):
+                if ch == "\n":
+                    lines.append("")
+                else:
+                    lines[-1] += ch
+        elif tag == "w":
+            lines[-1] += " "
+        elif tag == "img":
+            d = it[1] if len(it) > 1 and isinstance(it[1], dict) else {}
+            a = str(d.get("alt") or "").strip()
+            if a:
+                lines[-1] += a
+    return ["".join(x).strip() for x in lines]
+
+
+def recycle_item_view(rec, days=RECYCLE_TTL_DAYS):
+    """把一条回收站记录装成「笔记行能直接画」的假笔记。
+
+    id 用回收记录 id（不是原笔记 id）：行里所有点击都按它找回收记录，绝不会
+    误打开真笔记。content 是普通 runs，列表的 title_of / preview_of 照常用。
+    """
+    p = rec.get("payload") or {}
+    if rec.get("kind") == "folder":
+        folders = p.get("folders") or []
+        # 删除时 origin 记的就是被删文件夹的 id，快照里还带着它的子孙。
+        # 按 id 精确取回那一层的名字：别读 payload["folder"]（删除时根本不写这个键，
+        # 旧代码因此永远退化成「未命名」），也别在有多层子孙时误取到子文件夹的名。
+        origin = rec.get("origin")
+        fol = next((f for f in folders if f.get("id") == origin), None)
+        if fol is None:
+            fol = folders[0] if folders else {}
+        n_fol = len(folders)
+        n_note = len(p.get("notes") or [])
+        title = "文件夹 · %s" % (fol.get("name") or "未命名")
+        desc = "%d 个子文件夹 · %d 条笔记" % (max(0, n_fol - 1), n_note)
+    else:
+        lines = _recycle_note_lines(p)
+        title = lines[0] if lines else "未命名笔记"
+        desc = (lines[1] if len(lines) > 1 else "")
+    left = max(0, days - int((time.time() * 1000 - rec.get("deleted_at", 0)) /
+                             86400000 + 0.999))
+    tail = "%d 天后自动清除" % left if left else "即将清除"
+    return {"id": rec["id"], "folder": RECYCLE_FOLDER,
+            "content": [["t", title], ["t", "\n" + (desc + " · " if desc else "") + tail]],
+            "plain": "", "pinned": False, "starred": False, "order": None,
+            "created": rec.get("deleted_at", 0.0),
+            "updated": rec.get("deleted_at", 0.0),
+            "recycle": rec}
 
 
 def uid():
@@ -477,6 +608,9 @@ def plain_of(n):
             s.append(it[2] if len(it) > 2 else "")
         elif it[0] == "hr":
             continue                   # 分割线是纯装饰，不产生搜索文本
+        elif it[0] == "img":
+            d = it[1] if len(it) > 1 and isinstance(it[1], dict) else {}
+            s.append(str(d.get("alt") or ""))  # 图片的 alt 可搜，路径不搜
     txt = "".join(s)
     # 待办框现在是**字面字符**：方框连着后面那个间隙空格，正好顶掉一个空格。
     # 不换掉的话搜索文本里会混进方框字符，搜「买菜」命中的是「⬜ 买菜」，
@@ -509,21 +643,24 @@ ALARM_INDEX_TITLE = "任务提醒列表"
 # 汇总表用 **tag 级制表位** 分列：\t 后的字段由 Tk 按像素定位，与字体、任务名
 # 长短、中英文混排都无关。实测正文字体中文 15px / 半角空格 8px（1.875 倍，不是 2），
 # 按「中文算 2 格补空格」每行会按汉字数累积误差；交给制表位才真的对齐。
-# tabs 只挂在 ALARM_ROW_TAG 上，普通笔记里的 \t 仍是默认制表位，也不用切笔记时
-# 还原 widget 级配置；具体像素在 app_ui._config_tags() 里按当前字号现算。
+# 汇总表的 tabs 挂在 ALARM_ROW_TAG 上，普通笔记走 widget 级制表位（2 个汉字宽，
+# 见 app_ui.EDITOR_TAB_HANZI）；tag 级设置会覆盖 widget 级，两者互不干扰。
+# 具体像素在 app_ui._config_tags() 里按当前字号现算。
 ALARM_ROW_TAG = "alarm_row"
-# 五列**固定宽度**（半角列，一个汉字算 2 列）。每一格超宽都截断加 …，鼠标悬浮
-# 在正文里由 app_actions._on_cell_motion 用 _alarm_cell_tips 查全文浮出来。
-# 这组数还决定整张表的宽度：默认窗口的正文区约 590px，半角一列约 9px，
-# 17+20+6+6+12 = 61 列 ≈ 549px，加列间空隙 573px —— 五列一屏放得下，不用横向拖。
-# 两个状态列只有 6 列，是因为格子里只写「是 / 否」—— 字段名在表头，格子里再
-# 重复一遍「已完成：」要多吃 4 个汉字宽，任务名就只剩七八个字了。
+# 四列**固定宽度**（半角列，一个汉字算 2 列）。2026-11-18 用户拍板把原「已完成 /
+# 已确认」两列合成一列「状态」：●待提醒 / ○已过期 / ✓已确认 / ◇仅标记，配色在
+# app_ui._config_tags() 按状态 tag 给。合成后 17+24+8+12 = 61 列，与旧五列总宽
+# 完全相同 —— 窗口布局、横向不滚动这些性质都保住了，任务列还多出 4 列。
+# 每一格超宽都截断加 …，悬浮由 app_actions._on_cell_motion 用 _alarm_cell_tips 查全文。
 # ⚠️ 改了这里要同步 app_ui._config_tags() 的制表位：那儿的列距就是按这组数算的，
 # 只改一边会出现「格子截得短、列却留得宽」的空当。
-ALARM_COLS = (17, 20, 6, 6, 12)
+ALARM_COLS = (17, 24, 8, 12)
 ALARM_TASK_COL = ALARM_COLS[1]      # 旧名，留作兼容（「任务」列宽）
 ALARM_CELL_TAG = "ac_"              # 单元格标签前缀：ac_<行号>_<列号>，只挂被截断的格
-ALARM_HEADERS = ("提醒时间", "任务", "已完成", "已确认", "来源笔记")
+ALARM_HEADERS = ("提醒时间", "任务", "状态", "来源笔记")
+# 状态格专用 tag（前缀 + 状态名），app_ui._config_tags 按它配 foreground。
+# 它们和 ALARM_ROW_TAG 叠在同一段字符上：制表位取后者，颜色取前者。
+ALARM_STATE_TAG_PREFIX = "alarm_st_"
 
 # 「系统」文件夹：程序自带的一格，专放内置说明笔记。用户不能改名、删除、移动它，
 # 也不能把别的笔记拖进去。判定只认固定 id —— 它本来就是唯一的，多存一个字段
@@ -829,7 +966,7 @@ def _note_head(n):
             if len(it) > 1 and it[1] == "\n":
                 break
             s.append(it[1] if len(it) > 1 else "")
-        elif it[0] in ("hr", "code", "alarm", "w"):
+        elif it[0] in ("hr", "code", "img", "alarm", "w"):
             break
     out = "".join(s).strip()
     if out:
@@ -874,10 +1011,10 @@ def _clip_cell(s, max_w):
 
 
 def _alarm_row(cells):
-    """一条表格行：制表符分列，逐字符挂 ALARM_ROW_TAG（制表位只认带标签的行）。
+    """一条表格行：制表符分列，逐字符挂 ALARM_ROW_TAG（四列的对齐靠 tag 级制表位）。
 
     cells 是 `[(文本, 额外标签), ...]`。内链那格额外带 lk_N + 共用的 link：
-    少了 link 点击不生效，少了 ALARM_ROW_TAG 这一行就没有制表位。
+    少了 link 点击不生效，少了 ALARM_ROW_TAG 这一行就会退回正文的 2 汉字 Tab 宽。
     ⚠️ 行尾换行刻意不带标签：实测不带也生效，还不会把标签范围连到下一行。
     """
     out = []
@@ -891,23 +1028,22 @@ def _alarm_row(cells):
 def alarm_index_content(data, now=None):
     """扫全库任务提醒，返回「任务提醒列表」的 `(content, links, tips)`。纯函数，不碰 UI。
 
-    排版是一张 **五列表格**：提醒时间 / 任务 / 已完成 / 已确认 / 来源笔记，
-    列间用制表符分隔、逐字符挂 ALARM_ROW_TAG；真正对齐由
-    `app_ui._config_tags()` 配在这个标签上的 **tag 级制表位**按像素完成。
-    不用空格补齐：正文字体中文 15px、半角空格 8px（1.875 倍，不是 2），
-    按字数补空格会按汉字数累积误差，制表位则与内容长度完全无关。
-    上面一行加粗表头定字段名，数据行的状态列只写「是 / 否」（表头已经说过
-    这一列是什么，格子里再重复一遍字段名纯属占宽度）。
+    排版是一张 **四列表格**：提醒时间 / 任务 / 状态 / 来源笔记，列间用制表符
+    分隔、逐字符挂 ALARM_ROW_TAG；真正对齐由 `app_ui._config_tags()` 配在
+    这个标签上的 **tag 级制表位**按像素完成。不用空格补齐：正文字体中文 15px、
+    半角空格 8px（1.875 倍，不是 2），按字数补空格会按汉字数累积误差。
 
-    - 已完成：`alarm.is_done()` = 提醒时刻已过，跟着时钟自动翻面，不落库。
+    状态列 2026-11-18 由原「已完成 / 已确认」两列合并：调用 `alarm.state_of()`
+    判四态，取 `alarm.STATE_SYMBOLS` 的 BMP 符号 + 文案，挂 `alarm_st_<state>`
+    tag 着色。判定口径与正文卡片共用同一个纯函数，不会两处对不上。
+
+    - 已过期：提醒时刻已过，跟着时钟自动翻面，不落库。
     - 已确认：`settings["alarm_acked"]` 里有 `<note_id>|<alarm_id>` 才算 —— 只有
-      用户真点过到点弹窗的「知道了」会写它；关机期间过期、回来自动补记的
-      `alarm_fired` 不算确认（两条状态各管一件事）。
-    - 有时间的按时间升序（最早该做的排最前），没设时间的沉底。
-    - **五列都是固定宽度**（ALARM_COLS，按显示宽度算），超宽的格截断加 …；
-      被截断的那一格多挂一枚 `ac_<行>_<列>` 标签，全文按标签收进 `tips` ——
-      鼠标悬浮在正文里时由 app_actions 用它把原样文字浮出来。
-      `tips` 只在内存里用（不落库：它每次都跟着 content 现算）。
+      用户真点过弹窗的「知道了」/ 卡片的「完成」会写它；自动补记的 `alarm_fired` 不算。
+    - 已确认优先于已过期（点过确认还显示已过期会让人以为没生效）。
+    - 有时间的按时间升序，没设时间的沉底。
+    - **四列都是固定宽度**（ALARM_COLS），超宽的格截断加 …；被截断的格多挂
+      `ac_<行>_<列>` 标签，全文按标签收进 `tips`，供悬浮显示。`tips` 只在内存用。
     """
     now = time.time() if now is None else now
     acked = (data.get("settings") or {}).get("alarm_acked") or {}
@@ -920,12 +1056,20 @@ def alarm_index_content(data, now=None):
                     or not isinstance(it[1], dict)):
                 continue
             rows.append((n.get("id") or "", it[1], _note_head(n)))
-    rows.sort(key=lambda r: (0 if (r[1].get("at") or 0) else 1,
-                             r[1].get("at") or 0, r[2]))
+    def _sort_key(r):
+        d = r[1]
+        if not d.get("at"):
+            return (1, 0, r[2])
+        if alarm.repeat_kind(d) != alarm.REPEAT_ONCE:
+            # 重复提醒按下次该响的时刻排（今天已过的算明天），不再用起始锚点
+            return (0, alarm.next_occ(d, now) or 0, r[2])
+        return (0, d.get("at") or 0, r[2])
+    rows.sort(key=_sort_key)
 
     out = _line(ALARM_INDEX_TITLE, ["title"])
-    out += _line("共 %d 条 · 提醒时间已过即算「已完成」，点过到点弹窗的「知道了」才算「已确认」。"
-                 "过长的格子会截断，鼠标停上去看全文，点 @笔记名 跳回原文。" % len(rows), ["quote"])
+    out += _line("共 %d 条 · ●待提醒 ○已过期 ✓已确认 ◇仅标记；"
+                 "时间过了自动翻「已过期」，点过「知道了」才算「已确认」。"
+                 "过长的格子截断后停上去看全文，点 @笔记名 跳回原文。" % len(rows), ["quote"])
     out += [["t", "\n", []]]
     if not rows:
         out += _line("还没有任务提醒。在任意笔记里点工具栏的小闹钟插入一条，这里会自动列出来。")
@@ -941,19 +1085,23 @@ def alarm_index_content(data, now=None):
         # note: 前缀由 mention.note_url 定义；这里的字符串必须与它一致，
         # 否则 _on_link_click 认不出内链、点击会当成普通网址丢给浏览器
         links[tag] = "note:%s" % nid
-        when = alarm.fmt_full(d.get("at")) or "未设时间"
-        # 只写「是 / 否」：「已完成」「已确认」这两个字段名在表头上，格子里再重复
-        # 一遍要多占 4 个汉字宽，那点宽度留给任务名更值
-        done = "是" if alarm.is_done(d, now) else "否"
-        conf = "是" if acked.get("%s|%s" % (nid, d.get("id") or "")) else "否"
+        # 时间列对重复提醒显示规则（每天 09:00 / 每周一三五 09:00），
+        # 一次性的还是原来的绝对时间 —— 两者宽度都要塞进 17 列的格子里
+        when = (alarm.fmt_repeat(d, now) if alarm.repeat_kind(d) != alarm.REPEAT_ONCE
+                else alarm.fmt_full(d.get("at"))) or "未设时间"
+        st = alarm.state_of(d, acked=bool(acked.get(
+            alarm.state_key("%s|%s" % (nid, d.get("id") or ""), d, now))), now=now)
+        status = alarm.STATE_SYMBOLS[st] + alarm.STATE_LABELS[st]
         task = _one_line(d.get("text")) or "（未填写任务）"
         head = "@" + _one_line(title)
         cells = []
-        for col, full in enumerate((when, task, done, conf, head)):
+        for col, full in enumerate((when, task, status, head)):
             shown = _clip_cell(full, ALARM_COLS[col])
             # 来源笔记那格：lk_N 记 URL，"link" 是共用的可点标签（点击/手型事件
             # 绑在它上面），两者都要；ALARM_ROW_TAG 由 _alarm_row 统一挂
-            extra = [tag, "link"] if col == 4 else []
+            extra = [tag, "link"] if col == 3 else []
+            if col == 2:
+                extra.append(ALARM_STATE_TAG_PREFIX + st)   # 状态列按四态着色
             if shown != full:
                 # 只有真被截断的格才挂标签：没截的格子浮一条一模一样的文字只是噪音
                 cell_tag = "%s%d_%d" % (ALARM_CELL_TAG, i, col + 1)
@@ -1185,6 +1333,15 @@ class Store(object):
                 color   TEXT);
             CREATE INDEX IF NOT EXISTS idx_notes_folder ON notes(folder);
             CREATE INDEX IF NOT EXISTS idx_notes_star   ON notes(starred);
+            -- 回收站：payload 是整条笔记 / 整棵文件夹子树的 JSON 快照，
+            -- 还原时原样放回（id 冲突时才重新分配，见 app_actions.recycle_restore）。
+            CREATE TABLE IF NOT EXISTS recycle_bin (
+                id         TEXT PRIMARY KEY,
+                kind       TEXT,
+                payload    TEXT,
+                deleted_at REAL,
+                origin     TEXT);
+            CREATE INDEX IF NOT EXISTS idx_recycle_time ON recycle_bin(deleted_at);
         """)
         # 老库补列（本版新增 pos）：没有它读出来的顺序不稳定，导出/新建顺序会漂
         cols = {r[1] for r in c.execute("PRAGMA table_info(notes)")}
@@ -1357,6 +1514,55 @@ class Store(object):
         except Exception:
             return default
 
+    # ---------- 回收站（独立表，不进 data / 备份） ----------
+    def recycle_put(self, kind, payload, origin=None, rid=None, now=None):
+        """把一份删除快照放进回收站，返回它的 id。
+
+        kind 只认 "note" / "folder"；payload 是 note dict 或
+        {"folders": [...], "notes": [...]} 的整棵子树快照。
+        """
+        rid = rid or uid()
+        deleted_at = (now if now is not None else time.time() * 1000)
+        with self.con:
+            self.con.execute(
+                "INSERT OR REPLACE INTO recycle_bin(id,kind,payload,deleted_at,origin)"
+                " VALUES(?,?,?,?,?)",
+                (rid, kind, json.dumps(payload, ensure_ascii=False),
+                 deleted_at, origin or ""))
+        return rid
+
+    def recycle_get(self, rid):
+        row = self.con.execute(
+            "SELECT id,kind,payload,deleted_at,origin FROM recycle_bin WHERE id=?",
+            (rid,)).fetchone()
+        return _recycle_row(row) if row else None
+
+    def recycle_all(self):
+        rows = self.con.execute(
+            "SELECT id,kind,payload,deleted_at,origin FROM recycle_bin"
+            " ORDER BY deleted_at DESC, id DESC").fetchall()
+        return [_recycle_row(r) for r in rows]
+
+    def recycle_count(self):
+        return self.con.execute("SELECT COUNT(*) FROM recycle_bin").fetchone()[0]
+
+    def recycle_remove(self, rid):
+        with self.con:
+            self.con.execute("DELETE FROM recycle_bin WHERE id=?", (rid,))
+
+    def recycle_clear(self):
+        with self.con:
+            self.con.execute("DELETE FROM recycle_bin")
+
+    def recycle_purge(self, now=None):
+        """清掉超过 7 天的条目，返回删掉几条。只读检查也用它（传 now 不改真实数据）。"""
+        now = (now if now is not None else time.time() * 1000)
+        cutoff = now - RECYCLE_TTL_MS
+        with self.con:
+            cur = self.con.execute(
+                "DELETE FROM recycle_bin WHERE deleted_at < ?", (cutoff,))
+        return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
     # ---------- 写 ----------
     def save(self, d, full=False):
         """把内存数据落库。默认只写签名变了的笔记（full=True 时全量重写）。"""
@@ -1485,6 +1691,7 @@ class Store(object):
             self.con.execute("DELETE FROM notes")
             self.con.execute("DELETE FROM folders")
             self.con.execute("DELETE FROM meta")
+            self.con.execute("DELETE FROM recycle_bin")   # 清空数据 = 连回收站一起清
         self._sig = {}
         self._pos = {}
         self.save(d, full=True)

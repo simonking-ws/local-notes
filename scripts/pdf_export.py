@@ -459,6 +459,27 @@ class Layout(object):
                     self.opts["right"], self.y + 0.7, self.opts["rule"]))
         self.y += gap * 0.4
 
+    def image(self, alt=""):
+        """图片的 PDF 占位：一个淡框 + 一行 [图片：alt]。
+
+        PDF 不嵌位图本体（那要把 PNG 编进 XObject，留待后续）；导出里明确
+        标出「这里有一张图」比静默丢掉强 —— 用户能据此决定去 Markdown 版看。
+        """
+        h = 30
+        self._ensure(h + 8)
+        self.y += 4
+        self._emit(("frame", self.opts["left"], self.y,
+                    self.opts["right"], self.y + h, self.opts["rule"], 1))
+        self.y += 8
+        label = "[图片：%s]" % (alt or "无说明")
+        f = _Font(self.opts["font"], max(8, self.opts["body"] * 0.85))
+        chunks = [(ch, f, self.opts["pal"].get("soft", "#76767e"), False)
+                  for ch in label]
+        self.para(chunks, self.opts["left"] + 6,
+                  max(40, self.opts["width"] - 12),
+                  max(8, self.opts["body"] * 0.85))
+        self.y += 4
+
 
 # ---------- 第二批 GDI 图元（圆点 / 三角 / 方框 / 折线） ----------
 
@@ -620,6 +641,9 @@ def build_document(gdi, blocks, opts):
         if kind_b == "hr":
             lay.hr()
             continue
+        if kind_b == "img":
+            lay.image(b.get("alt") or "")
+            continue
         text = ex.line_text(b)
         if not text.strip():
             step = body * 0.95
@@ -680,6 +704,11 @@ def paint(gdi, pages, opts):
                 if op[0] == "rect":
                     gdi.fill_rect(op[1] * scale, op[2] * scale,
                                   op[3] * scale, op[4] * scale, op[5])
+                elif op[0] == "frame":
+                    if hasattr(gdi, "frame_rect"):
+                        gdi.frame_rect(op[1] * scale, op[2] * scale,
+                                       op[3] * scale, op[4] * scale,
+                                       op[5], max(1, int(op[6] * scale)))
                 elif op[0] == "text":
                     _kind, x, baseline, text, f, rgb = op
                     gdi.draw_text(x, baseline, text,

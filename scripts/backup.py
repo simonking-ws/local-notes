@@ -288,10 +288,23 @@ def _block_encode(run, pos):
                 "src": run[2] if len(run) > 2 else ""}
     if kind == "hr":
         return {"i": pos, "kind": "hr"}
+    if kind == "img":
+        # 图片本身是独立文件（data/media/<hash>.png），备份里只带引用与尺寸。
+        # media 目录由导出侧单独打包进容器（见 dump_container 的 assets 参数），
+        # 这里显式列字段而不是走 raw：src 是相对路径、必须能进 checksum。
+        d = run[1] if len(run) > 1 and isinstance(run[1], dict) else {}
+        return {"i": pos, "kind": "img",
+                "id": d.get("id"), "src": d.get("src"),
+                "w": d.get("w"), "h": d.get("h"), "alt": d.get("alt")}
     if kind == "alarm":
         d = run[1] if len(run) > 1 and isinstance(run[1], dict) else {}
-        return {"i": pos, "kind": "alarm", "id": d.get("id"),
-                "text": d.get("text"), "at": d.get("at")}
+        b = {"i": pos, "kind": "alarm", "id": d.get("id"),
+             "text": d.get("text"), "at": d.get("at")}
+        # 重复规则（2026-11-18）：缺字段的老备份天然当 once，不用迁移
+        for k in ("repeat", "hm", "days"):
+            if k in d:
+                b[k] = d[k]
+        return b
     if kind == "w":          # 老数据里的待办嵌入控件（现在是字面字符，仅兼容读取）
         return {"i": pos, "kind": "todo",
                 "checked": bool(run[1]) if len(run) > 1 else False,
@@ -305,10 +318,18 @@ def _block_decode(b):
         return ["code", b.get("lang") or "", b.get("src") or ""]
     if kind == "hr":
         return ["hr"]
+    if kind == "img":
+        d = {"id": b.get("id"), "src": b.get("src"),
+             "w": b.get("w"), "h": b.get("h"), "alt": b.get("alt")}
+        # 缺 src 的图片块是坏的：渲染时会指向空路径，宁可不还原
+        return ["img", d] if d.get("src") else None
     if kind == "alarm":
         d = {"id": b.get("id"), "text": b.get("text")}
         if b.get("at") is not None:
             d["at"] = b.get("at")
+        for k in ("repeat", "hm", "days"):
+            if k in b:
+                d[k] = b[k]
         return ["alarm", d]
     if kind == "todo":
         return ["w", 1 if b.get("checked") else 0, list(b.get("tags") or [])]
@@ -354,6 +375,51 @@ def _encode_folder(f):
     if not f.get("smart"):
         out.pop("smart", None)
     return out
+
+
+# ---------- 图片资源：随备份带走 data/media/ ----------
+# 正文 img 块只带相对 src，图片本体是独立文件。备份时把被引用的图按
+# ``{src: base64}`` 塞进 extra["media"]（进 checksum、不升 schema —— 老版本
+# 读到未知键会忽略）。图床 URL 不在本地，自然不在这里。
+
+def pack_media(notes, base=None):
+    """从全库正文收集本地 img src，读文件 → {src: base64 文本}。"""
+    import imgstore
+    refs = imgstore.collect_refs(notes)
+    out = {}
+    for src in sorted(refs):
+        raw = imgstore.read_local(src, base)
+        if raw:
+            out[src] = base64.b64encode(raw).decode("ascii")
+    return out
+
+
+def unpack_media(media, base=None):
+    """导入：把 {src: base64} 写回 data/media/。返回成功写入的文件数。"""
+    import imgstore
+    if not isinstance(media, dict):
+        return 0
+    n = 0
+    for src, b64 in media.items():
+        if not imgstore.is_local(str(src)):
+            continue
+        try:
+            raw = base64.b64decode(b64, validate=True)
+        except Exception:
+            continue
+        path = imgstore.src_path(src, base)
+        if not path:
+            continue                  # 脏路径不落盘
+        try:
+            d = os.path.dirname(path)
+            if not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(raw)
+            n += 1
+        except OSError:
+            continue
+    return n
 
 
 def encode(data, extra=None, exported_at=None):

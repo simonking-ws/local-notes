@@ -119,10 +119,10 @@ class _Stub(object):
     def _popup_goto_folder(self, nid):
         pass
 
-    def _popup_delete(self, nid):
+    def _popup_delete(self, nid, forever=False):
         pass
 
-    def _delete_notes(self, ids):
+    def _delete_notes(self, ids, forever=False):
         pass
 
     def set_note_password(self, nid):
@@ -210,13 +210,13 @@ class NoteMoveMenuTest(unittest.TestCase):
         self.assertIn("没有其他文件夹", it["label"])
         self.assertFalse(it["enabled"])
 
-    def test_multi_selection_menu_is_untouched(self):
+    def test_multi_selection_menu_only_offers_recycle_delete(self):
         stub = _Stub([_note("n1"), _note("n2")])
         stub._note_sel = {"n1", "n2"}
         menu = self._menu(stub, "n1")
         labels = [it["label"] for it in menu.items if it["label"]]
         self.assertEqual(["删除选中的 2 条笔记"], labels,
-                         "多选菜单仍只提供批量删除，本需求只针对单篇")
+                         "多选菜单只保留进回收站的删除，彻底删除入口已取消")
 
     def test_targets_exclude_smart_system_and_home(self):
         stub = _Stub([_note()])
