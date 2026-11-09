@@ -8,7 +8,6 @@
 import datetime
 import os
 import sys
-import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))

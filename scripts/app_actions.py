@@ -18,7 +18,7 @@ import win_frame
 from store import (APP_NAME, uid, _t, seed, store, save_data,
                    SMART_FOLDERS, SYSTEM_FOLDER, pick_note_color, _ensure_note_colors,
                    _note_head,
-                   ALARM_INDEX_ID, ALARM_INDEX_TITLE, _ensure_alarm_index_note,
+                   ALARM_INDEX_ID,
                    folder_children, folder_depth, folder_ancestors,
                    set_all_collapsed, subtree_ids, MAX_FOLDER_DEPTH)
 from theme import FONT, on_accent

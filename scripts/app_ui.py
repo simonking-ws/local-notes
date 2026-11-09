@@ -22,8 +22,8 @@ from store import (APP_NAME, save_data,
                    SMART_FOLDERS, SYSTEM_FOLDER, LOCKED_BODY_TEXT, folder_children,
                    subtree_ids, ensure_note_color, resolve_adjacent_colors,
                    pick_note_color, NOTE_COLORS,
-                   ALARM_INDEX_ID, ALARM_INDEX_TITLE, ALARM_ROW_TAG,
-                   alarm_index_content, _ensure_alarm_index_note)
+                   ALARM_INDEX_ID, ALARM_ROW_TAG,
+                   alarm_index_content)
 from theme import (FONT, _RES, build_palette, DEFAULT_THEME, THEMES, list_themes,
                    theme_label, on_accent)
 from widgets import (RoundButton, FontSizeSlider, ArrowButton,

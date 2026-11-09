@@ -20,7 +20,7 @@ import tkinter as tk
 from store import (load_data, save_data, store, plain_of, _fix_sample_note,
                    _mark_sample_note, _upgrade_sample_note, _ensure_smart_folders,
                    _ensure_system_folder, _ensure_note_colors,
-                   _ensure_alarm_index_note, ALARM_INDEX_ID,
+                   _ensure_alarm_index_note,
                    normalize_folder_parents, smart_notes, subtree_ids, SMART_FOLDERS,
                    APP_NAME, SEAL_TITLE_MASK, set_save_error_hook,
                    dump_pending, pending_files)
