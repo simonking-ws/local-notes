@@ -82,6 +82,14 @@ def blocks_from_content(content):
             flush()
             blocks.append({"kind": "hr"})
             swallow_nl = True
+        elif kind == "img":
+            flush()
+            d = it[1] if len(it) > 1 and isinstance(it[1], dict) else {}
+            blocks.append({"kind": "img",
+                           "src": (d.get("src") if isinstance(d.get("src"), str) else ""),
+                           "alt": (d.get("alt") if isinstance(d.get("alt"), str) else ""),
+                           "w": d.get("w"), "h": d.get("h")})
+            swallow_nl = True
         elif kind == "w":
             # 历史数据里的待办控件：早已在渲染时变成 ⬜ / ✅ 字符，content 里
             # 可能还留着条目，忽略即可（正文里本来就没有它）。
@@ -180,6 +188,12 @@ def plain_text(blocks):
         if b["kind"] == "hr":
             out.append("-" * 24)
             continue
+        if b["kind"] == "img":
+            # 纯文本放不下位图，留一行 alt 说明（有 alt 才写，别留空行）
+            alt = (b.get("alt") or "").strip()
+            if alt:
+                out.append("[图片：%s]" % alt)
+            continue
         mi = marker_info(b)
         kind, cut, level = mi["kind"], mi["cut"], mi["level"]
         body_runs = _slice_runs(b["runs"], cut) if cut else b["runs"]
@@ -254,6 +268,12 @@ def markdown_text(blocks, links=None):
             continue
         if b["kind"] == "hr":
             out.append("---")
+            prev_list = False
+            continue
+        if b["kind"] == "img":
+            src = b.get("src") or ""
+            alt = b.get("alt") or ""
+            out.append("![%s](%s)" % (alt, src) if src else alt)
             prev_list = False
             continue
         mi = marker_info(b)

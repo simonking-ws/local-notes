@@ -538,12 +538,19 @@ def _draw_icon(cv, name, cx, cy, s, color, stroke=ICON_STROKE):
         # 星标：与列表行上的星标同一套 _star_points，只有大小不同
         ids.append(cv.create_polygon(_star_points(cx, cy, s * 0.46, s * 0.20),
                                      fill=color, outline=""))
-    elif name == "trash":
+    elif name in ("trash", "trash_slash"):
         # 垃圾桶：提手 + 盖 + 梯形桶身。全部细长图元，互不重叠，16px 下不糊。
         line(x0 + s * 0.20, y0 + s * 0.27, x0 + s * 0.80, y0 + s * 0.27)
         line(x0 + s * 0.40, y0 + s * 0.17, x0 + s * 0.60, y0 + s * 0.17)
         line(x0 + s * 0.28, y0 + s * 0.27, x0 + s * 0.34, y0 + s * 0.85,
              x0 + s * 0.66, y0 + s * 0.85, x0 + s * 0.72, y0 + s * 0.27)
+        if name == "trash_slash":
+            # 彻底删除：在垃圾桶上压一道斜杠 —— 与「隐藏行号」同一套语言
+            # （斜杠 = 这一项不生效）。菜单里它紧挨着「删除笔记」，两个都是
+            # 垃圾桶，只靠文字区分太慢；划掉表示「连回收站都不进」。
+            # 端点收在 0.13 / 0.87，圆头描边不会顶出 16px 格子（见
+            # test_gutter_menu_icons 的越界断言）。
+            line(x0 + s * 0.13, y0 + s * 0.87, x0 + s * 0.87, y0 + s * 0.13)
     elif name == "pencil":
         # 重命名：一支斜放的实心笔。整块填充、不描边——16px 里描边加内空会糊成墨块。
         ids.append(cv.create_polygon(
@@ -632,10 +639,29 @@ def _draw_icon(cv, name, cx, cy, s, color, stroke=ICON_STROKE):
             ax1, mid + half,
             fill=color, outline=""))   # 回卷箭头
     elif name == "hr":
-        # 分割线：中间一条通栏横线，上下各一条半宽短线，读作「文字 / 分割 / 文字」
-        line(x0, cy, x0 + s, cy)
-        line(x0 + s * 0.28, y0 + s * 0.16, x0 + s * 0.72, y0 + s * 0.16)
-        line(x0 + s * 0.28, y0 + s * 0.84, x0 + s * 0.72, y0 + s * 0.84)
+        # 分割线：中间一条通栏横线，上下各一条半宽短线，读作「文字 / 分割 / 文字」。
+        # ⚠️ 必须整数矩形拼，别用浮点 create_line + 圆头描边：16px 档取整后三条线
+        # 落在 21/27/32 —— 上间距 6、下间距 5（不对称），整体还比同排图标偏高 1px。
+        #
+        # ⚠️ 线宽不能动：矩形 (top, top+span) 按**半开区间**点亮 top..top+span-1
+        # 共 span 行（实测：13-15 点亮 13、14 两行）。上一版 p=3 → span=2 → 2 行线，
+        # 曾有人把 p 压到 2 想对齐中线，结果只剩 1 行、整枚线细了一半 —— 用户否掉了。
+        # 正确做法是保留 2 行线宽，只把三条线**整体下移**：上一版 ymid=round(cy)=14
+        # （Python 银行家舍入 round(14.5)=14），点亮的 13、14 两行墨迹中心 13.5，
+        # 比按钮中心 cy=14.5 高 1px。让 yc 直接用 cy-d / cy / cy+d，中心落在 .5 上，
+        # 于是 2 行线的中心 top+0.5 能**精确**等于 yc，不再需要任何取整。
+        p = max(3, int(s * 0.17 + 0.5) // 2 * 2 + 1)   # 线跨度参数，奇数（16px 档 3）
+        span = p - 1                                    # 实际点亮行数（16px 档 2 行）
+        d = max(span + 2, int(s * 0.34 + 0.5))          # 相邻线中心距（16px 档 5px）
+        x0i = int(round(x0))
+        xl = x0i + int(round(s)) - 1                   # 通栏线右端
+        xs0 = x0i + int(round(s * 0.28))               # 半宽短线左右端
+        xs1 = x0i + int(round(s * 0.72)) - 1
+        for yc, xa, xb in ((cy - d, xs0, xs1), (cy, x0i, xl), (cy + d, xs0, xs1)):
+            # 2 行线（span=2）墨迹中心 = top+0.5，要落在 yc 就取 top=yc-0.5。
+            top = int(yc - (span - 1) / 2.0)            # cy=14.5 → 9/14/19
+            ids.append(cv.create_rectangle(xa, top, xb, top + span,
+                                           fill=color, outline=""))
     elif name == "alarm":
         # 任务提醒：圆表盘 + 两根指针 + 顶上两颗铃。
         #
@@ -694,8 +720,7 @@ def _draw_icon(cv, name, cx, cy, s, color, stroke=ICON_STROKE):
         ids.append(cv.create_rectangle(x0 + s * 0.16, y0 + s * 0.44,
                                        x0 + s * 0.76, y0 + s * 0.90,
                                        outline=color, width=stroke))
-    elif name == "gutter":
-        # 行号：左边竖排两个数字（1、2）+ 右边一条通高栏线。
+    elif name in ("gutter", "gutter_hide"):
         #
         # 按用户给的两张参考图取的折中：参考图一是「文档 + 折角 + 123 + 两条横线」，
         # 参考图二是「纯 123 竖排」。前者 16px 里画不下 —— 实测「外框 + 两数字 +
@@ -727,6 +752,34 @@ def _draw_icon(cv, name, cx, cy, s, color, stroke=ICON_STROKE):
                                                       by + p - 1,
                                                       fill=color, outline=""))
         line(x0 + s * 0.66, y0 + s * 0.10, x0 + s * 0.66, y0 + s * 0.90)
+        if name == "gutter_hide":
+            # 行号栏右键「隐藏行号」：在上面这枚 gutter 图标压一道左上→右下的斜杠。
+            # ⚠️ 不换眼睛：菜单文字已经写明「隐藏行号」，图标沿用 gutter 的点阵
+            #    数字 + 栏线，一眼看出关的就是这一列；也和另一个「清除标记」的
+            #    圆点 + × 拉开距离（两项都用斜杠会读成同一个动作）。
+            # 线宽走 ICON_STROKE，端点内收 0.18s：圆头会把 bbox 外扩约 2px，
+            # 收到 0.08s 时整枚图标在 16px 画布上就出框了（菜单画布虽大不会真裁，
+            # 但单独复用这枚图标时会缺角）。
+            line(x0 + s * 0.18, y0 + s * 0.18,
+                 x0 + s * 0.82, y0 + s * 0.82)
+    elif name == "mark_clear":
+        # 行号栏右键「清除所有标记」：左边竖排三枚实心方块（gmark 是行号右侧
+        # 那颗点的抽象）+ 右边一个 ×。
+        # ⚠️ 不用斜杠：斜杠已归 gutter_hide，同一张菜单里两项都划斜线会读成
+        #    同一个动作；× 是「清空」的通行符号，和圆点列分开更清楚。
+        # ⚠️ 圆点用整数矩形拼、不用 oval：16px 档 oval 走 GDI 不抗锯齿，会糊成
+        #    半透明的灰点（同 wrap / _draw_section_icon 的结论）。
+        p = max(2, int(s * 0.17 + 0.5))      # 标记点边长（整像素），16px 档 3px
+        mx = x0 + s * 0.24
+        for f in (0.24, 0.50, 0.76):
+            bx = int(round(mx - p / 2.0))
+            by = int(round(y0 + s * f - p / 2.0))
+            ids.append(cv.create_rectangle(bx, by, bx + p - 1, by + p - 1,
+                                           fill=color, outline=""))
+        # × 中心偏右，臂长 0.15s —— 与左侧圆点列留出 0.2s 净空，16px 下不粘连
+        xx, a = x0 + s * 0.70, s * 0.15
+        line(xx - a, cy - a, xx + a, cy + a)
+        line(xx + a, cy - a, xx - a, cy + a)
     elif name == "check":
         # 菜单里的「已选中」对勾。**不用文字 ✓**：雅黑那个 ✓ 字形偏窄、起笔带一段
         # 细拖尾，11pt 下歪在标题后面，和菜单右缘怎么摆都对不齐；勾的字面对齐基准
@@ -2639,7 +2692,8 @@ def _draw_chevron(cv, cx, cy, size, color, down=False):
         pts = ((x0, y0), (x1, y0), (mx, y1), (mx - 1, y1))
     else:
         pts = ((x0, y0), (x1, my - 1), (x1, my), (x0, y1))
-    cv.create_polygon([v for xy in pts for v in xy], fill=color, outline="")
+    poly = cv.create_polygon([v for xy in pts for v in xy], fill=color, outline="")
+    return poly
 
 
 # ---------- 文件夹行首的「>」展开箭头 ----------
@@ -3054,6 +3108,12 @@ def _draw_section_icon(cv, kind, cx, cy, size, color, bg):
         # 所以留 3 格高、并且比后页窄一截，轮廓才读得出 tab 形。
         ring(6, 2, 14, 11)
         poly(((1, 15), (1, 6), (3, 6), (3, 3), (8, 3), (8, 6), (11, 6), (11, 15)))
+    elif kind == "image":
+        # 图片：方框描边 + 山景三角 + 太阳方块。全用网格实心矩形/多边形拼，
+        # 不走 create_line（Tk 线宽居中、取整后粗细不匀，见 ring 的说明）。
+        ring(1, 2, 15, 14)
+        rect(3, 4, 6, 7)                               # 太阳
+        poly(((2, 13), (6, 8), (9, 11), (12, 7), (14, 13)))   # 山景
 
 
 class SettingsButton(IconButton):
@@ -3269,11 +3329,6 @@ def _icon_photo(master, name, size, color=None, by_height=False):
     return img
 
 
-def _png_icon_photo(master, name, size=dpi.px(25)):
-    """`icon/<name>` 的原色版本（db / about / notice 这类颜色已经烤在图里的）。"""
-    return _icon_photo(master, name, size)
-
-
 def _note_icon_photo(master, height=dpi.px(14), color=None):
     """标签页左侧那支斜铅笔：按**高度**取档（icon/px/12/note.png 是 12 高的横图）。"""
     return _icon_photo(master, "note.png", height, color, by_height=True)
@@ -3403,7 +3458,7 @@ TOP_BAR_H = 30
 GUTTER_DIGITS = 4
 
 
-def gutter_width(unit, total=1, digits=GUTTER_DIGITS):
+def gutter_width(unit, total=1, digits=GUTTER_DIGITS, extra=0):
     """行号栏宽度（像素）：只由字号和**固定位数预算**决定，不跟当前内容走。
 
     为什么不用「当前总行数的位数」：9→10、99→100、999→1000 每跨一档，整列就变宽
@@ -3412,13 +3467,16 @@ def gutter_width(unit, total=1, digits=GUTTER_DIGITS):
 
     `unit` 是数字「0」的像素宽（由行号字体量出来），`total` 是当前总行数。
     只有真超过预算位数才让位：再不让就得把数字裁掉，显示一个错的行号比挪一下更糟。
+
+    `extra` 是给行号右侧标记槽预留的固定宽度（见 gmark）。默认 0 保持纯行号栏
+    的旧宽度；它是个**常量**而非按内容算，所以「列宽稳定」的性质不变。
     """
     d = max(int(digits), len(str(max(1, int(total)))))
-    return unit * d + dpi.px(13)
+    return unit * d + dpi.px(13) + extra
 
 
 def gutter_slots(v0, unit, height):
-    """等距行号「该画哪几格」：返回 (k0, k1) 闭区间，数字 = k + 1。
+    """等距行号「该画哪几格」：返回 (k0, k1) 闭区间（格序号，不是行号）。
 
     行号是一把**刻度尺**：一格的高度固定是正文行高 `unit`，`v0` 是第 1 格顶端
     在视口里的 y（往下滚就是负数）。只要格子和视口有交集就算 —— 上沿滚出去
@@ -3426,6 +3484,12 @@ def gutter_slots(v0, unit, height):
 
     * 空行、正文末尾以下的空白区都有号（一直填满画面，不会数到一半就断）；
     * 数字永远等距，敲字 / 插代码块 / 换字号都不会让某一段挤紧或拉开。
+
+    ⚠️ 每一格显示的号**就是** `k+1`（用户选的 B 方案：一格一个号，严格连续，
+    不跳号也不重号）。代价：文档里有比普通行高的行（首行标题 44px、内嵌代码块）
+    时，号会比真实行号快一两格 —— 点号标记的是「这一格盖住的那一行」（`@0,y`
+    反查），所以高行之后号与行不再一一对应。想让号与行严格对应就只能按真实行号
+    编号，高行旁必空一格（旧方案），两者不可兼得。
 
     ⚠️ 别改回「按每行的 dlineinfo 逐行贴齐」：标题、内嵌代码块的行高与正文
     行高差很多，贴齐的结果是 63 / 29 / 67 / 18×9 这种毫无规律的间距。
@@ -3437,17 +3501,49 @@ def gutter_slots(v0, unit, height):
     return k0, k1
 
 
+def gutter_paint_cells(cells):
+    """哪些格是它那一逻辑行的**行首格**（标记徽标 / 折叠箭头只挂这些格）。
+
+    `cells` 是 [(逻辑行号, 是否正文下方空白)]，和刻度尺的格一一对应；返回
+    同样长度的 True/False 列表（False = 这一格只是同一行的延续）。
+
+    行号本身**每格都画**（号 = 格序号，1、2、3 连续，见 `app_ui._gutter_redraw`）；
+    这个函数只回答「徽标画在哪」。一行占多格只可能因为它比普通行高（首行标题
+    44px、内嵌代码块），若每格都挂徽标，标记这一行时整块旁边会亮成一片 ——
+    所以统一挂在行首那一格：点标题的号 1，圈就出现在号 1 旁边。
+
+    ⚠️ 正文下方的空白格（`pad=True`）不受这条影响：它们的号是接着往下数的
+    虚号，每格都要画，也不挂徽标。
+    """
+    out = [True] * len(cells)
+    for i in range(1, len(cells)):
+        if cells[i][0] == cells[i - 1][0] and not cells[i][1]:
+            out[i] = False
+    return out
+
+
 def gutter_hit_at(hits, y):
-    """行号栏 y 处是哪个号：(目标行, 图元 id)；落在所有区间之外给 (None, None)。
+    """行号栏 y 处是哪个号：(目标行, 图元 id, 是否正文下方空白)；都没有给
+    (None, None, False)。
+
+    第三项是「这一格在正文最后一行下方」—— 那里的号是接着往下数的**虚号**，
+    底下没有文字可挂标签（见 `app_ui.gutter_paint_cells`）。调用方据此区分
+    「点一行」和「点空白」，否则点一个虚号会把标记打到末行、再被整片虚号
+    一起画出来（用户报「点空白行号，后面所有行号都显示标签」）。
 
     ⚠️ 必须按**区间**查，不能按「显示号 → 图元」的字典查：号是标尺数出来的，
     一个号未必等于一个逻辑行（代码块那一格占两百多像素，底下几行的号就差了
     八九个），按号查会把点击目标算到别的行去。
     """
-    for top, bottom, line, item in hits or ():
+    for hit in hits or ():
+        if len(hit) >= 5:
+            top, bottom, line, item, pad = hit[:5]
+        else:                                     # 兼容旧的四元组登记
+            top, bottom, line, item = hit[:4]
+            pad = False
         if top <= y < bottom:
-            return line, item
-    return None, None
+            return line, item, bool(pad)
+    return None, None, False
 
 
 class WindowButton(tk.Canvas):
@@ -4628,6 +4724,16 @@ class SlimScrollbar(tk.Canvas):
         self._draw()
 
 
+def _pad_px(v):
+    """把 pack 的 pady（可能是 int / "2" / (上, 下)）折成像素数。"""
+    if isinstance(v, (tuple, list)):
+        return sum(_pad_px(x) for x in v)
+    try:
+        return int(float(v))
+    except Exception:
+        return 0
+
+
 class ScrollPanel(tk.Frame):
     """带滚动条的容器，内部用 Frame 摆放自定义行。"""
     def __init__(self, parent, bg, palette):
@@ -4641,7 +4747,7 @@ class ScrollPanel(tk.Frame):
         # 右侧细滚动条：叠在卡片右侧留白上，只在内容超出时出现
         self.sb = SlimScrollbar(self, bg, palette, self.canvas)
         self.canvas.configure(yscrollcommand=self._on_yscroll)
-        self._inner_kids = -1               # 上次结算时的行数（用于判断要不要重算高度）
+        self._inner_kids = -1               # 上次结算时的行数（仅记录，便于诊断）
         self.inner.bind("<Configure>", lambda e: self._update())
         self.canvas.bind("<Configure>", self._on_cfg)
         # 滚轮双保险（两条路径，靠 _is_own 去重，避免一次滚动被处理两次）：
@@ -4698,8 +4804,10 @@ class ScrollPanel(tk.Frame):
         """强制内部 Frame 重算「请求高度」。
 
         这台机器的 Tk 有个坑：销毁子控件后 Frame 的 winfo_reqheight 不失效
-        （仍是销毁前的值），于是列表清空/筛没之后滚动区停在旧高度、滚动条不消失。
-        关掉传播→写死 1px→再打开传播，就是一次廉价的重算触发。
+        （仍是销毁前的值）。⚠️ 但这一招会把内层 Frame 真的压成 1×1 再放开 ——
+        调用瞬间屏幕上整列行会缩成一条、随后又长回来（就是「未删的笔记闪没了」）。
+        所以 `_update()` 现在**不再用它**，只留作诊断 / 极端兜底；正路见
+        `_content_height()`。
         """
         try:
             self.inner.pack_propagate(False)
@@ -4708,25 +4816,42 @@ class ScrollPanel(tk.Frame):
         except Exception:
             pass
 
+    def _content_height(self):
+        """按「行自己的请求高度」求和，得出内容应有的高度。
+
+        ⚠️ 不能读 `inner.winfo_reqheight()`：销毁行之后那个值不会失效（见
+        `_nudge_reqheight`），逼它重算又会把整列压成 1px、闪一下。逐行求和没有
+        这个副作用 —— 行自己的 reqheight 与父级的缓存无关，删几行就少几行的量。
+        """
+        total = 0
+        for w in self.inner.pack_slaves():
+            try:
+                if not w.winfo_exists():
+                    continue
+                total += w.winfo_reqheight()
+                total += _pad_px(w.pack_info().get("pady", 0))
+            except Exception:
+                continue
+        return total
+
     def _update(self):
         """刷新可滚动区域（内容增减后调用，确保滚动条启用、可拖）。
 
-        采用双重兜底，保证任何时序下 scrollregion 都正确，彻底解决
-        “文件夹/笔记铺满后无法滚动”：
-        1) 优先用内部 Frame 的「自然高度」winfo_reqheight——由几何管理器同步算出，
-           不依赖画布实际渲染像素（bbox("all") 在窗口未完全映射时常返回过小值）；
-        2) 若自然高度为 0（如尚未布局），回退到 bbox("all") 的像素高度。
+        高度优先**逐行求和**（`_content_height`）：行数一变，合成的值立刻跟着变，
+        既不依赖 `inner` 那份可能已过期的 reqheight，也不需要把内层压成 1px
+        去逼它重算（那一压就是肉眼可见的闪烁）。
+        只有「还没有行、或行尚未布局」时才退回 reqheight / 画布包围盒兜底。
         """
-        kids = len(self.inner.winfo_children())
-        if kids != self._inner_kids:        # 行数变了：先让 Frame 重算请求高度（见上）
-            self._inner_kids = kids
-            self._nudge_reqheight()
+        kids = self.inner.winfo_children()
+        self._inner_kids = len(kids)
         w = self.canvas.winfo_width() or 200
-        h = self.inner.winfo_reqheight() or 0
-        if h == 0:
-            b = self.canvas.bbox("all")
-            if b:
-                h = b[3] - b[1]
+        h = self._content_height()
+        if h <= 0 and kids:                 # 首帧还没量出高度：退回旧口径兜底
+            h = self.inner.winfo_reqheight() or 0
+            if h == 0:
+                b = self.canvas.bbox("all")
+                if b:
+                    h = b[3] - b[1]
         # 列表没占满可视区时：滚动区锁定为可视区高度 → 完全不产生滚动（滚轮无位移）
         vis = self.canvas.winfo_height()
         if vis and h < vis:
@@ -4736,6 +4861,26 @@ class ScrollPanel(tk.Frame):
         if self.sb is not None:
             first, last = self.canvas.yview()
             self.sb.sync(first, last)
+
+    def repaint(self):
+        """强制整画布重画一次（内容已经改完、只差把屏幕刷成新样子时用）。
+
+        为什么要绕这一下：Canvas 只在 `-scrollregion` **值真的变了**时才做整幅
+        重画。`win_frame.frozen_paint` 冻结重绘期间，`inner` 的 Configure 已经把
+        新滚动区设了进去（Tk 记成「画过了」，实际没画到屏上），解冻后再设同一个
+        值等于什么都没做 —— 屏幕上留的就是冻结前的旧像素（残影：新行叠在旧行上）。
+        所以先把滚动区撑高 1px，再让 `_update()` 设回真值，触发一次完整重画。
+        """
+        try:
+            w = self.canvas.winfo_width() or 200
+            h = self._content_height()
+            vis = self.canvas.winfo_height()
+            if vis and h < vis:
+                h = vis
+            self.canvas.configure(scrollregion=(0, 0, w, h + 1))
+        except Exception:
+            pass
+        self._update()
 
     def _on_cfg(self, e):
         self.canvas.itemconfig(self.inner_id, width=e.width)
@@ -5008,6 +5153,361 @@ class HRule(tk.Frame):
             self.app.mark_modified()
         except Exception:
             pass
+
+
+class AlarmCard(tk.Frame):
+    """正文里的一张任务提醒卡片（替代原来那枚 16px 小闹钟）。
+
+    2026-11-18 用户拍板：正文提醒从「只有一个闹钟图标」改成一张卡片，任务 /
+    时间 / 状态 / 来源一眼可见，操作直接落在卡上。四态配色与汇总表共用
+    alarm.state_of() 的口径，绝不各算各的。
+
+    实现沿用 CodeBlock / HRule 的路子：`text.window_create` 嵌一个 tk.Frame，
+    整块是一个结构项（不占字符），serialize() 从 window 分支认领成 `["alarm", d]`。
+    这样撤销 / 整块删除 / 换笔记销毁都走现成的窗口机制，不用自己维护字符占位。
+
+    构成：一张 AA 位图画圆角底 + 左侧色条 + 闹钟/勾图标 + 右侧状态胶囊；文字用
+    tk.Label 叠上去（Tk 原生字体抗锯齿，比位图文字清楚）。位图挂在实例上保活 ——
+    PhotoImage 被 GC 后位置会变空白且不报错，是本项目踩过的老坑。
+    """
+
+    BAR_W = dpi.px(3)             # 左侧状态色条
+    CARD_H = dpi.px(62)           # 固定行高：一行标题 + 一行来源/操作
+    CARD_W = dpi.px(400)          # 固定宽度：不铺满编辑区，右侧留白（用户 2026-11-18 定）
+    MIN_W = dpi.px(120)
+    PAD_X = dpi.px(14)
+    ICON = dpi.px(16)
+    RADIUS = dpi.px(9)            # 卡片圆角
+    PILL_H = dpi.px(22)           # 状态胶囊高
+
+    def __init__(self, parent, app, data, source=""):
+        tk.Frame.__init__(self, parent, bd=0, highlightthickness=0, cursor="arrow")
+        self.app = app
+        self.data = dict(data or {})          # 快照：编辑时由 app 回填
+        self.name = "alarm:" + (self.data.get("id") or "")
+        self._source = source or ""           # 来源笔记名，渲染时给定，不受切笔记影响
+        self._width = 0
+        self._photo = None                    # 底图 PhotoImage，必须挂实例保活
+        self._icon_photo = None               # 闹钟/勾图标，同理
+        self._state = "pending"
+        self._build()
+        self.apply_theme(app.pal)
+        self.refresh()
+
+    def _build(self):
+        self.pack_propagate(False)
+        self._cv = tk.Canvas(self, bd=0, highlightthickness=0)
+        self._cv.place(x=0, y=0, relwidth=1.0, relheight=1.0)
+        # 图标 + 文字：Canvas 上的位图与 Label 叠放，Label 底与稿纸同色
+        self._icon = tk.Label(self, bd=0, padx=0, pady=0)
+        self._icon.place(x=self.PAD_X, y=dpi.px(11), anchor="nw")
+        self._task = tk.Label(self, bd=0, padx=0, pady=0, anchor="w")
+        self._task.place(x=self.PAD_X + self.ICON + dpi.px(9), y=dpi.px(9), anchor="nw")
+        # 时间紧跟任务名右边（同行），x 在 _redraw 里按任务名实测宽度摆
+        self._when = tk.Label(self, bd=0, padx=0, pady=0, anchor="w")
+        self._when.place(x=self.PAD_X + self.ICON + dpi.px(9), y=dpi.px(11), anchor="nw")
+        # 第二行：来源靠左、操作靠右；徽章胶囊贴右上角（底图画在 AA 位图里）
+        self._meta = tk.Label(self, bd=0, padx=0, pady=0, anchor="w")
+        self._meta.place(x=self.PAD_X, y=dpi.px(39), anchor="nw")
+        self._badge = tk.Label(self, bd=0, padx=dpi.px(2), pady=0, anchor="center")
+        self._badge.place(relx=1.0, x=-self.PAD_X, y=dpi.px(11), anchor="ne")
+        self._ops = tk.Label(self, bd=0, padx=0, pady=0, anchor="ne", cursor="hand2")
+        self._ops.place(relx=1.0, x=-self.PAD_X, y=dpi.px(39), anchor="ne")
+        # 点卡片本体把焦点还给正文，否则接着打字全打不进去（同 HRule）
+        for w in (self, self._cv, self._icon, self._task, self._when, self._meta):
+            w.bind("<Button-1>", self._focus_text)
+        self._ops.bind("<Button-1>", self._on_ops)
+        self.bind("<Button-3>", self._open_menu)
+        self._cv.bind("<Button-3>", self._open_menu)
+
+    # ---------- 状态与配色 ----------
+    def _palette_for(self, state, pal):
+        """四态配色。设计稿（2026-11-18 用户给图）要求的是**空心卡片**：
+
+        白底（= 稿纸色，不填主题色）+ 浅灰细描边 + 圆角，左侧一条状态色条。
+        ⚠️ 卡片底必须与稿纸同色 —— 上面叠着的 Label 自带不透明底色，只有它们
+        的 bg 和稿纸一致，底图上描边 / 色条 / 胶囊以外的部分才不会被盖掉。
+
+        徽章两种样式：待提醒 / 已确认 = 淡彩底 + 彩字实心胶囊；已过期 / 仅标记
+        = 稿纸底 + 灰描边空心胶囊。1px 细描边不取 pal["line"]（太浅会看不见），
+        按项目惯例用稿纸底与墨色混色。
+        """
+        base = pal.get("editor", "#ffffff")
+        ink = pal.get("text", "#1f1f24")
+        soft = pal.get("soft", "#76767e")
+        star = pal.get("star", "#f5a623")
+        green = pal.get("green", "#16a34a")
+        line = pal.get("line", "#cfcfd6")
+        if state == "acked":
+            c = green
+        elif state == "expired":
+            c = soft
+        elif state == "mark":
+            c = line
+        else:
+            c = star
+        filled = state in ("pending", "acked")
+        return {"bar": c, "task": ink if state != "expired" else soft,
+                "meta": soft, "base": base,
+                "border": _mix_hex(base, ink, 0.26),
+                "pill_border": _mix_hex(base, ink, 0.26),
+                "pill_bg": _mix_hex(base, c, 0.16) if filled else base,
+                "pill_fg": c if filled else soft,
+                "filled": filled}
+
+    def refresh(self, state=None):
+        """按当前数据重算状态并刷新文字/位图（编辑、完成、时钟翻面都走这里）。"""
+        if state is None:
+            state = self.app._alarm_card_state(self.data)
+        self._state = state
+        text = (self.data.get("text") or "").strip() or "（未填写任务）"
+        self._task.configure(text=text)
+        self._when.configure(text=self._alarm_when())
+        self._meta.configure(text="@" + self._source_title())
+        self._badge.configure(text=_alarm_state_label(state))
+        # 设计稿：只有待提醒那张有「完成」，其余三张只有「编辑 · 删除」
+        self._ops.configure(text="编辑 · 完成 · 删除"
+                            if state == "pending" else "编辑 · 删除")
+        self._redraw()
+        self.update_idletasks()
+
+    def _alarm_when(self):
+        at = self.data.get("at") or 0
+        if not at:
+            return "未设时间"
+        # 重复提醒显示规则 + 下次时刻，一次性的还是原来的相对时间。
+        # alarm 是纯函数模块（不碰 tkinter），函数内导入避免动模块顶层依赖顺序。
+        import alarm as _alarm
+        if _alarm.repeat_kind(self.data) != _alarm.REPEAT_ONCE:
+            return _alarm.fmt_when(self.data)
+        return _alarm_fmt_at(at)
+
+    def _source_title(self):
+        return self._source[:16] if self._source else "本笔记"
+
+    @classmethod
+    def fit_width(cls, w):
+        """固定 400px，不铺满整行；只有编辑区比卡片还窄时才收缩，避免溢出。"""
+        try:
+            return max(cls.MIN_W, min(cls.CARD_W, int(w)))
+        except (TypeError, ValueError):
+            return cls.CARD_W
+
+    def set_width(self, w):
+        self._width = self.fit_width(w)
+        self.configure(width=self._width, height=self.CARD_H)
+        # 胶囊贴右缘，任务/元信息 trunc 到可用宽，别压到胶囊底下
+        avail = self._width - (self.PAD_X * 2 + self.ICON + dpi.px(8)) - dpi.px(148)
+        self._task.configure(wraplength=max(80, avail))
+        self._meta.configure(wraplength=max(80, avail))
+        self._redraw()
+
+    def apply_theme(self, pal):
+        self.pal = dict(pal)
+        self._photo = None
+        self._icon_photo = None
+        # 图标按底色进缓存；换肤后旧底色那批再也用不上，清掉免得 PhotoImage 越积越多
+        for k in [k for k in list(self.__dict__) if k.startswith("_alarm_icon_")]:
+            delattr(self, k)
+        self._redraw()
+        self.refresh()
+
+    def _redraw(self):
+        if not getattr(self, "pal", None):
+            return
+        pal = self._palette_for(self._state, self.pal)
+        w = self._width or self.winfo_width() or self.CARD_W
+        h = self.CARD_H
+        # ⚠️ 所有叠在底图上的 Label 底色都必须是稿纸色：卡片是空心的（底=稿纸），
+        # Label 自带不透明 bg，只有同色才不出现一块块方补丁。
+        self.configure(bg=pal["base"])
+        self._cv.configure(bg=pal["base"])
+        f_task = (FONT[0], max(11, self.app.body_size - 1))
+        f_small = (FONT[0], max(9, self.app.body_size - 3))
+        for lb in (self._icon, self._task, self._when, self._meta, self._ops):
+            lb.configure(bg=pal["base"])
+        self._task.configure(fg=pal["task"], font=f_task)
+        self._when.configure(fg=pal["meta"], font=f_small)
+        self._meta.configure(fg=pal["meta"], font=f_small)
+        self._ops.configure(fg=pal["meta"], font=f_small)
+        self._badge.configure(bg=pal["pill_bg"], fg=pal["pill_fg"], font=f_small)
+
+        # 底图：稿纸底上先画「描边环」= 外圆角矩形填边框色，内圆角矩形回填稿纸色，
+        # 两环相减得 1px 细描边。Canvas 画圆角会锯齿，这里全程走 AAImage SDF。
+        aa = AAImage(w, h, pal["base"])
+        outer, ob = aa_round_rect(dpi.px(1), dpi.px(1), w - dpi.px(1),
+                                  h - dpi.px(1), self.RADIUS)
+        inner, ib = aa_round_rect(dpi.px(2), dpi.px(2), w - dpi.px(2),
+                                  h - dpi.px(2), max(1, self.RADIUS - dpi.px(1)))
+        aa.fill(pal["border"], outer, ob)
+        aa.fill(pal["base"], inner, ib)
+        # 左侧色条：贴左边缘、上下各留圆角，宽 BAR_W（设计稿是一条圆角竖条）
+        bar_sdf, bar_bb = aa_round_rect(dpi.px(2), dpi.px(5),
+                                        dpi.px(2) + self.BAR_W, h - dpi.px(5),
+                                        dpi.px(1))
+        aa.fill(pal["bar"], bar_sdf, bar_bb)
+        # 右上角胶囊：先量徽章文字宽，画出胶囊底（实心淡彩 / 空心描边两种）
+        self._badge.update_idletasks()
+        bw = tkfont.Font(font=f_small).measure(self._badge.cget("text") or "")
+        bw += dpi.px(16)                        # 胶囊左右内边距
+        bx1 = w - self.PAD_X
+        bx0 = max(self.PAD_X, bx1 - bw)
+        by0, by1 = dpi.px(8), dpi.px(8) + self.PILL_H
+        pr = self.PILL_H / 2.0
+        po, pob = aa_round_rect(bx0, by0, bx1, by1, pr)
+        if pal["filled"]:
+            aa.fill(pal["pill_bg"], po, pob)
+        else:
+            aa.fill(pal["pill_border"], po, pob)
+            pi, pib = aa_round_rect(bx0 + 1, by0 + 1, bx1 - 1, by1 - 1,
+                                    max(1, pr - 1))
+            aa.fill(pal["base"], pi, pib)
+        # ⚠️ PhotoImage 复用只能填同尺寸的数据：初次 _redraw 时 winfo_width() 可能是 1，
+        # 生成 1px 宽的图；之后 set_width 到 400px 时 to_photo 复用旧对象只 blank()
+        # 不扩尺寸，put 进去的数据只能落下 1 列 —— 描边/色条全画在那一列上，肉眼看不见。
+        # 尺寸对不上时必须丢弃旧对象重建。
+        if (self._photo is None or self._photo.width() != w
+                or self._photo.height() != h):
+            self._photo = None
+        self._photo = aa.to_photo(self, self._photo)
+        self._cv.delete("all")
+        self._cv.create_image(0, 0, image=self._photo, anchor="nw")
+        # 胶囊 Label 居中对齐底图；x 到右缘的距离让文字落在胶囊正中。
+        # ⚠️ place 是增量更新：_build 里的 relx=1.0 不 place_forget 会残留，
+        # 与 x 叠加把徽章推出窗口外 —— 必须先 forget 再重新 place。
+        self._badge.place_forget()
+        self._badge.place(x=bx1 - dpi.px(8), y=dpi.px(8) + self.PILL_H / 2.0,
+                          anchor="e")
+        # 时间紧跟任务名，按实测宽度摆，跟设计稿「交周报 今天 18:00」同一行
+        tw = tkfont.Font(font=f_task).measure(self._task.cget("text") or "")
+        self._when.place(x=self.PAD_X + self.ICON + dpi.px(9) + tw + dpi.px(8),
+                         y=dpi.px(11), anchor="nw")
+        # 图标：闹钟（待提醒/标记/过期用状态色），已确认换成勾；底色同为稿纸色
+        ic = _alarm_icon(self, self._state, pal["bar"], self.pal, pal["base"])
+        self._icon_photo = ic
+        self._icon.configure(image=ic, bg=pal["base"])
+
+    # ---------- 交互 ----------
+    def _focus_text(self, _e=None):
+        try:
+            self.app.text.focus_set()
+            self.app.text.mark_set("insert", self.app.text.index(self))
+        except Exception:
+            pass
+
+    def _on_ops(self, event):
+        """点在「编辑 / 完成 / 删除」哪一段上，就执行哪一段（与 refresh 文案同口径）。"""
+        words = ["编辑", "完成", "删除"] if self._state == "pending" \
+            else ["编辑", "删除"]
+        labels = [" · ", " · "] if len(words) == 3 else [" · "]
+        try:
+            font = tkfont.Font(font=self._ops.cget("font"))
+            x = event.x                    # 事件坐标已相对 _ops 本身，别再减 winfo_x
+            cursor = 0
+            for i, w in enumerate(words):
+                nxt = cursor + font.measure(w)
+                if cursor <= x <= nxt:
+                    return {"编辑": self.edit, "完成": self.ack,
+                            "删除": self.remove}[w]()
+                cursor = nxt + (font.measure(labels[i]) if i < len(labels) else 0)
+        except Exception:
+            pass
+        return None
+
+    def edit(self):
+        self.app._alarm_edit(self.name)
+
+    def ack(self):
+        self.app._alarm_ack_card(self.name)
+
+    def remove(self):
+        self.app._alarm_remove(self.name)
+
+    def _open_menu(self, event=None):
+        p = self.app.pal
+        ro = self.app.is_readonly()
+        m = PopupMenu(self.app.root, p)
+        m.add("编辑提醒", enabled=not ro, command=self.edit)
+        if self._state == "pending":
+            m.add("完成（记为已确认）", enabled=not ro, command=self.ack)
+        m.add("删除提醒", icon="trash", danger=True, enabled=not ro,
+              command=self.remove)
+        x = event.x_root if event is not None else self.winfo_pointerx()
+        y = event.y_root if event is not None else self.winfo_pointery()
+        m.popup(x, y)
+
+    def snapshot(self):
+        out = {"id": self.data.get("id"), "text": self.data.get("text"),
+               "at": self.data.get("at")}
+        # 重复规则必须一起带走：serialize() 走 window 分支拿这个快照落库，
+        # 漏了字段重开笔记就退回一次性提醒（用户设的每天/每周全丢）。
+        for k in ("repeat", "hm", "days"):
+            if k in self.data:
+                out[k] = self.data[k]
+        return out
+
+
+def _alarm_state_label(state):
+    if state == "acked":
+        return "已确认"
+    if state == "expired":
+        return "已过期"
+    if state == "mark":
+        return "仅标记"
+    return "待提醒"
+
+
+def _alarm_fmt_at(ts):
+    """卡片上的相对时间（与 alarm.fmt_at 同口径，这里只引纯函数避免循环导入）。"""
+    try:
+        import alarm as _a
+        return _a.fmt_at(ts)
+    except Exception:
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+
+
+def _alarm_icon(widget, state, color, pal, bg=None):
+    """闹钟 / 勾的 16px 位图：小尺寸下用 AA 混色，避免 Canvas 的锯齿毛刺。
+
+    bg 是卡片底色：位图必须与卡片同色，否则图标四周会显出一块稿纸色方补丁。
+    缓存 key 带上底色 —— 换肤后底色变了自然失效（原先只按状态缓存，深色主题
+    换回来图标还是旧底色，是一处隐蔽的串色隐患）。
+    """
+    base = bg or pal.get("editor", "#ffffff")
+    key = "_alarm_icon_%s_%s" % (state, base)
+    cache = getattr(widget, key, None)
+    if cache is not None:
+        return cache
+    n = widget.ICON
+    aa = AAImage(n, n, base)
+    if state == "acked":
+        # 圆角方块 + 对勾（aa_segment 圆头线，端点不糊）
+        s, bb = aa_round_rect(dpi.px(1), dpi.px(1), n - dpi.px(1),
+                              n - dpi.px(1), dpi.px(4))
+        aa.fill(color, s, bb)
+        s1, bb1 = aa_segment(dpi.px(3.5), dpi.px(8), dpi.px(6.5), dpi.px(11), dpi.px(2))
+        aa.fill(base, s1, bb1)
+        s2, bb2 = aa_segment(dpi.px(6.5), dpi.px(11), dpi.px(12), dpi.px(5), dpi.px(2))
+        aa.fill(base, s2, bb2)
+    else:
+        # 闹钟：外圈 + 指针 + 两只脚；mark 态淡一档（虚线用更浅的圆表示）
+        c = _mix_hex(base, color, 0.62) if state == "mark" else color
+        s, bb = aa_ring(n / 2.0, n / 2.0 + dpi.px(1), dpi.px(6), dpi.px(1.6))
+        aa.fill(c, s, bb)
+        s1, bb1 = aa_segment(n / 2.0, n / 2.0 + dpi.px(1),
+                             n / 2.0, n / 2.0 - dpi.px(2), dpi.px(1.4))
+        aa.fill(c, s1, bb1)
+        s2, bb2 = aa_segment(n / 2.0, n / 2.0 + dpi.px(1),
+                             n / 2.0 + dpi.px(3), n / 2.0 + dpi.px(2), dpi.px(1.4))
+        aa.fill(c, s2, bb2)
+        for cx in (dpi.px(4), n - dpi.px(4)):
+            s3, bb3 = aa_segment(cx, dpi.px(2), cx + (dpi.px(1) if cx < n / 2 else -dpi.px(1)),
+                                 dpi.px(4), dpi.px(1.4))
+            aa.fill(c, s3, bb3)
+    photo = aa.to_photo(widget)
+    setattr(widget, key, photo)
+    return photo
 
 
 class CodeBlock(tk.Frame):

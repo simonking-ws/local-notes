@@ -3,9 +3,9 @@
 
 锁住用户反馈过的两件事：
 
-1. **四节平级**：「字体设置 / 外观主题 / 工具栏按钮定制 / 标签页」四节标题必须是
-   同一套字体、同一尺寸的图标。当初「全局设置」是 13pt 的窗口标题、图标 18px，
-   底下三节是 12pt / 16px，看着像「一节套三节」。
+1. **五节平级**：「字体设置 / 外观主题 / 工具栏按钮定制 / 图片与图床 / 标签页」
+   五节标题必须是同一套字体、同一尺寸的图标。当初「全局设置」是 13pt 的窗口
+   标题、图标 18px，底下几节是 12pt / 16px，看着像「一节套几节」。
 2. **切主题当场换肤，且不能闪**：这张窗的底色 / 字色 / Canvas 图标全是建窗时
    一次性刷上去的（不像主窗有 `apply_palette` 可以反复重刷），所以颜色必须逐控件
    重刷。但**不许 destroy + 重建** —— 窗口消失又出现的那一帧就是「闪一下」；
@@ -40,7 +40,7 @@ dpi.init()
 import tkinter as tk                                    # noqa: E402
 from tkinter import ttk                                 # noqa: E402
 
-TITLES = ("字体设置", "外观主题", "工具栏按钮定制", "标签页")
+TITLES = ("字体设置", "外观主题", "工具栏按钮定制", "图片与图床", "标签页")
 PAL_KEYS = ("editor", "text", "soft", "hover", "line", "accent", "sel", "selfg")
 COLOR_OPTS = ("background", "foreground", "activebackground", "activeforeground",
               "selectcolor", "highlightbackground", "readonlybackground")
@@ -51,6 +51,23 @@ def _walk(w):
     for c in w.winfo_children():
         for x in _walk(c):
             yield x
+
+
+def _mk_png(w, h, rgb):
+    """造一张纯色 PNG（测试图，不落进用户目录）。"""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff))
+
+    px = bytes(rgb) + b"\xff"
+    raw = b"".join(b"\x00" + px * w for _ in range(h))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b""))
 
 
 class TestSettingsDialog(unittest.TestCase):
@@ -68,6 +85,16 @@ class TestSettingsDialog(unittest.TestCase):
         cls.root = tk.Tk()
         cls.root.withdraw()
         cls.app = notes_app.NotesApp(cls.root)
+        # 真实库里的 current_note 可能指向已删除的笔记（用户库当前就是这个状态），
+        # 复制过来的临时库也带着它；很多动作一开头就 current_note() 判空返回，
+        # 会让 Shift+Tab / 删整行这些用例静默失效。测试库统一指到一篇普通笔记。
+        data = cls.app.data
+        if data.get("current_note") not in {n["id"] for n in data["notes"]}:
+            target = next((n for n in data["notes"]
+                           if not n.get("sample") and n["id"] != store.ALARM_INDEX_ID),
+                          None)
+            if target:
+                data["current_note"] = target["id"]
         cls.root.update_idletasks()
         cls.root.update()
 
@@ -239,7 +266,7 @@ class TestSettingsDialog(unittest.TestCase):
     def test_sections_share_one_icon_size(self):
         dlg = self._open()
         icons = self._section_icons(dlg)
-        self.assertEqual(len(icons), 4, "四节该有四枚图标，实际 %d" % len(icons))
+        self.assertEqual(len(icons), 5, "五节该有五枚图标，实际 %d" % len(icons))
         sizes = {(c.winfo_width(), c.winfo_height()) for c in icons}
         self.assertEqual(len(sizes), 1, "四节图标尺寸不一致：%s" % sizes)
         for c in icons:
@@ -310,7 +337,8 @@ class TestSettingsDialog(unittest.TestCase):
         track = [str(slider.itemcget(i, "fill")).lower() for i in slider.find_all()]
         self.assertIn(new_pal["accent"].lower(), track, "滑杆轨道还画着旧主题色")
         rounds = [w for w in _walk(dlg) if isinstance(w, widgets.RoundButton)]
-        self.assertEqual(len(rounds), 4, "四枚圆角按钮不全了")
+        # 五枚：全不选 / 全选（工具栏节）+ 测试上传（图片节）+ 确定 / 取消
+        self.assertEqual(len(rounds), 5, "五枚圆角按钮不全了")
         for b in rounds:
             self.assertEqual(str(b.cget("bg")).lower(), new_pal["editor"].lower(),
                              "按钮画布底色没换")
@@ -859,7 +887,7 @@ class TestSettingsDialog(unittest.TestCase):
             self.assertFalse(self.app._editor_wrap_on(), "缺省 / 脏数据应默认不换行")
             ids = [i[0] for i in self.app.TOOL_ITEMS]
             self.assertIn("wrap", ids, "工具栏没登记自动换行按钮")
-            self.assertEqual(len(ids), 15, "工具栏应有 15 项（第 15 枚是自动换行）")
+            self.assertEqual(len(ids), 16, "工具栏应有 16 项（含插入分割线）")
             self.assertEqual(self.app.TOOL_SHORT_NAMES["wrap"], "自动换行")
             self.assertNotIn("wrap", self.app.READONLY_LOCKED,
                              "自动换行是视图开关，只读笔记里也该能点")
@@ -1048,9 +1076,12 @@ class TestSettingsDialog(unittest.TestCase):
             self.root.update()
             ctrl = first_row_chars()
 
-            # 同一段 20 字复制 20 遍，段间一个半角空格
-            para = "自动换行效果检查用的中文示例文字没有空格"
-            self.assertEqual(len(para), 20)
+            # 同一段 17 字复制 20 遍，段间一个半角空格。
+            # ⚠️ 段长别取 20：本机一行恰好放得下 4 段（84 字），21 整除 84，
+            # CHAR 折行也会落在空格上 —— 断言会假阳性（看着像退回 WORD）。
+            # 17 字的段长（周期 18）与常见行宽不整除，才真能区分两种折行。
+            para = "自动换行效果检查用的中文示例文字啊"
+            self.assertEqual(len(para), 17)
             period = len(para) + 1
             body_restore()
             body_restore = None
@@ -1140,13 +1171,12 @@ class TestSettingsDialog(unittest.TestCase):
             self.root.update_idletasks()
             body = app.text.get("1.0", "end")
             self.assertIn("窗口测试提醒", body)
-            # 状态列只写是 / 否（字段名在表头），按格切出来断言
+            # 四列：时间 / 任务 / 状态 / 来源。状态用 BMP 符号 + 文案
             rows = [ln.split("\t") for ln in body.split("\n")
-                    if len(ln.split("\t")) == 5]
+                    if len(ln.split("\t")) == 4]
             probe = [r for r in rows if r[1] == "窗口测试提醒"]
             self.assertEqual(len(probe), 1, "没找到刚插入的那条提醒")
-            self.assertEqual(probe[0][2], "是", "时间已过 = 已完成")
-            self.assertEqual(probe[0][3], "否", "没点过弹窗 = 未确认")
+            self.assertEqual(probe[0][2], "○已过期", "时间已过 = 已过期（未确认）")
             ranges = app.text.tag_ranges("link")
             self.assertTrue(ranges, "汇总表里没有可点的内链")
             # 库里可能本来就有别的提醒（按时间排在前面），别假定第一条就是 src。
@@ -1161,11 +1191,128 @@ class TestSettingsDialog(unittest.TestCase):
         finally:
             self._alarm_restore(old_f, old_n, src, saved)
 
-    def test_alarm_table_columns_are_pixel_aligned(self):
-        """长短不一的任务名 / 中英混排 / 未设时间，五列起点必须逐行相同。
+    def test_tab_fallback_detects_shift_and_keeps_plain_tab(self):
+        """Shift 位兜底能退缩进；普通 Tab 仍照常插入字面制表符，只读也挡得住。"""
+        app = self.app
+        self.assertTrue(app.text.bind("<Tab>"), "编辑器没绑 <Tab> 兜底")
+        restore = self._long_line("\t甲")
+        try:
+            t = app.text
+            t.mark_set("insert", "1.1")
+            app._editor_tab_maybe_shift(type("E", (), {"state": 0x1})())
+            self.assertEqual(t.get("1.0", "end-1c"), "甲")
+        finally:
+            restore()
 
-        对齐靠 **tag 级制表位**：不许改 widget 级 tabs（那会污染所有笔记里的
-        制表符），也不许退回按字数补空格（中文 15px / 半角空格 8px，会累积误差）。
+        restore = self._long_line("甲")
+        try:
+            t = app.text
+            t.mark_set("insert", "1.0")
+            # 不靠 event_generate：合成事件的类绑定在全量测试里偶发不执行。
+            # 兜底handler 放行 + Text 类绑定还在，就等价于普通 Tab 照常插字符。
+            self.assertIsNone(app._editor_tab_maybe_shift(
+                type("E", (), {"state": 0})()), "普通 Tab 不该被 break")
+            self.assertTrue(t.bind_class("Text", "<Tab>"), "Text 的 Tab 类绑定丢了")
+            old_guard = app._refuse_readonly
+            app._refuse_readonly = lambda: True
+            try:
+                self.assertEqual(app._editor_tab_maybe_shift(
+                    type("E", (), {"state": 0})()), "break")
+            finally:
+                app._refuse_readonly = old_guard
+        finally:
+            restore()
+
+    def test_shift_tab_deletes_one_indent_before_caret(self):
+        """Shift+Tab 删光标前的一档缩进：Tab / 4 半角 / 2 全角空格；没缩进就不动。"""
+        app = self.app
+        self.assertTrue(app.text.bind("<Shift-Tab>"), "编辑器没绑 Shift+Tab")
+        for body, insert, expect in (
+            ("\t甲", "1.1", "甲"),
+            ("\u3000\u3000甲", "1.2", "甲"),
+            ("    甲", "1.5", "甲"),
+            ("甲", "1.0", "甲"),
+        ):
+            restore = self._long_line(body)
+            try:
+                t = app.text
+                t.mark_set("insert", insert)
+                self.assertEqual(app._editor_shift_tab(None), "break")
+                self.assertEqual(t.get("1.0", "end-1c"), expect)
+                if expect != body:
+                    t.edit_undo()
+                    self.assertEqual(t.get("1.0", "end-1c"), body,
+                                     "Shift+Tab 的删除没进撤销栈")
+            finally:
+                restore()
+
+    def test_shift_tab_dedents_selected_lines(self):
+        """多行选区按行首退一格；选到下一行行首时，那一行不算被选中。"""
+        app = self.app
+        restore = self._long_line("\t甲\n\u3000\u3000乙\n丙")
+        try:
+            t = app.text
+            t.tag_remove("sel", "1.0", "end")
+            t.tag_add("sel", "1.0", "3.0")
+            self.assertEqual(app._editor_shift_tab(None), "break")
+            self.assertEqual(t.get("1.0", "end-1c"), "甲\n乙\n丙")
+            spans = t.tag_ranges("sel")
+            self.assertEqual((str(spans[0]), str(spans[1])), ("1.0", "2.1"),
+                             "退完缩进后选区没跟着收")
+        finally:
+            restore()
+
+    def test_shift_tab_respects_readonly_and_outdents_at_line_start(self):
+        """光标在行首也退行首缩进；只读笔记由统一守卫拦下。"""
+        app = self.app
+        restore = self._long_line("\t甲")
+        try:
+            t = app.text
+            t.mark_set("insert", "1.0")
+            app._editor_shift_tab(None)
+            self.assertEqual(t.get("1.0", "end-1c"), "甲")
+            old_guard = app._refuse_readonly
+            app._refuse_readonly = lambda: True
+            try:
+                self.assertEqual(app._editor_shift_tab(None), "break")
+                self.assertEqual(t.get("1.0", "end-1c"), "甲")
+            finally:
+                app._refuse_readonly = old_guard
+        finally:
+            restore()
+
+    def test_editor_tab_width_is_two_hanzi(self):
+        """正文 widget 级 Tab = 2 个汉字宽，且真的是按制表位停位而非默认 8 半角。"""
+        import tkinter.font as tkfont
+        import app_ui
+        from theme import FONT
+        app = self.app
+        fam = getattr(app, "ui_font", None) or FONT[0]
+        char_w = tkfont.Font(family=fam, size=app.body_size).measure("中")
+        expected = app_ui.EDITOR_TAB_HANZI * char_w
+        tabs = tuple(float(str(x)) for x in app.text.cget("tabs"))
+        self.assertEqual(tabs, (float(expected),),
+                         "正文 Tab 没配成 %d 个汉字宽" % app_ui.EDITOR_TAB_HANZI)
+        # 真量一次落点：单独的 Text 用同一组 tabs，首档就应落在 2 汉字处。
+        probe = tk.Text(self.root, font=(fam, app.body_size), tabs=tabs)
+        probe.pack()
+        try:
+            probe.insert("1.0", "\tX")
+            self.root.update_idletasks()
+            self.root.update()
+            x0 = probe.bbox("1.0")[0]
+            xx = probe.bbox("1.1")[0]
+            self.assertLessEqual(abs((xx - x0) - expected), 1,
+                                 "制表符实际落点不是 2 汉字宽")
+        finally:
+            probe.destroy()
+
+    def test_alarm_table_columns_are_pixel_aligned(self):
+        """长短不一的任务名 / 中英混排 / 未设时间，四列起点必须逐行相同。
+
+        对齐靠 **tag 级制表位** 覆盖正文的 widget 级 tabs；既不能被正文的
+        2 汉字 Tab 带歪，也不许退回按字数补空格（中文 15px / 半角空格 8px，
+        会累积误差）。
         """
         import datetime
         import store
@@ -1189,16 +1336,18 @@ class TestSettingsDialog(unittest.TestCase):
             self.root.update_idletasks()
             self.root.update()
             t = app.text
-            self.assertFalse(t.cget("tabs"),
-                             "不许改 widget 级制表位，会连带改掉普通笔记")
+            self.assertTrue(t.cget("tabs"),
+                            "正文 widget 级制表位不见了（应为 2 汉字宽）")
             self.assertTrue(t.tag_cget(store.ALARM_ROW_TAG, "tabs"),
                             "汇总表行没配上 tag 级制表位")
             last = int(t.index("end-1c").split(".")[0])
-            col_x = {2: [], 3: [], 4: []}
+            import alarm as _alarm
+            symbols = set(_alarm.STATE_SYMBOLS.values())
+            col_x = {1: [], 2: [], 3: []}
             for ln in range(1, last + 1):
                 cells = t.get("%d.0" % ln, "%d.end" % ln).split("\t")
-                if len(cells) != 5 or cells[2] not in ("是", "否"):
-                    continue            # 只量数据行（表头那行的状态列是字段名）
+                if len(cells) != 4 or not cells[2] or cells[2][0] not in symbols:
+                    continue            # 只量数据行（表头那行状态列是字段名）
                 pos = 0
                 for i, cell in enumerate(cells):
                     if i:
@@ -1265,11 +1414,12 @@ class TestSettingsDialog(unittest.TestCase):
             self._alarm_restore(old_f, old_n, src, saved)
 
     def test_alarm_tab_stops_follow_body_size(self):
-        """字号一变，制表位必须按新字体重算，否则时间列会撞进任务列。"""
+        """字号一变，正文 Tab 与汇总表制表位都得按新字体重算。"""
         import store
         app = self.app
         t = app.text
         before = tuple(str(x) for x in t.tag_cget(store.ALARM_ROW_TAG, "tabs"))
+        widget_before = float(str(t.cget("tabs")[0]))
         old = app.body_size
         try:
             app.body_size = old + 3
@@ -1277,6 +1427,8 @@ class TestSettingsDialog(unittest.TestCase):
             after = tuple(str(x) for x in t.tag_cget(store.ALARM_ROW_TAG, "tabs"))
             self.assertNotEqual(before, after, "改字号后制表位没跟着变")
             self.assertGreater(int(after[0]), int(before[0]))
+            self.assertGreater(float(str(t.cget("tabs")[0])), widget_before,
+                               "改字号后正文 Tab 没跟着变")
         finally:
             app.body_size = old
             app._config_tags()
@@ -1480,6 +1632,899 @@ class TestSettingsDialog(unittest.TestCase):
             app._ro_kind = old_kind
             app._set_readonly(old_ro, old_kind)
             app._update_readonly_bar()
+
+    # ---------- 撤销 / 重做后的待办样式 ----------
+    def _todo_line(self, checked=False):
+        """临时放一行带完整标签的待办并清空撤销栈，返回 (Text, restore)。
+
+        ⚠️ 共享 root 是 withdraw 状态，`event_generate` 送不到按键绑定；这里直接
+        调动作方法，并显式生成 <<Undo>>（Tk 的 edit_undo 自己不发这个虚拟事件）。
+        """
+        import store
+        from md_conv import TODO_OFF, TODO_ON, TODO_GAP, TODO_GAP_TAG
+        app, text = self.app, self.app.text
+        state = str(text.cget("state"))
+        body = text.get("1.0", "end-1c")
+        loading = getattr(app, "_loading", False)
+        old_note = app.data.get("current_note")
+        target = next((x for x in app.data["notes"]
+                       if not x.get("sample") and x["id"] != store.ALARM_INDEX_ID),
+                      None)
+        self.assertIsNotNone(target, "临时库里没有可编辑的普通笔记")
+        app.data["current_note"] = target["id"]
+        app._loading = True
+        text.config(state=tk.NORMAL)
+        text.delete("1.0", "end")
+        text.insert("1.0", "标题\n")
+        mark = TODO_ON if checked else TODO_OFF
+        text.insert("2.0", mark, ("todo_done" if checked else "todo",))
+        text.insert("2.1", TODO_GAP, (TODO_GAP_TAG,))
+        text.insert("2.2", "待办内容")
+        if checked:
+            app._sync_todo_done()
+        text.edit_reset()
+        text.mark_set("insert", "2.2")
+        self.root.update_idletasks()
+        self.root.update()
+
+        def restore():
+            text.delete("1.0", "end")
+            text.insert("1.0", body)
+            text.config(state=state)
+            app._loading = loading
+            app.data["current_note"] = old_note
+            text.edit_reset()
+            self.root.update()
+
+        return text, restore
+
+    def _run_undo(self):
+        """模拟 Ctrl+Z：Tk 的 edit_undo 不生成 <<Undo>>，补发一次再跑 idle 回调。"""
+        text = self.app.text
+        self.root.update()
+        text.edit_undo()
+        text.event_generate("<<Undo>>")
+        for _ in range(8):
+            self.root.update()
+
+    def test_undo_after_delete_line_restores_todo_tag(self):
+        """Ctrl+Y 删整行待办再 Ctrl+Z：方框字号标签与点击绑定必须一起回来。"""
+        from md_conv import TODO_OFF
+        text, restore = self._todo_line()
+        try:
+            self.assertIn("todo", text.tag_names("2.0"))
+            self.app.delete_line()          # Ctrl+Y 的实际动作
+            self.root.update()
+            self.assertNotIn(TODO_OFF, text.get("1.0", "end-1c"))
+            self._run_undo()
+            self.assertIn(TODO_OFF, text.get("1.0", "end-1c"))
+            self.assertIn("todo", text.tag_names("2.0"),
+                          "撤销后方框丢了 todo 标签 → 按正文大字号渲染")
+            self.assertEqual(tuple(str(x) for x in text.tag_ranges("todo")),
+                             ("2.0", "2.1"))
+        finally:
+            restore()
+
+    def test_undo_after_delete_line_restores_checked_style(self):
+        """已勾待办删行再撤销：todo_done 与 done 删除线都要跟着字符回来。"""
+        from md_conv import TODO_ON
+        text, restore = self._todo_line(checked=True)
+        try:
+            self.assertIn("todo_done", text.tag_names("2.0"))
+            self.assertTrue(text.tag_ranges("done"))
+            self.app.delete_line()          # Ctrl+Y 的实际动作
+            self.root.update()
+            self._run_undo()
+            self.assertIn(TODO_ON, text.get("1.0", "end-1c"))
+            self.assertIn("todo_done", text.tag_names("2.0"))
+            self.assertTrue(text.tag_ranges("done"), "撤销后删除线没回来")
+        finally:
+            restore()
+
+    def test_undo_toggle_restores_done(self):
+        """撤销一次勾选：字符回到 ✅ 时删除线不能丢，也不能停在 ⬜ 的样式上。"""
+        from md_conv import TODO_ON
+        text, restore = self._todo_line(checked=True)
+        try:
+            self.app.toggle_todo_at("2.0")       # ✅ → ⬜，同步摘掉 done
+            self.assertFalse(text.tag_ranges("done"))
+            self._run_undo()
+            self.assertIn(TODO_ON, text.get("1.0", "end-1c"))
+            self.assertIn("todo_done", text.tag_names("2.0"))
+            self.assertTrue(text.tag_ranges("done"), "撤销勾选后删除线没恢复")
+        finally:
+            restore()
+
+    # ---------- 图片与图床：B 版文案 ----------
+    def _pic_badge(self, dlg):
+        """标题右侧那枚状态徽标（按「当前：」前缀认，不按位置猜）。"""
+        badges = [w for w in _walk(dlg) if isinstance(w, tk.Label)
+                  and str(w.cget("text")).startswith("当前：")]
+        self.assertEqual(len(badges), 1, "图片与图床的状态徽标应当只有一枚")
+        return badges[0]
+
+    def _pic_placeholder(self, dlg):
+        """路径输入框里的占位 Label；它的 master 就是那个 Entry。"""
+        return next(w for w in _walk(dlg) if isinstance(w, tk.Label)
+                    and str(w.cget("text")) == "留空即使用本机保存")
+
+    def test_piclist_copy_b_version(self):
+        """B 版文案：两种模式拆两段、副作用单独强调，界面不再出现 PicList.exe。"""
+        dlg = self._open()
+        texts = [str(w.cget("text")) for w in _walk(dlg) if isinstance(w, tk.Label)]
+        self.assertIn("留空 PicList路径：图片保存在 data/media/，不联网。", texts)
+        self.assertIn("填好路径：插图后自动上传图床，上传成功会删除本地副本。", texts)
+        self.assertIn("PicList路径", texts)
+        self.assertIn("路径只在本机生效，不随备份带走", texts)
+        self.assertNotIn("PicList.exe", texts, "界面上还留着旧标签")
+
+    def test_piclist_badge_and_placeholder_follow_path(self):
+        """状态徽标与占位文字跟着路径有无切换；纯空格不算配了图床。"""
+        settings = self.app.data.setdefault("settings", {})
+        saved = settings.get("piclist_exe")
+        settings["piclist_exe"] = ""
+        try:
+            dlg = self._open()
+            badge = self._pic_badge(dlg)
+            ph = self._pic_placeholder(dlg)
+            entry = ph.master
+            self.assertIsInstance(entry, tk.Entry)
+            vname = str(entry.cget("textvariable"))
+
+            self.assertEqual(str(badge.cget("text")), "当前：本机保存")
+            self.assertTrue(ph.place_info(), "空路径时占位文字没显示")
+
+            self.root.setvar(vname, "D:\\Tools\\PicList.exe")
+            self.root.update_idletasks()
+            self.assertEqual(str(badge.cget("text")), "当前：图床上传")
+            self.assertEqual(ph.place_info(), {}, "填了路径占位文字没隐藏")
+
+            self.root.setvar(vname, "   ")
+            self.root.update_idletasks()
+            self.assertEqual(str(badge.cget("text")), "当前：本机保存",
+                             "纯空格不该算配了图床")
+        finally:
+            settings["piclist_exe"] = saved
+
+    def test_piclist_badge_repaints_on_theme_switch(self):
+        """徽标浅绿底是派生色：换肤要按新板重算，不能留旧主题色斑。"""
+        from app_ui import _mix_hex
+        settings = self.app.data.setdefault("settings", {})
+        saved = settings.get("piclist_exe")
+        settings["piclist_exe"] = ""
+        try:
+            dlg = self._open()
+            badge = self._pic_badge(dlg)
+            old_pal = dict(self.app.pal)
+            self.assertEqual(
+                str(badge.cget("bg")).lower(),
+                _mix_hex(old_pal["editor"], old_pal["accent"], 0.12).lower())
+
+            self._switch(dlg, "石墨灰")
+            new_pal = dict(self.app.pal)
+            self.assertEqual(
+                str(badge.cget("bg")).lower(),
+                _mix_hex(new_pal["editor"], new_pal["accent"], 0.12).lower(),
+                "状态徽标底色没跟着换肤重算")
+            self.assertEqual(str(badge.cget("fg")).lower(), new_pal["accent"].lower())
+        finally:
+            settings["piclist_exe"] = saved
+
+    def test_piclist_entry_border_not_eaten_by_placeholder(self):
+        """边框要走外围 highlight：内侧 SOLID 会被占位 Label 的白底盖掉一截。"""
+        dlg = self._open()
+        entry = self._pic_placeholder(dlg).master
+        self.assertIsInstance(entry, tk.Entry)
+        # bd=0 + highlightthickness>0：边框画在控件外，子 Label 盖不到
+        self.assertEqual(str(entry.cget("bd")), "0",
+                         "输入框用了内侧边框，占位底会盖掉下边框左半段")
+        self.assertGreater(int(entry.cget("highlightthickness")), 0,
+                           "外围高亮边框没开，输入框会没有可见边界")
+        self.assertEqual(str(entry.cget("relief")).lower(), "flat")
+
+    # ---------- 后台任务回传（「测试上传点了没效果」） ----------
+    def _pump_async(self, seconds):
+        """让后台线程 + 主线程轮询链真正跑完（轮询间隔 40ms）。"""
+        import time
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            self.root.update_idletasks()
+            self.root.update()
+            time.sleep(0.02)
+
+    def test_img_async_result_reaches_main_thread(self):
+        """_img_async 必须把结果交回主线程执行 done。
+
+        旧实现在子线程直接 root.after()，被 Tk 以
+        "main thread is not in main loop" 拒绝 → done 永不执行，正是
+        「测试上传点了没反应、按钮卡禁用」的根因。
+        """
+        import threading
+        got = {}
+        main = threading.current_thread().name
+
+        self.app._img_async(lambda: "OK",
+                            lambda res: (got.update(res=res,
+                                                    thread=threading.current_thread().name)))
+        self._pump_async(0.6)
+        self.assertEqual(got.get("res"), "OK", "后台结果没回传")
+        self.assertEqual(got.get("thread"), main, "done 没在主线程执行")
+
+    def test_img_async_exception_reaches_done(self):
+        """work 抛异常也要按 (False, msg) 协议回传，不能把线程崩掉吞掉。"""
+        got = {}
+
+        def boom():
+            raise RuntimeError("boom")
+
+        self.app._img_async(boom, lambda res: got.update(res=res))
+        self._pump_async(0.6)
+        res = got.get("res")
+        self.assertTrue(isinstance(res, tuple) and len(res) == 2)
+        self.assertFalse(res[0])
+        self.assertIn("boom", res[1])
+
+    def test_test_upload_uses_app_icon(self):
+        """测试上传的样图必须是应用自带的 icon/app_icon.png（不再是 1×1 临时图）。"""
+        import piclist
+        path = piclist._default_test_image()
+        self.assertTrue(os.path.isfile(path), "测试图不存在：%s" % path)
+        self.assertEqual(os.path.basename(path), "app_icon.png")
+        self.assertGreater(os.path.getsize(path), 1024, "测试图不该是占位小图")
+
+        # test_upload 必须把这张图交给 upload（不是现拼临时 PNG）
+        seen = {}
+        saved = piclist.upload
+        try:
+            piclist.upload = lambda s, p, timeout=None: seen.update(path=p) or "https://x/y.png"
+            piclist.test_upload({"piclist_exe": r"C:\fake\PicList.exe"})
+        finally:
+            piclist.upload = saved
+        self.assertEqual(seen.get("path"), path)
+
+    def test_piclist_upload_uses_http_server_not_cli(self):
+        """上传必须走内置 Server 的 HTTP 接口，不能再调 `PicList.exe upload`。
+
+        PicList 是 Electron 应用，`PicList.exe upload <路径>` 会被当成 JS 入口
+        解析、报 Cannot find module —— 这正是「没有返回图片链接：无输出」的根因。
+        """
+        import piclist
+        s = {"piclist_exe": r"C:\fake\PicList.exe"}
+        self.assertEqual(piclist.server_port({}), 36677)
+        self.assertEqual(piclist.server_port({"piclist_port": "8080"}), 8080)
+        self.assertEqual(piclist.server_port({"piclist_port": "bad"}), 36677)
+
+        sent = {}
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"success":true,"result":["https://example.com/a.png"]}'
+
+        def fake_urlopen(req, timeout=None):
+            sent["url"] = req.full_url if hasattr(req, "full_url") else req
+            sent["data"] = req.data
+            return _Resp()
+
+        saved_alive = piclist.server_alive
+        saved_open = piclist.urllib.request.urlopen
+        try:
+            piclist.server_alive = lambda s, timeout=2.0: True
+            piclist.urllib.request.urlopen = fake_urlopen
+            url = piclist.test_upload(s)
+            self.assertEqual(url, "https://example.com/a.png")
+            self.assertIn("127.0.0.1:36677/upload", str(sent["url"]))
+            self.assertIn(b"app_icon.png", sent["data"])
+        finally:
+            piclist.server_alive = saved_alive
+            piclist.urllib.request.urlopen = saved_open
+
+    def test_piclist_upload_server_down_gives_hint(self):
+        """Server 没开时，错误信息要指明「内置 Server」，不能只说无输出。"""
+        import piclist
+        saved = piclist.server_alive
+        try:
+            piclist.server_alive = lambda s, timeout=2.0: False
+            with self.assertRaises(piclist.UploadError) as ctx:
+                piclist.test_upload({"piclist_exe": r"C:\fake\PicList.exe"})
+            msg = str(ctx.exception)
+            self.assertIn("内置 Server", msg)
+            self.assertIn("36677", msg)
+        finally:
+            piclist.server_alive = saved
+
+    def test_test_upload_button_shows_result_and_reenables(self):
+        """端到端：配了路径点「测试上传」，要弹结果框、按钮要复位。"""
+        import piclist
+        saved_upload = piclist.test_upload
+        saved_info = self.app._show_info
+        saved_error = self.app._show_error
+        settings = self.app.data.setdefault("settings", {})
+        saved_exe = settings.get("piclist_exe")
+        infos = []
+        try:
+            piclist.test_upload = lambda s, timeout=None: "https://example.com/x.png"
+            self.app._show_info = lambda t, m: infos.append((t, m))
+            self.app._show_error = lambda t, m: infos.append((t, m))
+            settings["piclist_exe"] = r"C:\fake\PicList.exe"
+
+            dlg = self._open()
+            btn = next(w for w in _walk(dlg)
+                       if getattr(w, "_text", "") == "测试上传")
+            btn.command()
+            self.assertFalse(btn._enabled, "上传中按钮应禁用")
+            self._pump_async(0.6)
+            self.assertTrue(infos, "测试上传没弹结果提示")
+            self.assertEqual(infos[-1][0], "测试上传")
+            self.assertIn("https://example.com/x.png", infos[-1][1])
+            self.assertTrue(btn._enabled, "结果回来后按钮没复位")
+        finally:
+            piclist.test_upload = saved_upload
+            self.app._show_info = saved_info
+            self.app._show_error = saved_error
+            settings["piclist_exe"] = saved_exe
+
+
+    # ---------- 整行图片语法 / 点图改地址（复用本文件的 app 与 root） ----------
+
+    def _img_scratch_note(self, with_image=True):
+        """临时笔记 + 临时 media 目录，返回 (note, block, cleanup)。
+
+        ⚠️ `store.BASE` 必须临时指到空目录：渲染走 `imgstore.src_path()`，
+        它是按 `store.BASE` 找文件的；不换就是往用户真实 `data/media` 里写测试图。
+        """
+        import store as _store
+        import imgstore as _imgstore
+        base = tempfile.mkdtemp(prefix="sj_img_ui_")
+        old_base = _store.BASE
+        _store.BASE = base
+        block = _imgstore.make_block(_mk_png(40, 30, (200, 60, 60)), alt="旧图")
+        content = [["t", "标题\n", ["title"]]]
+        if with_image:
+            content.append(block)
+            content.append(["t", "\n尾巴", []])
+        note = {"id": "n_img_ui", "folder": "f_all", "content": content}
+        data = self.app.data
+        old_cur = data.get("current_note")
+        data["notes"].append(note)
+        data["current_note"] = note["id"]
+        self.app.select_note(note["id"])
+        self.root.update_idletasks()
+        self.root.update()
+
+        def cleanup():
+            data["notes"] = [n for n in data["notes"] if n is not note]
+            data["current_note"] = old_cur
+            _store.BASE = old_base
+            if old_cur:
+                try:
+                    self.app.select_note(old_cur)
+                except Exception:
+                    pass
+            shutil.rmtree(base, ignore_errors=True)
+
+        return note, block, cleanup
+
+    def _imgs(self):
+        return [n for n in self.app.text.image_names() if n.startswith("img:")]
+
+    def test_md_image_input_parsing(self):
+        """地址输入框的解析口径：Markdown / 裸地址 / 空 / 残句。"""
+        import imgstore
+        self.assertEqual(imgstore.parse_md_image_input("![图](media/a.png)"),
+                         ("图", "media/a.png"))
+        self.assertEqual(imgstore.parse_md_image_input("  https://a/b.png  ", old_alt="旧"),
+                         ("旧", "https://a/b.png"))
+        self.assertEqual(imgstore.parse_md_image_input("<C:\\a b\\c.png>", old_alt="x"),
+                         ("x", "C:\\a b\\c.png"))
+        self.assertIsNone(imgstore.parse_md_image_input(""))
+        self.assertIsNone(imgstore.parse_md_image_input("   "))
+        # 只写了 ![]() 这种空地址，别把整串当路径丢给下载器
+        self.assertIsNone(imgstore.parse_md_image_input("![]()"))
+
+    def test_md_image_line_renders_without_enter(self):
+        """敲完 `)` 与粘贴之后，整行 ![alt](src) 都要直接成图（不必回车）。"""
+        import imgstore
+        note, block, cleanup = self._img_scratch_note(with_image=False)
+        try:
+            src = block[1]["src"]
+            # ⚠️ 夹具里这张图没被任何正文引用，载入笔记时 _img_gc 会把它当孤儿删掉。
+            # 这里先把文件放回去，模拟真实场景：笔记里本来就有这张图，用户把它的
+            # Markdown 复制出来再粘一次 —— 那时文件当然还在。
+            with open(imgstore.src_path(src), "wb") as f:
+                f.write(_mk_png(40, 30, (200, 60, 60)))
+            self.assertFalse(self._imgs())
+            # ① 手打整行语法，敲完 `)`（_md_after_paren 的 idle 链）
+            self.app.text.insert("2.0", "![手打](%s)" % src)
+            self.app.text.mark_set("insert", "2.end")
+            self.app._md_after_paren()
+            self.assertTrue(self._pump(lambda: len(self._imgs()) == 1, 5),
+                            "敲完 ) 没有把整行图片语法变成图")
+            self.assertTrue([it for it in self.app.serialize() if it[0] == "img"])
+
+            # ② 粘贴整行语法（不带换行）
+            self.root.clipboard_clear()
+            self.root.clipboard_append("![粘贴](%s)" % src)
+            self.app.text.mark_set("insert", "3.0")
+            self.app.text.event_generate("<<Paste>>")
+            self.assertTrue(self._pump(lambda: len(self._imgs()) == 2, 5),
+                            "粘贴整行图片语法没有变成图")
+            self.assertNotIn("![](", self.app.text.get("1.0", "end"))
+
+            # ③ 普通文字粘贴不能被吞、也不该被当成图
+            self.root.clipboard_clear()
+            self.root.clipboard_append("普通一段话")
+            self.app.text.mark_set("insert", "4.0")
+            self.app.text.event_generate("<<Paste>>")
+            self._pump(lambda: "普通一段话" in self.app.text.get("1.0", "end"), 5)
+            self.assertIn("普通一段话", self.app.text.get("1.0", "end"))
+            self.assertEqual(len(self._imgs()), 2)
+        finally:
+            cleanup()
+
+    def test_image_source_dialog_swaps(self):
+        """改地址就地换图并落库（入口从「点击」挪到右键菜单，逻辑不变）。"""
+        import imgstore
+        note, block, cleanup = self._img_scratch_note()
+        try:
+            name = "img:" + block[1]["id"]
+            old_md = imgstore.format_md_image(block)   # 弹窗里应该预填这个
+            bb = self.app.text.bbox(name)
+            self.assertTrue(bb, "临时笔记里的图没渲染出来")
+            cx, cy = bb[0] + bb[2] // 2, bb[1] + bb[3] // 2
+            self.assertEqual(self.app._img_at_point(cx, cy), name)
+            self.assertIsNone(self.app._img_at_point(2, 2), "点空白处不应算点中图片")
+
+            new_src = imgstore.make_block(_mk_png(20, 50, (0, 120, 200)),
+                                          alt="新图")[1]["src"]
+            out = {}
+
+            def inspect():
+                dlg = self._dialogs()[-1]
+                out["dlg"] = dlg
+                entry = next(w for w in _walk(dlg) if isinstance(w, tk.Entry))
+                out["md"] = entry.get()
+                entry.delete(0, tk.END)
+                entry.insert(0, "![新图](%s)" % new_src)
+                next(w for w in _walk(dlg)
+                     if isinstance(w, tk.Button)
+                     and str(w.cget("text")) == "确定").invoke()
+
+            def verify():
+                dlg = out.get("dlg")
+                out["closed"] = bool(dlg is not None and not dlg.winfo_exists())
+
+            self._close_dialogs()
+            self.root.after(400, inspect)
+            self.root.after(150, lambda: self.app._img_source_dialog(name))
+            self.root.after(1600, verify)
+            self.assertTrue(self._pump(lambda: out.get("closed"), 8),
+                            "换完地址对话框没有关闭")
+            self.assertEqual(out.get("md"), old_md,
+                             "弹窗里预填的不是这张图原来的 Markdown")
+            self.assertEqual(block[1]["src"], new_src)
+            self.assertEqual(block[1]["alt"], "新图")
+            self.assertEqual((block[1]["w"], block[1]["h"]), (20, 50))
+            self.assertTrue(self.app.text.bbox(name), "换地址后正文里没有图")
+            saved = [it for it in note["content"] if it[0] == "img"]
+            self.assertTrue(saved and saved[0][1]["src"] == new_src, "新地址没落到数据块")
+        finally:
+            cleanup()
+
+    # ---------- 图片：悬停看源 / 右键菜单 / 上传图床 ----------
+    def test_image_hover_shows_markdown(self):
+        """悬停图片浮出 Markdown 源（含尺寸与操作提示），指针移开即收。
+
+        用户定的交互：点击**不再**弹窗，改看浮层；点不动才是原本写正文的体验。
+        """
+        import imgstore
+        note, block, cleanup = self._img_scratch_note()
+        try:
+            name = "img:" + block[1]["id"]
+            bb = self.app.text.bbox(name)
+            self.assertTrue(bb, "临时笔记里的图没渲染出来")
+            self.app.text.event_generate("<Motion>", x=bb[0] + bb[2] // 2,
+                                         y=bb[1] + bb[3] // 2)
+            self.assertTrue(self._pump(lambda: self.app._img_hover_win is not None, 3),
+                            "悬停在图片上没有浮出 Markdown")
+            texts = [w.cget("text") for w in _walk(self.app._img_hover_win)
+                     if isinstance(w, tk.Label)]
+            self.assertIn(imgstore.format_md_image(block), texts,
+                          "浮层里不是这张图的 Markdown：%s" % texts)
+            self.assertTrue(any("右键可更换地址" in t for t in texts),
+                            "浮层没告诉用户改地址的入口在哪：%s" % texts)
+
+            self.app.text.event_generate("<Motion>", x=2, y=2)
+            self.root.update()
+            self.assertIsNone(self.app._img_hover_win, "指针移开后浮层还挂着")
+        finally:
+            self.app._img_hover_leave()
+            cleanup()
+
+    def test_image_click_does_not_pop_dialog(self):
+        """点击图片不许再弹「图片地址」窗（浮层才是看源的入口）。"""
+        note, block, cleanup = self._img_scratch_note()
+        try:
+            name = "img:" + block[1]["id"]
+            bb = self.app.text.bbox(name)
+            calls = []
+            real = self.app._img_source_dialog
+            self.app._img_source_dialog = lambda n: calls.append(n)
+            try:
+                self.app.text.event_generate("<Button-1>", x=bb[0] + bb[2] // 2,
+                                             y=bb[1] + bb[3] // 2)
+                self._pump_async(0.3)
+            finally:
+                self.app._img_source_dialog = real
+            self.assertEqual(calls, [], "点击图片仍然弹了地址窗")
+        finally:
+            cleanup()
+
+    def _img_menu_labels(self, name, settings_patch=None, remote=False):
+        """跑一遍 _img_popup，把菜单项 (label, enabled) 捞出来（不真弹窗）。"""
+        import app_actions
+        from unittest import mock
+        settings = self.app.data.setdefault("settings", {})
+        old = {k: settings.get(k) for k in ("piclist_exe",)}
+        if settings_patch:
+            settings.update(settings_patch)
+        ev = type("E", (), {"x_root": 100, "y_root": 100})()
+        try:
+            with mock.patch.object(app_actions, "PopupMenu") as PM:
+                self.app._img_popup(ev, name)
+                out = []
+                for c in PM.return_value.add.call_args_list:
+                    out.append((c[0][0], c[1].get("enabled", True)))
+                return out
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    settings.pop(k, None)
+                else:
+                    settings[k] = v
+
+    def test_image_right_click_menu_local(self):
+        """本地图右键：上传到图床 / 复制本地路径 / 更换地址。"""
+        note, block, cleanup = self._img_scratch_note()
+        try:
+            name = "img:" + block[1]["id"]
+            labels = self._img_menu_labels(name, {"piclist_exe": "D:/PicList/PicList.exe"})
+            texts = [lbl for lbl, _ok in labels]
+            self.assertIn("上传到图床", texts)
+            self.assertIn("复制本地路径", texts)
+            self.assertTrue(any(t.startswith("更换图片地址") for t in texts), texts)
+            ok = dict(labels)["上传到图床"]
+            self.assertTrue(ok, "配好 PicList 时「上传到图床」不该置灰")
+        finally:
+            cleanup()
+
+    def test_image_right_click_menu_upload_reason(self):
+        """没配 PicList / 只读笔记：「上传到图床」置灰，且把原因写进 label。
+
+        一项点不动的菜单用户会以为程序坏了，所以原因必须在菜单上看得见。
+        """
+        note, block, cleanup = self._img_scratch_note()
+        try:
+            name = "img:" + block[1]["id"]
+            labels = self._img_menu_labels(name, {"piclist_exe": ""})
+            zero = labels[0]
+            self.assertIn("PicList路径", zero[0], "置灰时没说清为什么：%s" % (zero,))
+            self.assertFalse(zero[1], "没配 PicList 还能点上传")
+        finally:
+            cleanup()
+
+    def test_image_right_click_menu_remote(self):
+        """远程图右键：给复制地址，不出现「上传到图床」（它已经在上头了）。"""
+        note, block, cleanup = self._img_scratch_note()
+        try:
+            block[1]["src"] = "https://cdn.test/a.png"
+            name = "img:" + block[1]["id"]
+            rec = self.app._imgs_get().get(name)
+            if isinstance(rec, dict):
+                rec["block"] = block          # 让菜单按远程图的口径判断
+            labels = self._img_menu_labels(name, {"piclist_exe": "D:/PicList/PicList.exe"})
+            texts = [lbl for lbl, _ok in labels]
+            self.assertIn("复制图片地址", texts)
+            self.assertFalse(any("上传到图床" in t for t in texts), texts)
+        finally:
+            cleanup()
+
+    def test_image_upload_local_switches_src(self):
+        """右键上传：成功后 src 换成 URL、本地文件删掉（与插入时自动上传同一落点）。"""
+        import imgstore
+        import piclist
+        from unittest import mock
+        note, block, cleanup = self._img_scratch_note()
+        try:
+            name = "img:" + block[1]["id"]
+            old_src = block[1]["src"]
+            path = imgstore.src_path(old_src)
+            self.assertTrue(os.path.isfile(path), "夹具图没落到临时 media 目录")
+            block[1]["src"] = old_src
+            rec = self.app._imgs_get().get(name)
+            if isinstance(rec, dict):
+                rec["block"] = [block[0], dict(block[1])]
+
+            settings = self.app.data.setdefault("settings", {})
+            old_exe = settings.get("piclist_exe")
+            settings["piclist_exe"] = "D:/PicList/PicList.exe"
+            url = "https://cdn.test/uploaded.png"
+            info, err = [], []
+            real_info, real_err = self.app._show_info, self.app._show_alert
+            self.app._show_info = lambda *a, **k: info.append(a)
+            self.app._show_alert = lambda *a, **k: err.append(a)
+            try:
+                with mock.patch.object(piclist, "upload", return_value=url):
+                    self.app._img_upload_local(name)
+                    self._pump_async(1.2)
+            finally:
+                self.app._show_info, self.app._show_alert = real_info, real_err
+                if old_exe is None:
+                    settings.pop("piclist_exe", None)
+                else:
+                    settings["piclist_exe"] = old_exe
+
+            self.assertEqual(err, [], "上传成功却弹了失败框：%s" % (err,))
+            self.assertTrue(info, "上传成功没有任何提示")
+            saved = [it for it in note["content"] if it[0] == "img"][0]
+            self.assertEqual(saved[1]["src"], url, "src 没换成图床 URL")
+            self.assertFalse(os.path.isfile(path), "上传后本地文件没删，会占着 media/")
+        finally:
+            cleanup()
+
+
+    # ---------- 图床图：https 降级 / 后台下载 ----------
+    def _fake_resp(self, data):
+        class _R(object):
+            def read(self_inner):
+                return data
+
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+        return _R()
+
+    def test_remote_fetch_falls_back_to_http(self):
+        """https 握手被掐（WinError 10054 / EOF in violation）→ 自动换 http 重试。
+
+        实测环境里某图床就是这样：TCP 443 连得上、TLS 被重置，http 明文反而正常。
+        """
+        import urllib.request
+        import imgstore
+        png = _mk_png(4, 4, (0, 0, 255))
+        real = urllib.request.urlopen
+        calls = []
+
+        def fake(req, timeout=None):
+            u = getattr(req, "full_url", req)
+            calls.append(u)
+            if u.startswith("https://"):
+                raise OSError("EOF occurred in violation of protocol (_ssl.c:997)")
+            return self._fake_resp(png)
+
+        urllib.request.urlopen = fake
+        try:
+            self.assertEqual(imgstore.fetch_bytes("https://img.test/a.png"), png)
+            self.assertEqual(calls, ["https://img.test/a.png",
+                                     "http://img.test/a.png"])
+        finally:
+            urllib.request.urlopen = real
+
+    def test_remote_fetch_detects_block_page(self):
+        """返回 200 的 HTML 拦截页不能被当成图片；换 http 拿到真图就用。
+
+        只按状态码判断会一路走到 normalize_image 才报「cannot identify image
+        file」—— 用户看到这句话完全没法自查。
+        """
+        import urllib.request
+        import imgstore
+        png = _mk_png(4, 4, (0, 255, 0))
+        html = b"<html><title>URL\xe8\xbf\x87\xe6\xbb\xa4</title></html>"
+        real = urllib.request.urlopen
+
+        def fake(req, timeout=None):
+            u = getattr(req, "full_url", req)
+            return self._fake_resp(html if u.startswith("https://") else png)
+
+        urllib.request.urlopen = fake
+        try:
+            self.assertEqual(imgstore.fetch_bytes("https://img.test/b.png"), png)
+        finally:
+            urllib.request.urlopen = real
+
+        # 两个候选都是网页 → 文案要说清「不是图片」，别甩 SSL 报错
+        urllib.request.urlopen = lambda req, timeout=None: self._fake_resp(html)
+        try:
+            with self.assertRaises(imgstore.UnsupportedImage) as ctx:
+                imgstore.fetch_bytes("https://img.test/c.png")
+            msg = str(ctx.exception)
+            self.assertIn("网页而不是图片", msg)
+            self.assertIn("网络拦截", msg)
+        finally:
+            urllib.request.urlopen = real
+
+    def test_proxy_url_shape(self):
+        """转存地址：host/path/query 整段交给它，query 里的 & 要编码，非 http 给空。"""
+        import imgstore
+        u = "https://files.seeusercontent.com/2026/11/18/Jkf2/a.png"
+        self.assertEqual(
+            imgstore._proxy_url(u),
+            "https://images.weserv.nl/?url=files.seeusercontent.com/2026/11/18/Jkf2/a.png")
+        self.assertEqual(
+            imgstore._proxy_url("http://h/p.png?w=1&h=2"),
+            "https://images.weserv.nl/?url=h/p.png?w%3D1%26h%3D2")
+        self.assertEqual(imgstore._proxy_url("media/a.png"), "")
+        self.assertEqual(imgstore._proxy_url(""), "")
+
+    def test_remote_fetch_falls_back_to_image_proxy(self):
+        """直连 https 被 RST、明文 http 被网关换成拦截页 → 第三条走公开图片转存。
+
+        实测 files.seeusercontent.com 就是这样：按域名拦死，改协议、改 header 都
+        没用，只能让第三方去取。直连能取到图时**绝不**经过它（那会把内网图床
+        地址漏给外面），所以顺带锁住「成功即停」。
+        """
+        import urllib.request
+        import imgstore
+        png = _mk_png(8, 6, (30, 30, 200))
+        html = b"<html><title>URL\xe8\xbf\x87\xe6\xbb\xa4</title></html>"
+        real = urllib.request.urlopen
+        calls = []
+
+        def fake(req, timeout=None):
+            u = getattr(req, "full_url", req)
+            calls.append(u)
+            if u.startswith("https://images.weserv.nl/"):
+                return self._fake_resp(png)
+            if u.startswith("https://"):
+                raise OSError("Connection reset by peer")
+            return self._fake_resp(html)
+
+        urllib.request.urlopen = fake
+        try:
+            src = "https://files.seeusercontent.com/x/a.png"
+            self.assertEqual(imgstore.fetch_bytes(src), png)
+            self.assertEqual(len(calls), 3)
+            self.assertEqual(calls[0], src)
+            self.assertEqual(calls[1], "http://files.seeusercontent.com/x/a.png")
+            self.assertTrue(calls[2].startswith("https://images.weserv.nl/?url="))
+            self.assertIn("files.seeusercontent.com/x/a.png", calls[2])
+
+            # 直连就通 → 不许多发一个请求（内网/私有图床不外泄）
+            calls[:] = []
+            urllib.request.urlopen = lambda req, timeout=None: (
+                calls.append(getattr(req, "full_url", req)) or self._fake_resp(png))
+            imgstore.fetch_bytes(src)
+            self.assertEqual(calls, [src])
+        finally:
+            urllib.request.urlopen = real
+
+    def test_remote_fetch_all_paths_fail_message(self):
+        """三条路都死 → 明说「试过公开图片代理」，并给出换图床/存本机的出路。"""
+        import urllib.request
+        import imgstore
+        real = urllib.request.urlopen
+
+        def fake(req, timeout=None):
+            raise OSError("Connection reset by peer")
+
+        urllib.request.urlopen = fake
+        try:
+            with self.assertRaises(Exception) as ctx:
+                imgstore.fetch_bytes("https://img.test/d.png")
+            msg = str(ctx.exception)
+            self.assertIn("公开图片代理", msg)
+            self.assertIn("换", msg)
+        finally:
+            urllib.request.urlopen = real
+
+        urllib.request.urlopen = lambda req, timeout=None: self._fake_resp(b"<html>x</html>")
+        try:
+            with self.assertRaises(imgstore.UnsupportedImage) as ctx:
+                imgstore.fetch_bytes("https://img.test/e.png")
+            self.assertIn("公开图片代理", str(ctx.exception))
+        finally:
+            urllib.request.urlopen = real
+
+    def test_remote_image_line_is_async(self):
+        """整行远程图必须**立刻**交出占位、后台下载，回来再换图。
+
+        以前是主线程同步下载：慢网时整窗假死，https 被掐还要白等 20 秒超时。
+        同时锁住两件事：src 保留 URL（不复制成本地副本）、图真的出来了。
+        """
+        import time
+        note, _block, cleanup = self._img_scratch_note(with_image=False)
+        real_fetch = self.app._img_cache_fetch
+        try:
+            url = "https://img.test/async.png"
+            png_path = os.path.join(tempfile.mkdtemp(prefix="sj_async_"), "a.png")
+            with open(png_path, "wb") as f:
+                f.write(_mk_png(12, 9, (10, 120, 200)))
+            self.app._img_cache_fetch = lambda u: (png_path, None)
+
+            self.app.text.insert("2.0", "![远端](%s)" % url)
+            self.app.text.mark_set("insert", "2.end")
+            t0 = time.time()
+            self.app._img_line_break("2", url, "远端")
+            cost = time.time() - t0
+            self.assertLess(cost, 0.5, "整行远程图还在主线程上同步下载（%.2fs）" % cost)
+            self.assertEqual(self.app.text.get("2.0", "2.end"),
+                             self.app.IMG_LOADING_TEXT, "没先放「加载中」占位")
+
+            self._pump_async(0.8)
+            self.assertTrue(self._imgs(), "后台下载回来后没有出图")
+            blocks = [it for it in self.app.serialize() if it[0] == "img"]
+            self.assertTrue(blocks, "图片数据块没进 serialize")
+            self.assertEqual(blocks[0][1]["src"], url, "远程图不该复制成本地 media 副本")
+        finally:
+            self.app._img_cache_fetch = real_fetch
+            cleanup()
+
+    def test_remote_image_failure_restores_markdown(self):
+        """下载失败：正文要退回原文，并把真实原因（不是「无输出」）报出来。"""
+        note, _block, cleanup = self._img_scratch_note(with_image=False)
+        real_fetch = self.app._img_cache_fetch
+        real_err = self.app._show_error
+        seen = []
+        try:
+            url = "https://img.test/bad.png"
+            reason = "图床返回的是网页而不是图片：http://img.test/bad.png"
+            self.app._img_cache_fetch = lambda u: (None, reason)
+            self.app._show_error = lambda t, m: seen.append((t, m))
+
+            self.app.text.insert("2.0", "![坏](%s)" % url)
+            self.app.text.mark_set("insert", "2.end")
+            self.app._img_line_break("2", url, "坏")
+            self.assertEqual(self.app.text.get("2.0", "2.end"),
+                             self.app.IMG_LOADING_TEXT)
+            self._pump_async(0.8)
+
+            self.assertEqual(self.app.text.get("2.0", "2.end"),
+                             "![坏](%s)" % url, "失败后原文没回来")
+            self.assertEqual(self._imgs(), [])
+            self.assertTrue(seen, "失败没有任何提示")
+            self.assertIn("网页而不是图片", seen[0][1], "没把真实原因告诉用户")
+        finally:
+            self.app._img_cache_fetch = real_fetch
+            self.app._show_error = real_err
+            cleanup()
+
+    def test_remote_image_render_uses_placeholder(self):
+        """打开笔记时远程图先放灰块占位（不联网、不卡打开），失败也不丢数据块。"""
+        import time
+        note, _block, cleanup = self._img_scratch_note(with_image=False)
+        real_fetch = self.app._img_cache_fetch
+        try:
+            url = "https://img.test/placeholder.png"
+            self.app._img_cache_fetch = lambda u: (None, "断网")
+            content = [["t", "标题\n", ["title"]],
+                       ["img", {"id": "i_ph", "src": url, "w": 12, "h": 9, "alt": ""}]]
+            t0 = time.time()
+            self.app._render_content(content)
+            cost = time.time() - t0
+            self.assertLess(cost, 0.5, "打开笔记还在同步下远程图（%.2fs）" % cost)
+            rec = self.app._imgs_get().get("img:i_ph")
+            self.assertIsNotNone(rec, "远程图没有先放占位块")
+            self.assertNotEqual((rec["photo"].width(), rec["photo"].height()), (12, 9),
+                                "占位块直接用真图尺寸了")
+
+            self._pump_async(0.8)
+            # ⚠️ 失败后**不能**把图元删掉：它是数据块在 serialize() 里的唯一凭据，
+            # 删了下次落库就把这张图从正文里永久抹掉（一次断网 = 丢图）。
+            self.assertIn("img:i_ph", self.app.text.image_names(),
+                          "下载失败后图元被删了，数据块会跟着丢")
+            blocks = [it for it in self.app.serialize() if it[0] == "img"]
+            self.assertTrue(blocks, "占位撤掉了但数据块也跟着没了（等于丢内容）")
+            self.assertEqual(blocks[0][1]["src"], url)
+        finally:
+            self.app._img_cache_fetch = real_fetch
+            cleanup()
 
 
 if __name__ == "__main__":

@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """「任务提醒」智能分类 + 「任务提醒列表」汇总笔记的回归测试（纯数据层，不建窗口）。
 
-锁住 2026-11-09 用户定下的五条语义：
+锁住 2026-11-09 定下、2026-11-18 改版的语义：
   1. 分类排在「加密笔记」下面，不可改名 / 移动（rename_folder 的拦截在真窗口测）；
   2. 该分类下**只有一篇**自动生成的「任务提醒列表」；
-  3. 每行四字段：什么时间 / 做什么任务 / 是否已完成 / 是否已确认，末尾
-     `@源笔记` 是 note: 内链；
-  4. 已完成 = 提醒时间已过（自动），已确认 = 用户点过弹窗「知道了」（独立状态，
-     过期自动补记的 alarm_fired 不算）；
-  5. 排版是**五列制表符表格**（含加粗表头），逐字符挂 ALARM_ROW_TAG；像素级
-     对齐由 app_ui._config_tags() 配在该标签上的 tag 级制表位完成（真窗口测
-     量列起点），不许退回「按字数补空格」。
+  3. 每行四列：提醒时间 / 任务 / 状态 / 来源笔记，末尾 `@源笔记` 是 note: 内链；
+  4. 状态四态共用 alarm.state_of()：待提醒 / 已过期 / 已确认 / 仅标记。
+     已过期 = 提醒时间已过（自动），已确认 = 用户点过「知道了」（独立状态，
+     过期自动补记的 alarm_fired 不算），已确认优先于已过期；
+  5. 排版是**四列制表符表格**（含加粗表头），逐字符挂 ALARM_ROW_TAG；像素级
+     对齐由 app_ui._config_tags() 配在该标签上的 tag 级制表位完成，不许退回
+     「按字数补空格」。
 
 运行：
     python tests/test_alarm_index.py
@@ -28,7 +28,7 @@ import backup                                                  # noqa: E402
 from store import (_t, SMART_FOLDERS, SMART_FOLDER_NAMES, smart_notes,
                    ALARM_INDEX_ID, ALARM_INDEX_TITLE,
                    ALARM_ROW_TAG, ALARM_TASK_COL, ALARM_HEADERS, ALARM_COLS,
-                   alarm_index_content, _ensure_alarm_index_note,
+                   ALARM_STATE_TAG_PREFIX, alarm_index_content, _ensure_alarm_index_note,
                    _ensure_smart_folders, seed, _disp_w)        # noqa: E402
 
 
@@ -120,27 +120,28 @@ class TestIndexContent(unittest.TestCase):
         self.assertIn("2026-11-09 09:00", s, "什么时间：完整年月日 + 时分")
         self.assertIn("交周报", s, "做什么任务")
         row = _cells(content)[0]
-        self.assertEqual(row[2], "是", "时间已过 = 已完成")
-        self.assertEqual(row[3], "是", "点过弹窗 = 已确认")
+        self.assertEqual(row[2], alarm.STATE_SYMBOLS[alarm.STATE_ACKED] + "已确认",
+                         "时间已过 + 点过弹窗 = 已确认（优先于已过期）")
         self.assertIn("@周会待办", s)
         self.assertEqual(links, {"lk_1": "note:n1"}, "内链必须指向源笔记 id")
         self.assertIn("@周会待办", _linked(content, "lk_1"))
         self.assertIn("@周会待办", _linked(content, "link"),
                       "少了共用的 link 标签，点击跳转不会生效")
 
-    def test_done_is_pure_time_not_a_stored_flag(self):
+    def test_state_is_pure_time_not_a_stored_flag(self):
         past = {"id": "a1", "text": "交周报", "at": PAST}
         future = {"id": "a2", "text": "买菜", "at": FUTURE}
         no_time = {"id": "a3", "text": "随手记", "at": 0}
         d = _data([_note("n1", "杂事", [past, future, no_time])])
-        done = [c[2] for c in _cells(alarm_index_content(d, NOW)[0])]
-        self.assertEqual(done.count("是"), 1)
-        self.assertEqual(done.count("否"), 2, "未来 / 未设时间都不算完成")
+        st = [c[2] for c in _cells(alarm_index_content(d, NOW)[0])]
+        self.assertEqual(st, [alarm.STATE_SYMBOLS[alarm.STATE_EXPIRED] + "已过期",
+                              alarm.STATE_SYMBOLS[alarm.STATE_PENDING] + "待提醒",
+                              alarm.STATE_SYMBOLS[alarm.STATE_MARK] + "仅标记"])
         self.assertIn("未设时间", _text(alarm_index_content(d, NOW)[0]))
-        # 同一份数据，把「现在」推到 19:00，未来的那条自动翻成已完成
+        # 同一份数据，把「现在」推到 19:00，未来的那条自动翻成已过期
         later = [c[2] for c in _cells(
             alarm_index_content(d, _ts(2026, 11, 9, 19, 0))[0])]
-        self.assertEqual(later.count("是"), 2)
+        self.assertEqual(later.count(alarm.STATE_SYMBOLS[alarm.STATE_EXPIRED] + "已过期"), 2)
 
     def test_acked_is_independent_from_fired(self):
         """过期自动补记只写 alarm_fired，绝不能算「已确认」。"""
@@ -149,10 +150,10 @@ class TestIndexContent(unittest.TestCase):
             acked={})
         d["settings"]["alarm_fired"] = {"n1|a1": NOW}
         row = _cells(alarm_index_content(d, NOW)[0])[0]
-        self.assertEqual(row[2], "是")
-        self.assertEqual(row[3], "否", "fired 不等于 acked")
+        self.assertEqual(row[2], alarm.STATE_SYMBOLS[alarm.STATE_EXPIRED] + "已过期")
         d["settings"]["alarm_acked"]["n1|a1"] = NOW
-        self.assertEqual(_cells(alarm_index_content(d, NOW)[0])[0][3], "是")
+        self.assertEqual(_cells(alarm_index_content(d, NOW)[0])[0][2],
+                         alarm.STATE_SYMBOLS[alarm.STATE_ACKED] + "已确认")
 
     def test_empty_state_and_sort(self):
         d = _data([_note("n1", "只有文字")])
@@ -265,9 +266,9 @@ class TestAlarmHelpers(unittest.TestCase):
 
 
 class TestTableLayout(unittest.TestCase):
-    """五列表格：制表符分列 + ALARM_ROW_TAG 逐字符挂标签（像素对齐在真窗口测）。"""
+    """四列表格：制表符分列 + ALARM_ROW_TAG 逐字符挂标签（像素对齐在真窗口测）。"""
 
-    def test_header_plus_five_columns_every_row(self):
+    def test_header_plus_four_columns_every_row(self):
         d = _data([
             _note("n1", "甲", [
                 {"id": "a1", "text": "短", "at": PAST},
@@ -278,14 +279,28 @@ class TestTableLayout(unittest.TestCase):
         rows = _rows(content)
         self.assertEqual(len(rows), 4, "1 行表头 + 3 行数据")
         self.assertEqual(tuple(rows[0].split("\t")), ALARM_HEADERS)
+        symbols = set(alarm.STATE_SYMBOLS.values())
         for r in rows[1:]:
             cells = r.split("\t")
-            self.assertEqual(len(cells), 5, "每行必须是五列：%r" % r)
+            self.assertEqual(len(cells), 4, "每行必须是四列：%r" % r)
             self.assertTrue(cells[0] == "未设时间" or len(cells[0]) == 16)
-            self.assertIn(cells[2], ("是", "否"), "状态列只写是 / 否，字段名在表头")
-            self.assertIn(cells[3], ("是", "否"))
-            self.assertTrue(cells[4].startswith("@"))
+            self.assertTrue(cells[2][0] in symbols, "状态列用 BMP 符号 + 文案")
+            self.assertTrue(cells[3].startswith("@"))
         self.assertEqual(set(links.values()), {"note:n1"})
+
+    def test_state_cell_carries_state_tag(self):
+        """状态格的 tag 是 app_ui 着色的唯一依据，漏了就整列一个颜色。"""
+        d = _data([_note("n1", "周会", [
+            {"id": "a1", "text": "交周报", "at": PAST}])])
+        content, _links, _tips = alarm_index_content(d, NOW)
+        tagged = _linked(content, ALARM_STATE_TAG_PREFIX + alarm.STATE_EXPIRED)
+        self.assertEqual(tagged, alarm.STATE_SYMBOLS[alarm.STATE_EXPIRED] + "已过期")
+        self.assertEqual(_linked(content, ALARM_STATE_TAG_PREFIX + alarm.STATE_ACKED), "")
+
+    def test_total_width_unchanged_after_merge(self):
+        """四列总宽必须等于旧五列的 61 列，否则窗口一开就横向滚动。"""
+        self.assertEqual(sum(ALARM_COLS), 61)
+        self.assertEqual(len(ALARM_COLS), 4)
 
     def test_every_table_character_carries_the_row_tag(self):
         """少了 ALARM_ROW_TAG，那一行的 tag 级制表位就不生效、整行会错位。"""
@@ -307,32 +322,32 @@ class TestTableLayout(unittest.TestCase):
             {"id": "a1", "text": long, "at": PAST}])])
         content, links, _tips = alarm_index_content(d, NOW)
         cells = _rows(content)[1].split("\t")
-        self.assertEqual(len(cells), 5, "截断不能多切或少切列")
+        self.assertEqual(len(cells), 4, "截断不能多切或少切列")
         self.assertTrue(cells[1].endswith("…"))
         self.assertLessEqual(_disp_w(cells[1]), ALARM_TASK_COL)
         self.assertNotIn("挤歪", cells[1], "超长尾巴不该漏进表格")
-        self.assertEqual(cells[2], "是")
+        self.assertEqual(cells[2], alarm.STATE_SYMBOLS[alarm.STATE_EXPIRED] + "已过期")
         self.assertEqual(links, {"lk_1": "note:n1"})
 
     def test_every_column_has_fixed_width_and_ticks_the_tips(self):
-        """五列都按 ALARM_COLS 截断；真被截的那几格把全文交给 tips（悬停用）。"""
+        """四列都按 ALARM_COLS 截断；真被截的那几格把全文交给 tips（悬停用）。"""
         long_task = ("这是一个特别长的任务名称用来验证超过列宽之后会被截断"
                      "显示省略号而不会把后面的列挤歪")
-        long_title = "这是一篇标题特别特别长的来源笔记用来验证第五列也会被截断"
+        long_title = "这是一篇标题特别特别长的来源笔记用来验证第四列也会被截断"
         d = _data([_note("n1", long_title, [
             {"id": "a1", "text": long_task, "at": PAST}])])
         content, _links, tips = alarm_index_content(d, NOW)
         cells = _rows(content)[1].split("\t")
-        self.assertEqual(len(cells), 5)
+        self.assertEqual(len(cells), 4)
         for i, cell in enumerate(cells):
             self.assertLessEqual(
                 _disp_w(cell), ALARM_COLS[i],
                 "第 %d 列超了固定宽度，后面的列会被顶歪：%r" % (i + 1, cell))
         self.assertTrue(cells[1].endswith("…"), "任务列该截断")
-        self.assertTrue(cells[4].endswith("…"), "来源笔记列同样固定宽度、同样截断")
+        self.assertTrue(cells[3].endswith("…"), "来源笔记列同样固定宽度、同样截断")
         # 标签必须落在那一格自己的文字上，否则悬停会定位到别的格
         self.assertEqual(_linked(content, "ac_1_2"), cells[1])
-        self.assertEqual(_linked(content, "ac_1_5"), cells[4])
+        self.assertEqual(_linked(content, "ac_1_4"), cells[3])
         self.assertEqual(len(tips), 2, "只有被截断的两格进 tips")
         self.assertIn(long_task, tips.values(), "全文要原样留着，不能是截断后的")
         self.assertIn("@" + long_title, tips.values())
@@ -350,10 +365,10 @@ class TestTableLayout(unittest.TestCase):
             {"id": "a1", "text": "买菜\t做饭\n顺便", "at": PAST}])])
         content, _links, _tips = alarm_index_content(d, NOW)
         cells = _rows(content)[1].split("\t")
-        self.assertEqual(len(cells), 5, "任务 / 标题里的制表符不能凭空多切一列")
+        self.assertEqual(len(cells), 4, "任务 / 标题里的制表符不能凭空多切一列")
         self.assertNotIn("\t", cells[1])
         self.assertNotIn("\n", cells[1])
-        self.assertTrue(cells[4].startswith("@"))
+        self.assertTrue(cells[3].startswith("@"))
 
     def test_empty_state_has_no_header(self):
         content, links, _tips = alarm_index_content(

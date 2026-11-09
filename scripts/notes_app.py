@@ -16,14 +16,17 @@ import dpi
 dpi.init()
 
 import tkinter as tk
+import threading
+import queue
 
 from store import (load_data, save_data, store, plain_of, _fix_sample_note,
                    _mark_sample_note, _upgrade_sample_note, _ensure_smart_folders,
                    _ensure_system_folder, _ensure_note_colors,
                    _ensure_alarm_index_note,
-                   normalize_folder_parents, smart_notes, subtree_ids, SMART_FOLDERS,
-                   APP_NAME, SEAL_TITLE_MASK, set_save_error_hook,
-                   dump_pending, pending_files)
+                    normalize_folder_parents, smart_notes, subtree_ids, SMART_FOLDERS,
+                    RECYCLE_FOLDER, recycle_item_view,
+                    APP_NAME, SEAL_TITLE_MASK, set_save_error_hook,
+                    dump_pending, pending_files)
 from theme import build_palette, DEFAULT_THEME, THEMES
 from widgets import (SIDEBAR_W, LIST_W, SIDE_MIN, SIDE_MAX, LIST_MIN, LIST_MAX)
 from app_ui import UIMixin
@@ -99,6 +102,10 @@ class NotesApp(UIMixin, ActionsMixin):
         # 兼容旧数据：给还没有色条的笔记补颜色（老库升级 / 导入后第一次启动）
         if _ensure_note_colors(self.data):
             save_data(self.data)
+        # 回收站 7 天过期：启动时先清一遍（回收站自己是一张独立表，不随 data 落库）
+        store().recycle_purge()
+        # 图片孤儿回收：删笔记 / 图床上传后遗留的 media 文件，启动时清一次
+        self._img_gc()
         # 配色：多主题，读 settings["theme"]（首次打开默认森林绿 = 中性浅灰底 +
         # WorkBuddy 当前主题色）。首次运行把这个默认写进库，已下线的「跟随 WorkBuddy
         # 外观（skin）」也归位默认；用户自己选过的主题不动。
@@ -164,6 +171,8 @@ class NotesApp(UIMixin, ActionsMixin):
         # 上一次「自动更新」的收尾：批处理替换失败时会留一个日志，那时本进程
         # 已经退了、弹不出窗，只能下次启动再说。顺带清掉旧版本的安装包。
         self._after(300, self._check_update_aftermath)
+        # 回收站过期检查：启动时已清一遍，这里管「应用连着开很多天」的情况。
+        self._after(60 * 60 * 1000, self._recycle_timer)
         if self._save_error is not None:
             self._after(0, self._notify_save_error)
         else:
@@ -173,6 +182,17 @@ class NotesApp(UIMixin, ActionsMixin):
             self.root.bind("<Destroy>", self._on_root_destroy, add="+")
         except Exception:
             pass
+
+    def _recycle_timer(self):
+        """每小时清一次超过 7 天的回收站项目；正开着回收站视图时顺手重画。"""
+        if not getattr(self, "_alive", True):
+            return
+        try:
+            if store().recycle_purge():
+                self.recycle_refresh_if_open()
+        except Exception:
+            pass
+        self._after(60 * 60 * 1000, self._recycle_timer)
 
     def _on_root_destroy(self, e):
         if getattr(e, "widget", None) is not self.root:
@@ -272,6 +292,50 @@ class NotesApp(UIMixin, ActionsMixin):
     def _after_idle(self, fn):
         return self._after(0, fn)
 
+    def _img_async(self, work, done):
+        """图片相关的后台任务（PicList 上传 / 网络下载）：线程里跑 work()，
+        结果交回主线程给 done(result)。
+
+        ⚠️ 绝不能在后台线程里调 root.after()：Tk 只允许建窗的那个线程调用
+        after（内部 createcommand 会碰 Tcl 解释器），子线程调用会抛
+        `RuntimeError: main thread is not in main loop`。旧实现正是这么写的，
+        after 在子线程抛异常 → done 永远不执行 → 设置窗「测试上传」点了没反应、
+        按钮卡在禁用态；图片上传的回调也被吞掉。旧代码只 catch 了 TclError，
+        连线程崩了都不知道。
+
+        正确做法 = 每个任务一条独立队列 + 主线程轮询：后台线程只把结果
+        put 进 `queue.Queue`（唯一允许跨线程的动作），轮询的 after 由本函数在
+        **主线程**注册；poll 每 40ms 取一次，取到就在主线程调 done 并停。
+        每个任务自带队列/轮询链，并发上传互不干扰。整条 after 链都在主线程，
+        窗口关掉（_alive=False）后由 _after 统一取消，不再回调。
+
+        work() 抛出的异常也进队列，交给 done 里既有的 (ok, value) 协议处理。
+        """
+        q = queue.Queue()
+
+        def runner():
+            try:
+                result = work()
+            except Exception as e:
+                result = e
+            q.put(result)
+
+        def poll():
+            if not getattr(self, "_alive", False):
+                return
+            try:
+                result = q.get_nowait()
+            except queue.Empty:
+                self._after(40, poll)   # 还没回来：主线程再排一次
+                return
+            if isinstance(result, Exception):
+                done((False, str(result)))
+            else:
+                done(result)
+
+        threading.Thread(target=runner, daemon=True).start()
+        self._after(40, poll)
+
     def _cancel_after(self, job):
         self._after_jobs.discard(job)
         try:
@@ -296,6 +360,10 @@ class NotesApp(UIMixin, ActionsMixin):
         三个智能分类（全部 / 星标 / 加密）只是**筛选条件**，筛选本身抽在
         store.smart_notes 里（纯函数，测试不建 GUI 也能断言）。
         """
+        if fid == RECYCLE_FOLDER:
+            # 回收站里的「笔记行」是快照包装出来的假笔记，id = 回收记录 id：
+            # 点它只会查回收记录，绝不会把原笔记装进编辑器（见 _load_editor_body）。
+            return [recycle_item_view(r) for r in store().recycle_all()]
         if fid in SMART_FOLDERS:
             return smart_notes(fid, self.data["notes"])
         ids = set(self.folder_subtree(fid))
@@ -303,6 +371,14 @@ class NotesApp(UIMixin, ActionsMixin):
 
     def visible_notes(self):
         q = (self.search_var.get() if hasattr(self, "search_var") else "").strip().lower()
+        if self.data.get("current_folder") == RECYCLE_FOLDER:
+            # 回收站不走 notes 表的 SQL 搜索：那些假笔记根本不在表里。
+            # 本地按显示文字简单过滤即可（量很小，7 天就清）。
+            items = self.folder_notes(RECYCLE_FOLDER)
+            if not q:
+                return items
+            return [x for x in items
+                    if q in "".join(str(it) for it in x.get("content") or []).lower()]
         if q:
             # 搜索读的是库里的 plain 列；还有去抖中的改动就先落库，免得搜不到刚敲的字
             if self._save_job is not None:

@@ -31,6 +31,10 @@ import dpi
 
 WM_NCCALCSIZE = 0x0083
 WM_SIZE = 0x0005
+WM_SETREDRAW = 0x000B
+RDW_INVALIDATE = 0x0001
+RDW_ERASE = 0x0004
+RDW_ALLCHILDREN = 0x0080
 GWLP_WNDPROC = -4
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOZORDER, SWP_FRAMECHANGED = 0x0001, 0x0002, 0x0004, 0x0020
 SWP_NOACTIVATE = 0x0010
@@ -208,6 +212,51 @@ def panel_canvas_height(target_h, avail_h, fixed, min_canvas=120):
     """
     return max(int(min_canvas),
                min(int(target_h), int(avail_h)) - max(0, int(fixed)))
+
+
+class frozen_paint(object):
+    """操作期间临时冻结窗口重绘（Windows 的 WM_SETREDRAW），退出时整窗失效重画。
+
+    专门给「销毁一批子控件 → 重新布局」这种**中间态很难看**的操作兜底：
+    Tk 里子控件被销毁后，父窗口马上会收到曝光区的重绘，而 pack 的重排要等
+    下一个 idle。那一帧画出来的就是「行没了、空位还在」—— 删一条只是一道缝，
+    一次删很多条就是**整片空白**，肉眼看到的就是「列表闪了一下白」。
+    冻结重绘后，中间态一帧都不会往屏幕上送，用户只看到操作完成后的样子。
+
+    非 Windows 退化成空操作：那时没有 WM_SETREDRAW 可用，调用方按 Tk 常规时序
+    处理即可（本来也只是偶发的一帧）。
+    """
+
+    def __init__(self, win):
+        self.win = win
+        self.hwnd = None
+
+    def __enter__(self):
+        if not _IS_WIN or _u32 is None:
+            return self
+        try:
+            self.hwnd = _parent_hwnd(self.win)
+            _u32.SendMessageW(self.hwnd, WM_SETREDRAW, 0, 0)
+        except Exception:
+            self.hwnd = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.hwnd is None:
+            return False
+        try:
+            _u32.SendMessageW(self.hwnd, WM_SETREDRAW, 1, 0)
+            # 只标脏、不立刻重画：让 Tk 在下一个 idle 连同重排一起画，在这儿画
+            # 反而会画到「还没重排」的状态上。
+            # ⚠️ 必须带 ALLCHILDREN：Tk 在 Windows 上每个控件都有自己的窗口，行
+            # 控件被搬了位置后，**父窗口不负责擦它们原来的地盘** —— 只失效父窗口
+            # 的话，屏幕上会留下搬走前的旧像素（残影：新行下面叠着旧行）。
+            _u32.RedrawWindow(self.hwnd, None, None,
+                              RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN)
+        except Exception:
+            pass
+        self.hwnd = None
+        return False
 
 
 class WindowFrame(object):
@@ -396,16 +445,28 @@ class WindowFrame(object):
     def _drag_start(self, event):
         if not self.enabled:
             return
-        if self.is_maximized():
-            # 最大化状态下拖标题栏＝还原（Windows 的规矩）。还原这一步会重排几何，
-            # 所以必须等它落定再取位置，否则起点是最大化时的 (0,0)。
-            self.restore()
-            self.root.update_idletasks()
+        # 最大化时**不**在这里还原。Windows 的规矩是「拖动」标题栏才还原，
+        # 单纯单击要老老实实保持最大化 —— 之前按下就 restore，导致点一下
+        # 顶栏空白整窗就缩回去。真正的还原推迟到 _drag_move，且必须等鼠标
+        # 移动越过拖拽阈值（见 _drag_threshold）才认，顺带滤掉单击时的手抖。
         # 记**客户区原点**而不是 winfo_x/y：后者混着 wrapper 的偏移，与 _move_to
         # 的坐标口径不一致，拖起来会差半个边框。
-        self._drag = [event.x_root, event.y_root,
-                      self.root.winfo_rootx(), self.root.winfo_rooty()]
-        self._last_pos = (int(self._drag[2]), int(self._drag[3]))
+        self._drag = {
+            "x0": event.x_root, "y0": event.y_root,
+            "wx": self.root.winfo_rootx(), "wy": self.root.winfo_rooty(),
+            "max": self.is_maximized(),
+            "rel": event.x_root - self.root.winfo_rootx(),   # 按下点距窗口左缘
+            "dy": event.y_root - self.root.winfo_rooty(),    # 按下点距窗口顶缘
+            "restored": False,
+        }
+        self._last_pos = (int(self._drag["wx"]), int(self._drag["wy"]))
+
+    def _drag_threshold(self):
+        """认定「拖动」而非「单击」的最小位移（系统 SM_CXDRAG≈4px）。"""
+        try:
+            return max(2, int(dpi.px(4)))
+        except Exception:
+            return 4
 
     def _drag_move(self, event):
         """按「相对起点的位移」而不是每次的增量来摆窗口。
@@ -423,8 +484,35 @@ class WindowFrame(object):
         """
         if not self._drag or not self.enabled:
             return
-        x0, y0, wx, wy = self._drag
-        x, y = wx + event.x_root - x0, wy + event.y_root - y0
+        d = self._drag
+        dx = event.x_root - d["x0"]
+        dy = event.y_root - d["y0"]
+        # 最大化且还没拖起来：单击 / 微小抖动一律不还原、不挪窗
+        if d["max"] and not d["restored"]:
+            t = self._drag_threshold()
+            if abs(dx) < t and abs(dy) < t:
+                return
+            # 第一次真正拖动：先还原，再按「按下点相对窗口宽度」把窗口抓到
+            # 鼠标底下（对齐 Aero Snap 的手感，鼠标仍抓在顶栏原来的相对位置）。
+            w_before = max(1, self.root.winfo_width())
+            frac = min(1.0, max(0.0, d["rel"] / float(w_before)))
+            # 还原后的宽度优先从还原框取：不用为读 winfo 再跑一次布局刷新，
+            # 免得 restore 落在还原框、下一帧才跳到鼠标底下，中间闪一下。
+            box = self._restore_box
+            w_after = box[2] if box else None
+            self.restore()
+            if w_after is None:
+                self.root.update_idletasks()
+                w_after = self.root.winfo_width()
+            x = int(event.x_root - frac * w_after)
+            y = int(event.y_root - d["dy"])
+            d["restored"] = True
+            d["x0"], d["y0"] = event.x_root, event.y_root
+            d["wx"], d["wy"] = x, y
+            self._move_to(x, y)
+            return
+        x = d["wx"] + dx
+        y = d["wy"] + dy
         # 同一像素内的重复事件直接丢掉：鼠标 125Hz 时会有一堆重复坐标
         if self._last_pos == (int(x), int(y)):
             return
@@ -436,6 +524,13 @@ class WindowFrame(object):
     def _drag_toggle(self, event):
         if not self.enabled:
             return
+        d = self._drag
+        self._drag = None
+        # 双击自带两次 ButtonPress，_drag_start 已经记了基准；清掉免得还原
+        # 之后残留的 motion 拿旧坐标把窗口摆飞。若这次双击过程中已经因拖动
+        # 还原过，就别再 toggle 回去。
+        if d is not None and d.get("restored"):
+            return "break"
         self.toggle_max()
         return "break"
 

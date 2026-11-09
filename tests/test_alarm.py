@@ -8,6 +8,7 @@
 import datetime
 import os
 import sys
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -185,6 +186,181 @@ class TestDue(unittest.TestCase):
         self.assertEqual(len(fire), 1)                   # 正好卡在容差上 → 弹
         fire, stale = alarm.due([("n", {"id": "x", "at": edge - 1})], now)
         self.assertEqual((len(fire), len(stale)), (0, 1))
+
+
+class TestStateOf(unittest.TestCase):
+    """四态判定：正文卡片与汇总表共用，这里锁死优先级（2026-11-18）。"""
+
+    NOW = 1793300000.0
+
+    def test_four_states(self):
+        self.assertEqual(alarm.state_of({"at": self.NOW + 60}, now=self.NOW),
+                         alarm.STATE_PENDING)
+        self.assertEqual(alarm.state_of({"at": self.NOW - 60}, now=self.NOW),
+                         alarm.STATE_EXPIRED)
+        self.assertEqual(alarm.state_of({"at": self.NOW - 60}, acked=True,
+                                        now=self.NOW), alarm.STATE_ACKED)
+        self.assertEqual(alarm.state_of({"at": 0}, now=self.NOW), alarm.STATE_MARK)
+
+    def test_acked_beats_expired(self):
+        # 点过「知道了」还显示已过期 = 用户以为没生效
+        self.assertEqual(alarm.state_of({"at": self.NOW - 3600}, acked=True,
+                                        now=self.NOW), alarm.STATE_ACKED)
+
+    def test_mark_beats_acked(self):
+        # 没设时间从不弹窗，误写 acked 也只算标记
+        self.assertEqual(alarm.state_of({"at": 0}, acked=True, now=self.NOW),
+                         alarm.STATE_MARK)
+
+    def test_labels_and_symbols_are_bmp(self):
+        self.assertEqual(set(alarm.STATES),
+                         set(alarm.STATE_LABELS) | set(alarm.STATE_SYMBOLS))
+        for ch in alarm.STATE_SYMBOLS.values():
+            self.assertLess(ord(ch), 0x10000, "Tcl/Tk 不吃 U+FFFF 以上的字符")
+
+
+class TestRepeatRules(unittest.TestCase):
+    """重复提醒的规则与槽位（2026-11-18 用户定三种类型）。"""
+
+    def test_old_data_defaults_to_once(self):
+        d = {"id": "a", "text": "交周报", "at": 1793700000.0}
+        self.assertEqual(alarm.repeat_kind(d), alarm.REPEAT_ONCE)
+        self.assertEqual(alarm.fmt_repeat(d), alarm.fmt_at(d["at"]))
+        self.assertEqual(alarm.state_key("n|a", d), "n|a")   # 旧键不变
+
+    def test_daily_rule_text_and_next(self):
+        now = 1793700000.0                      # 2026-11-03 前后
+        anchor = datetime.datetime.fromtimestamp(now).replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp()
+        d = {"id": "a", "text": "吃药", "at": anchor,
+             "repeat": "daily", "hm": "09:00"}
+        self.assertEqual(alarm.fmt_repeat(d), "每天 09:00")
+        self.assertIn("下次", alarm.fmt_when(d, now))
+        self.assertGreater(alarm.next_occ(d, now), now)
+
+    def test_weekly_rule_multi_select_and_text(self):
+        anchor = datetime.datetime(2026, 11, 1).timestamp()
+        d = {"id": "a", "text": "周会", "at": anchor,
+             "repeat": "weekly", "hm": "09:00", "days": [0, 2, 4]}
+        self.assertEqual(alarm.fmt_repeat(d), "每周一三五 09:00")
+        nxt = alarm.next_occ(d, datetime.datetime(2026, 11, 18, 10).timestamp())
+        self.assertTrue(datetime.datetime.fromtimestamp(nxt).weekday() in (0, 2, 4))
+
+    def test_normalize_rule_no_weekday_selected_is_empty(self):
+        self.assertEqual(alarm.normalize_rule("bogus", "9:5", [99]),
+                         {"repeat": "once"})
+        self.assertEqual(alarm.normalize_rule("weekly", "25:00", [1, 1, 7, 2]),
+                         {"repeat": "weekly", "hm": "09:00", "days": [1, 2]})
+
+    def test_due_all_fires_once_per_day_and_not_twice(self):
+        base = datetime.datetime(2026, 11, 15).timestamp()
+        d = {"id": "a", "text": "吃药", "at": base,
+             "repeat": "daily", "hm": "09:00"}
+        fired = {}
+        key_of = lambda nid, x: "%s|%s" % (nid, x["id"])
+        t0 = datetime.datetime(2026, 11, 18, 16).timestamp()
+        f, s = alarm.due_all([("n1", d)], fired, key_of, t0)
+        self.assertEqual(len(f), 1, "当天没响过就该弹，不受 GRACE 限制")
+        self.assertEqual(len(s), 0)
+        fired[f[0][2]] = t0
+        f2, _ = alarm.due_all([("n1", d)], fired, key_of, t0 + 60)
+        self.assertEqual(f2, [], "同一天不该弹两次")
+        f3, _ = alarm.due_all([("n1", d)], fired, key_of, t0 + 86400)
+        self.assertEqual(len(f3), 1, "第二天照常响")
+        self.assertNotEqual(f3[0][2], f[0][2], "第二天的槽位键必须不同于今天")
+
+    def test_acked_is_per_cycle(self):
+        now = time.time()
+        d = {"id": "a", "text": "吃药", "at": now - 7200,
+             "repeat": "daily", "hm": "09:00"}
+        self.assertEqual(alarm.state_of(d, acked=True, now=now), alarm.STATE_ACKED)
+        # 明天同一个「今天确认过」的旧键不再生效
+        k = alarm.state_key("n|a", d, now)
+        self.assertTrue(k.endswith(datetime.date.today().isoformat()))
+        self.assertNotEqual(k, alarm.state_key("n|a", d, now + 86400))
+
+
+class TestAckedSuppressesPopup(unittest.TestCase):
+    """正文卡片上点过「完成」的提醒，到点不许再弹（用户 2026-11-18 要求）。
+
+    历史 bug：`_alarm_check` 只查 `alarm_fired`，而卡片「完成」写的是
+    `alarm_acked` —— 两条各管一件事，于是一边显示「已确认」、一边照样弹窗。
+    """
+
+    KEY = staticmethod(lambda nid, x: "%s|%s" % (nid, x["id"]))
+
+    def test_once_acked_before_due_never_fires(self):
+        at = datetime.datetime(2026, 11, 18, 18).timestamp()
+        d = {"id": "a", "text": "交周报", "at": at}
+        key = "n1|a"
+        # 提前点「完成」：时间还没到，ack 已写
+        f, s = alarm.due_all([("n1", d)], {}, self.KEY, at + 30,
+                             acked={key: at - 600})
+        self.assertEqual(f, [], "已确认的提醒不该弹窗")
+        self.assertEqual(s, [], "也不该被补记成 stale/fired")
+
+    def test_once_acked_still_suppresses_when_long_overdue(self):
+        """过期很久也只能靠 acked 挡住 —— 否则用户确认过的会被补记一波。"""
+        at = datetime.datetime(2026, 11, 18, 9).timestamp()
+        d = {"id": "a", "text": "交周报", "at": at}
+        f, s = alarm.due_all([("n1", d)], {}, self.KEY, at + 8 * 3600,
+                             acked={"n1|a": at})
+        self.assertEqual((f, s), ([], []))
+
+    def test_repeat_ack_only_blocks_current_slot(self):
+        base = datetime.datetime(2026, 11, 15).timestamp()
+        d = {"id": "a", "text": "吃药", "at": base,
+             "repeat": "daily", "hm": "09:00"}
+        t0 = datetime.datetime(2026, 11, 18, 16).timestamp()
+        today_key = alarm.state_key("n1|a", d, t0)
+        f, s = alarm.due_all([("n1", d)], {}, self.KEY, t0,
+                             acked={today_key: t0})
+        self.assertEqual((f, s), ([], []), "今天已确认，不弹")
+        f2, _ = alarm.due_all([("n1", d)], {}, self.KEY, t0 + 86400,
+                              acked={today_key: t0})
+        self.assertEqual(len(f2), 1, "明天是新槽位，照常提醒")
+
+    def test_acked_does_not_swallow_other_reminders(self):
+        at = datetime.datetime(2026, 11, 18, 18).timestamp()
+        a = {"id": "a", "text": "已确认的", "at": at}
+        b = {"id": "b", "text": "没确认的", "at": at}
+        f, _ = alarm.due_all([("n1", a), ("n1", b)], {}, self.KEY, at + 10,
+                             acked={"n1|a": at})
+        self.assertEqual([x[1]["id"] for x in f], ["b"])
+
+    def test_ack_before_first_slot_targets_the_upcoming_one(self):
+        """到点前点「完成」必须预确认今天那一格，不能退成静态 @start。
+
+        历史 bug：`slot_date()` 在今天的时刻还没到、且昨天早于起始日时返回
+        None，`state_key()` 于是写成 `nb|b1@start`；到点扫描算的是
+        `nb|b1@2026-11-18`，两边对不上 → 点了完成照样弹窗。
+        """
+        base = datetime.datetime(2026, 11, 18).timestamp()   # 起始日 = 今天
+        d = {"id": "b1", "text": "吃药", "at": base,
+             "repeat": "daily", "hm": "09:00"}
+        early = datetime.datetime(2026, 11, 18, 8, 0).timestamp()
+        due = datetime.datetime(2026, 11, 18, 9, 5).timestamp()
+        self.assertIsNone(alarm.slot_date(d, early), "8 点还没到今天的槽位")
+        self.assertEqual(alarm.next_slot_date(d, early),
+                         datetime.date(2026, 11, 18))
+        early_key = alarm.state_key("n1|b1", d, early)
+        self.assertEqual(early_key, alarm.state_key("n1|b1", d, due),
+                         "提前确认的键必须等于到点时的槽位键")
+        # 用提前写下的 acked 去扫，到点这一轮就该静默
+        f, s = alarm.due_all([("n1", d)], {}, self.KEY, due,
+                             acked={early_key: early})
+        self.assertEqual((f, s), ([], []))
+
+    def test_weekly_next_slot_skips_unselected_days(self):
+        anchor = datetime.datetime(2026, 11, 16).timestamp()   # 周一
+        d = {"id": "w", "text": "周会", "at": anchor,
+             "repeat": "weekly", "hm": "09:00", "days": [0, 2]}
+        wed_early = datetime.datetime(2026, 11, 18, 8, 0).timestamp()  # 周三早上
+        self.assertEqual(alarm.next_slot_date(d, wed_early),
+                         datetime.date(2026, 11, 18), "周三就是下一个")
+        thu = datetime.datetime(2026, 11, 19, 8, 0).timestamp()
+        self.assertEqual(alarm.next_slot_date(d, thu),
+                         datetime.date(2026, 11, 23), "周四之后跳到下周一")
 
 
 class TestText(unittest.TestCase):
