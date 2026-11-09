@@ -49,7 +49,8 @@ import struct
 import time
 
 from store import (SMART_FOLDERS, SYSTEM_FOLDER, _ensure_smart_folders,
-                   _ensure_system_folder, normalize_folder_parents,
+                   _ensure_system_folder, _ensure_alarm_index_note,
+                   ALARM_INDEX_ID, normalize_folder_parents,
                    new_sample_note, uid)
 
 # 备份文件里的格式标识与 schema 版本。
@@ -74,7 +75,8 @@ _SALT_LEN, _NONCE_LEN = 16, 12
 #   prefs —— 外观偏好，跟着人走。覆盖导入时采纳备份里的值。
 #   state —— 本机会话状态，不导出（存的是本机 id / 像素，换机就是垃圾）。
 PREFS_KEYS = ("font_family", "body_size", "toolbar")
-STATE_KEYS = ("tabs", "side_w", "list_w", "alarm_fired", "current_folder", "current_note")
+STATE_KEYS = ("tabs", "side_w", "list_w", "alarm_fired", "alarm_acked",
+              "current_folder", "current_note")
 
 # 只存在于备份文件里的笔记字段（导入时展开成 content 后要剔掉，别流进内存数据）
 _V2_ONLY = ("text", "spans", "blocks", "rev")
@@ -357,12 +359,11 @@ def _encode_folder(f):
 def encode(data, extra=None, exported_at=None):
     """内存数据 → schema 2 快照（含 checksum）。`extra` 里的键会一起算进校验和。
 
-    **内置说明笔记（`sample`）不导出**：它是程序自带的一份使用说明，不是用户的内容
-    —— 换机、存档、给别人一份，带过去都只是噪音（对面一导入就多出一篇讲过时的
-    快捷键表，还得跟本机自带的那篇较劲）。导入后由 `overwrite` 按当前版本重建一篇，
-    永远是最新的排版。判据只认 `sample` 这个标记：用户自己写的笔记哪怕标题也叫
-    「欢迎使用素笺」，没打标记就照常导出（改名 = 收下它，保护解除的规则见
-    store._mark_sample_note）。
+    **内置说明笔记（`sample`）与「任务提醒列表」（ALARM_INDEX_ID）都不导出**：
+    它们是程序自带的内容 / 按全库提醒实时生成的报表，不是用户写的东西 ——
+    换机、存档、给别人一份，带过去都只是噪音（对面一导入就多出一篇讲过时的
+    快捷键表，或一张指向本机笔记 id 的过期表格）。导入后由 `overwrite` / `merge`
+    按当前版本当场重建，永远是最新的。判据只认标记 / 固定 id。
 
     「系统」文件夹同理不导出：它和里面的说明笔记是一套的，导入时由
     `_ensure_system_folder` 补回来。把它写进备份只会让对面多出一格空文件夹。
@@ -378,7 +379,8 @@ def encode(data, extra=None, exported_at=None):
         "folders": [_encode_folder(f) for f in (data.get("folders") or [])
                     if isinstance(f, dict) and f.get("id") != SYSTEM_FOLDER],
         "notes": [_encode_note(n) for n in (data.get("notes") or [])
-                  if isinstance(n, dict) and not n.get("sample")],
+                  if isinstance(n, dict) and not n.get("sample")
+                  and n.get("id") != ALARM_INDEX_ID],
     }
     if extra:
         payload.update(extra)
@@ -801,6 +803,8 @@ def overwrite(d, cur=None):
     for n in d.get("notes") or []:
         if not isinstance(n, dict) or not isinstance(n.get("content"), list):
             continue
+        if n.get("id") == ALARM_INDEX_ID:
+            continue        # 系统报表按本机当前数据重建，不认备份里那一版
         fid = n.get("folder") if n.get("folder") in ids else "f_work"
         rec = _clean_note(n, fid, now)
         if not rec.get("id"):
@@ -812,9 +816,10 @@ def overwrite(d, cur=None):
            "current_folder": "f_all", "current_note": None,
            "settings": merge_prefs(cur.get("settings"), d.get("prefs"), adopt=True),
            "styles": merge_styles(cur.get("styles"), d.get("styles"))}
-    # 备份里没有「系统」文件夹（encode 不导出），说明笔记也由上面重建 ——
     # 这一句把它俩接上：补出文件夹、把 sample 收进去，钉在第一个真实文件夹位
     _ensure_system_folder(out)
+    # 「任务提醒列表」也按导入后的最终笔记集重建（备份不带它，见 encode）
+    _ensure_alarm_index_note(out, now / 1000.0)
     return out
 
 
@@ -875,6 +880,8 @@ def merge(d, cur):
     for n in d.get("notes") or []:
         if not isinstance(n, dict) or not isinstance(n.get("content"), list):
             continue
+        if n.get("id") == ALARM_INDEX_ID:
+            continue        # 报表不合并，末尾按合并结果重建一份
         r = rev_of(n)
         if r in have_rev:
             continue                 # 同一篇（内容一字不差）→ 跳过，导两次也只算一次
@@ -896,6 +903,7 @@ def merge(d, cur):
            "settings": merge_prefs(cur.get("settings"), d.get("prefs"), adopt=False),
            "styles": merge_styles(cur.get("styles"), d.get("styles"))}
     _ensure_system_folder(out)      # 本机老库里可能还没这一格（备份也不会带过来）
+    _ensure_alarm_index_note(out, now / 1000.0)   # 按合并后的全库提醒重建报表
     return out
 
 

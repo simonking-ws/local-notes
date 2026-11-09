@@ -20,6 +20,7 @@ import tkinter as tk
 from store import (load_data, save_data, store, plain_of, _fix_sample_note,
                    _mark_sample_note, _upgrade_sample_note, _ensure_smart_folders,
                    _ensure_system_folder, _ensure_note_colors,
+                   _ensure_alarm_index_note, ALARM_INDEX_ID,
                    normalize_folder_parents, smart_notes, subtree_ids, SMART_FOLDERS,
                    APP_NAME, SEAL_TITLE_MASK, set_save_error_hook,
                    dump_pending, pending_files)
@@ -89,6 +90,11 @@ class NotesApp(UIMixin, ActionsMixin):
         # ⚠️ 必须排在 _mark_sample_note **之后**：很老的库里说明笔记还没有 sample
         # 标记，先跑这里会认不出它，说明就留在「工作」里了（要等下次启动才搬）。
         if _ensure_system_folder(self.data):
+            save_data(self.data)
+        # 「任务提醒列表」汇总笔记：固定 id 补齐 + 按全库提醒重建正文（幂等）。
+        # 排在 _ensure_system_folder 之后：那一步可能把误落系统区的笔记搬走，
+        # 汇总表要按搬完之后的最终数据算。
+        if _ensure_alarm_index_note(self.data):
             save_data(self.data)
         # 兼容旧数据：给还没有色条的笔记补颜色（老库升级 / 导入后第一次启动）
         if _ensure_note_colors(self.data):

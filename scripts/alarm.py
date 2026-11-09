@@ -30,8 +30,8 @@ import re
 import uuid
 
 __all__ = ["new_id", "normalize_text", "default_when", "parse_when", "fmt_at",
-           "tips", "due", "month_grid", "shift_month", "WEEKDAYS",
-           "MAX_TEXT", "GRACE"]
+           "fmt_full", "is_done", "tips", "due", "month_grid", "shift_month",
+           "WEEKDAYS", "MAX_TEXT", "GRACE"]
 
 # 日历表头。周一排第一列（中国习惯），month_grid 的 lead 计算跟这个顺序绑定，
 # 改这里必须同步改 month_grid。
@@ -144,6 +144,29 @@ def fmt_at(ts):
     if t.year == today.year:
         return t.strftime("%m-%d ") + hm
     return t.strftime("%Y-%m-%d ") + hm
+
+
+def fmt_full(ts):
+    """`2026-11-09 18:00`；没设时间返回空串。
+
+    汇总表里要的是「哪一天几点」，不能用 fmt_at 的「今天 / 明天」相对写法 ——
+    表是拿来回看的，隔一天再看，「今天 18:00」就指向了别的日子。
+    """
+    if not ts:
+        return ""
+    return datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def is_done(data, now=None):
+    """「已完成」的判据（用户 2026-11-09 定义）：**提醒时刻已过**就算完成。
+
+    纯计算、不落库：状态跟着时钟走，过了那个点自动翻面，不需要任何按钮，
+    也不会因为换机器、导备份而丢。没设时间（at=0）的闹钟只是正文里的一枚
+    标记，永远不算完成。
+    """
+    now = datetime.datetime.now().timestamp() if now is None else now
+    at = (data or {}).get("at") or 0
+    return bool(at and at <= now)
 
 
 def tips(data, fired=False, now=None):

@@ -19,7 +19,9 @@
    着色）+ 下方名称，点击即换；换主题只重画选中环 / 名称色，圆内预览色固定。
    ⚠️ 真窗口断言一律复用本文件的 root：`widgets._PHOTO_CACHE` 是模块级缓存，
    PhotoImage 绑在第一个 Tcl 解释器上，另建 `tk.Tk()` 会让后面的测试类报
-   「image pyimage1 doesn't exist」。
+    「image pyimage1 doesn't exist」。正文自动换行（工具栏第 15 枚）这组真窗口
+    断言也放这里，同样复用本文件的 app / root；「任务提醒」分类与汇总表的
+    真窗口断言同理。
 
     python tests\\test_settings_dialog.py -v
 """
@@ -424,10 +426,21 @@ class TestSettingsDialog(unittest.TestCase):
         **每套主题自己**的固定配色，换主题只该换选中环与名称色，不能把六张
         预览一起洗掉 —— 那就没有「横向比较」的意义了。
         """
+        import theme
         self.app.set_theme("light")
         dlg = self._open()
         cards = self._theme_cards(dlg)
         self.assertEqual(len(cards), 6, "六套主题各一张色卡")
+
+        # 展示顺序按 grid 行列读（就是用户看到的第一格 / 第二格 …）：
+        # 默认主题森林绿占第一格，其余跟 list_themes() 一致。
+        ordered = sorted(cards, key=lambda c: (int(c.grid_info()["row"]),
+                                               int(c.grid_info()["column"])))
+        self.assertEqual([c._theme_tid for c in ordered],
+                         [t for t, _lb in theme.list_themes()],
+                         "色卡没按 list_themes() 的展示顺序摆")
+        self.assertEqual(ordered[0]._theme_tid, theme.DEFAULT_THEME,
+                         "森林绿（默认主题）应是第一张色卡")
 
         # 不再有主题下拉框：设置窗里只剩字体族那一枚 Combobox
         combos = [w for w in _walk(dlg) if isinstance(w, ttk.Combobox)]
@@ -451,7 +464,6 @@ class TestSettingsDialog(unittest.TestCase):
             self.assertEqual(len(self._card_swatch_fills(c)), 3,
                              "%s 的圆应是顶栏 / 稿纸 / 强调三色" % c._theme_tid)
 
-        import theme
         for c in cards:
             q = theme.build_palette(c._theme_tid)
             fills = self._card_swatch_fills(c)
@@ -689,6 +701,626 @@ class TestSettingsDialog(unittest.TestCase):
             btn._fg = None
             btn.redraw()
             self.app.set_theme("forest")
+
+    # ---------- 正文自动换行（工具栏第 15 枚，真窗口） ----------
+    def _wrap_guard(self):
+        """记下测试前的开关 / 窗口尺寸，返回 restore()。"""
+        app = self.app
+        was_on = app._editor_wrap_on()
+        geo = self.root.geometry()
+
+        def restore():
+            app.set_editor_wrap(was_on)
+            try:
+                self.root.geometry(geo)
+            except Exception:
+                pass
+            self.root.update_idletasks()
+            self.root.update()
+        return restore
+
+    def _long_line(self, content=None):
+        """临时把正文换成一行探针文字（缺省 400 字），返回 restore()。
+
+        ⚠️ 期间 `app._loading = True`：`<<Modified>>` 一律不算用户编辑，否则这段
+        探针文字会被去抖保存写进临时库，污染后面的字数 / 只读相关用例。
+        """
+        text = self.app.text
+        state = str(text.cget("state"))
+        body = text.get("1.0", "end-1c")
+        loading = getattr(self.app, "_loading", False)
+        self.app._loading = True
+        text.config(state=tk.NORMAL)
+        text.delete("1.0", "end")
+        text.insert("1.0", "字" * 400 if content is None else content)
+        self.root.update_idletasks()
+        self.root.update()
+
+        def restore():
+            text.delete("1.0", "end")
+            text.insert("1.0", body)
+            text.config(state=state)
+            self.app._loading = loading
+            self.root.update_idletasks()
+            self.root.update()
+        return restore
+
+    def test_editor_wrap_default_is_off_and_button_present(self):
+        """首次默认不换行；工具栏第 15 枚是「自动换行」，且默认不带选中态。"""
+        restore = self._wrap_guard()
+        try:
+            self.app.data["settings"].pop("editor_wrap", None)
+            self.assertFalse(self.app._editor_wrap_on(), "缺省 / 脏数据应默认不换行")
+            ids = [i[0] for i in self.app.TOOL_ITEMS]
+            self.assertIn("wrap", ids, "工具栏没登记自动换行按钮")
+            self.assertEqual(len(ids), 15, "工具栏应有 15 项（第 15 枚是自动换行）")
+            self.assertEqual(self.app.TOOL_SHORT_NAMES["wrap"], "自动换行")
+            self.assertNotIn("wrap", self.app.READONLY_LOCKED,
+                             "自动换行是视图开关，只读笔记里也该能点")
+            btn = self.app._wrap_btn
+            self.assertIsNotNone(btn, "工具栏没建出自动换行按钮")
+            btn.set_selected(False)
+            self.assertFalse(btn.selected, "默认态按钮不该亮着")
+            self.app.data["settings"]["editor_wrap"] = "true"
+            self.assertFalse(self.app._editor_wrap_on(),
+                             "脏数据（非布尔值）不能被当成「已开启」")
+            self.app.data["settings"].pop("editor_wrap", None)
+        finally:
+            restore()
+
+    def test_editor_wrap_toggle_persists_and_syncs_button(self):
+        """切换写进 settings，正文 / 按钮选中态 / 落库三处一致。"""
+        import store
+        restore = self._wrap_guard()
+        try:
+            self.app.set_editor_wrap(True)
+            self.assertEqual(str(self.app.text.cget("wrap")), "char",
+                             "开启后正文没切到按字符软换行（别改回 word：长段汉字"
+                             "会被当成一个词整块推到下一行）")
+            self.assertTrue(self.app._wrap_btn.selected, "开启后按钮没亮")
+            self.assertIs(store.load_data()["settings"]["editor_wrap"], True,
+                          "开启状态没落库，重启会丢")
+            self.app.set_editor_wrap(False)
+            self.assertEqual(str(self.app.text.cget("wrap")), "none",
+                             "再次关闭没回到不换行")
+            self.assertFalse(self.app._wrap_btn.selected, "关闭后按钮还亮着")
+            self.assertIs(store.load_data()["settings"]["editor_wrap"], False,
+                          "关闭状态没落库")
+        finally:
+            restore()
+
+    def test_editor_wrap_button_click_toggles(self):
+        """点一下开、再点一下关：按钮命令真的接到全局开关上。"""
+        restore = self._wrap_guard()
+        try:
+            self.app.set_editor_wrap(False)
+            btn = self.app._wrap_btn
+            for expected in (True, False):
+                btn.event_generate("<ButtonPress-1>", x=5, y=5)
+                btn.event_generate("<ButtonRelease-1>", x=5, y=5)
+                self.root.update_idletasks()
+                self.assertIs(self.app._editor_wrap_on(), expected,
+                              "点按钮没切到 %s" % ("开" if expected else "关"))
+                self.assertIs(btn.selected, expected, "按钮选中态没跟上")
+            self.assertEqual(str(self.app.text.cget("wrap")), "none")
+        finally:
+            restore()
+
+    def test_editor_wrap_reflows_when_window_widens(self):
+        """软换行随窗口宽度自动重排（不往正文插换行符）；不换行时才有横向细条。"""
+        geo_restore = self._wrap_guard()
+        body_restore = None
+        try:
+            body_restore = self._long_line()
+            self.app.set_editor_wrap(False)
+            self.root.update_idletasks()
+            self.root.update()
+            self.assertTrue(bool(self.app._hscroll.winfo_ismapped()),
+                            "不换行 + 超长行应浮出横向细条")
+            self.app.set_editor_wrap(True)
+            self.root.update_idletasks()
+            self.root.update()
+            self.assertFalse(bool(self.app._hscroll.winfo_ismapped()),
+                             "自动换行时不该还留着横向细条")
+
+            def lines():
+                n = self.app.text.count("1.0", "1.end", "update", "displaylines")
+                return int(n[0]) if isinstance(n, (tuple, list)) else int(n)
+
+            self.root.geometry("900x700")
+            self.root.update_idletasks()
+            self.root.update()
+            narrow = lines()
+            self.root.geometry("1500x900")
+            self.root.update_idletasks()
+            self.root.update()
+            wide = lines()
+            self.assertLess(wide, narrow,
+                            "窗口拉宽后折行数没变少 —— 换行不会自动补充")
+            # 注意用 end-1c（全文末尾那个 Tk 自动补的换行之前），别用 1.end-1c：
+            # 后者会再退一个字符，400 字读成 399 字。
+            self.assertEqual(self.app.text.get("1.0", "end-1c"), "字" * 400,
+                             "软换行竟然往正文里插了换行符")
+        finally:
+            if body_restore is not None:
+                body_restore()
+            geo_restore()
+
+    def test_wrap_icon_and_selected_state_repaint(self):
+        """16px 图标用整数矩形拼；选中底色随主题走，不把建窗那刻的色烤死。"""
+        import theme
+        import widgets
+        cv = tk.Canvas(self.root)
+        ids = widgets._draw_icon(cv, "wrap", 8, 8, 16, "#333333")
+        self.assertTrue(ids, "自动换行图标没画出图元")
+        self.assertTrue(any(cv.type(i) == "rectangle" for i in ids),
+                        "16px 图标应是整数矩形块面，别用细描线")
+        cv.destroy()
+
+        pal = self.app.pal
+        btn = widgets.RoundButton(self.root, pal, "", icon="wrap", base=pal["editor"])
+        normal = btn._cur_fill()
+        btn.set_selected(True)
+        self.assertTrue(btn.selected)
+        self.assertNotEqual(btn._cur_fill(), normal, "选中态没有视觉反馈")
+        dark = theme.build_palette("dark")
+        selected_light = btn._cur_fill()
+        btn.apply_theme(dark, base=dark["editor"])
+        self.assertTrue(btn.selected, "换肤把选中态弄丢了")
+        self.assertNotEqual(btn._cur_fill(), selected_light,
+                            "换主题后选中底色停在旧配色上")
+        btn.destroy()
+
+    def test_wrap_icon_arrow_centered_on_bottom_line(self):
+        """箭头必须压在底线的中线上。
+
+        工具栏按钮高 29px → cy=14.5、图标框 y0=6.5：四个坐标各自 round() 时
+        底线成 [16,18)（中线 17）、箭头尖成 18，整枚箭头偏低 1px（用户实报）。
+        现在箭头中线从底线取整后的实际坐标现推，整 / .5 / 高 DPI 都要对齐。
+        """
+        import widgets
+
+        def check(cv, label, tol=0):
+            items = list(cv.find_all())
+            rects = [cv.coords(i) for i in items if cv.type(i) == "rectangle"]
+            # 圆角底那张 polygon 有几十个顶点，箭头只有 6 个坐标
+            polys = [cv.coords(i) for i in items
+                     if cv.type(i) == "polygon" and len(cv.coords(i)) == 6]
+            self.assertEqual(len(rects), 3, "%s：横线/折角应是三块整数矩形" % label)
+            self.assertEqual(len(polys), 1, "%s：应只有一枚三角箭头" % label)
+            bot = max(rects, key=lambda c: c[1])       # y 起点最大 = 底线
+            center = (bot[1] + bot[3]) / 2.0
+            p = polys[0]
+            self.assertLessEqual(abs(p[1] - center), tol,
+                                 "%s：箭头尖没压在底线中线上" % label)
+            self.assertLessEqual(abs((p[3] + p[5]) / 2.0 - center), tol,
+                                 "%s：箭头上下不对称" % label)
+
+        for cy, size in ((8, 16), (8.5, 16), (14.5, 16)):
+            cv = tk.Canvas(self.root)
+            widgets._draw_icon(cv, "wrap", 8, cy, size, "#333333")
+            check(cv, "cy=%s s=%s" % (cy, size))
+            cv.destroy()
+        # 高 DPI 档允许半个像素的取整误差，但不能再出现整像素级错位
+        cv = tk.Canvas(self.root)
+        widgets._draw_icon(cv, "wrap", 10, 10, 20, "#333333")
+        check(cv, "s=20", tol=0.5)
+        cv.destroy()
+        check(self.app._wrap_btn, "真实工具栏按钮")
+
+    def test_editor_wrap_fills_line_for_repeated_paragraph(self):
+        """同一段文字复制多遍：按字符折行要排满，不能在段间空格处另起一行。
+
+        旧实现 wrap=WORD 只认空格断点，一长串汉字算一个「词」，第二遍会从
+        默认行首重新起排、上一行留一大截空白（用户 2026-11-09 实报）。
+        """
+        guard = self._wrap_guard()
+        body_restore = None
+        try:
+            self.app.set_editor_wrap(True)
+            t = self.app.text
+
+            def first_row_chars():
+                info = t.dlineinfo("1.0")
+                self.assertTrue(info, "首行量不到行盒")
+                end = t.index("@100000,%d" % (info[1] + info[3] // 2))
+                return int(end.split(".")[1])
+
+            def row_starts(n=3):
+                cur, out = "1.0", []
+                for _ in range(n):
+                    out.append(int(cur.split(".")[1]))
+                    nxt = t.index("%s +1 display line" % cur)
+                    if nxt == cur or t.compare(nxt, ">=", "1.end"):
+                        break
+                    cur = nxt
+                return out
+
+            # 对照组：纯汉字无空格，量出这一宽度到底能排多少字
+            body_restore = self._long_line("字" * 400)
+            self.root.update_idletasks()
+            self.root.update()
+            ctrl = first_row_chars()
+
+            # 同一段 20 字复制 20 遍，段间一个半角空格
+            para = "自动换行效果检查用的中文示例文字没有空格"
+            self.assertEqual(len(para), 20)
+            period = len(para) + 1
+            body_restore()
+            body_restore = None
+            body_restore = self._long_line(" ".join([para] * 20))
+            self.root.update_idletasks()
+            self.root.update()
+            char_len = first_row_chars()
+            starts = row_starts()
+
+            self.assertGreaterEqual(char_len, ctrl,
+                                    "按字符折行没把第一行排满（退回到空格断点了）")
+            self.assertNotEqual(starts[1] % period, 0,
+                                "第二显示行从段首重新起排 —— 又回到 WORD 的老毛病")
+            # 同一段内容在旧 WORD 模式下的首屏行数，用来锁住「确实不一样」
+            t.configure(wrap=tk.WORD)
+            self.root.update_idletasks()
+            self.root.update()
+            word_len = first_row_chars()
+            self.app.set_editor_wrap(True)     # 复原为 CHAR，别把状态留给别的用例
+            self.assertGreater(char_len, word_len,
+                               "CHAR 与 WORD 折点相同，重复段落的空白没被修掉")
+        finally:
+            if body_restore is not None:
+                body_restore()
+            guard()
+
+    # ---------- 「任务提醒」分类 / 汇总表（真窗口） ----------
+    # 三条都复用本文件的 root / app；改过视图与正文的用例各自 try/finally 复原。
+
+    def _alarm_restore(self, old_f, old_n, src=None, saved=None):
+        """把真窗口状态放回用例开始前，避免污染后面的设置窗用例。"""
+        if src is not None and saved is not None:
+            src["content"] = saved
+        self.app.data["current_folder"] = old_f
+        self.app.data["current_note"] = old_n
+        self.app.refresh_all()
+        self.root.update_idletasks()
+
+    def test_alarm_folder_order_and_index_protection(self):
+        import store
+        app = self.app
+        fids = [f["id"] for f in app.data["folders"]]
+        self.assertEqual(fids[:4], ["f_all", "f_star", "f_lock", "f_alarm"],
+                         "「任务提醒」必须紧接「加密笔记」")
+        idx = next(n for n in app.data["notes"]
+                   if n["id"] == store.ALARM_INDEX_ID)
+        self.assertEqual(idx["folder"], "f_alarm")
+        self.assertEqual(app.title_of(idx), store.ALARM_INDEX_TITLE)
+        self.assertTrue(app.is_alarm_index(idx))
+        self.assertTrue(app.is_protected_note(idx), "汇总表要受系统笔记保护")
+        self.assertGreater(len(app._folder_icons["f_alarm"].find_all()), 0,
+                           "新分类的闹钟图标没画出来")
+
+    def test_alarm_view_has_one_readonly_note(self):
+        import store
+        app = self.app
+        old_f, old_n = app.data.get("current_folder"), app.data.get("current_note")
+        try:
+            app.select_folder("f_alarm")
+            self.root.update_idletasks()
+            self.assertEqual(list(app._rows.keys()), [store.ALARM_INDEX_ID],
+                             "分类下必须只有「任务提醒列表」这一篇")
+            self.assertEqual(app.mid_head.cget("text"), "任务提醒")
+            app.select_note(store.ALARM_INDEX_ID)
+            self.root.update_idletasks()
+            self.assertTrue(getattr(app, "_readonly", False))
+            self.assertEqual(getattr(app, "_ro_kind", None), "alarm_index")
+            self.assertIn("自动汇总", app._ro_label.cget("text"))
+        finally:
+            self._alarm_restore(old_f, old_n)
+
+    def test_alarm_inline_link_jumps_to_source(self):
+        import datetime
+        import store
+        app = self.app
+        old_f, old_n = app.data.get("current_folder"), app.data.get("current_note")
+        src = next(n for n in app.data["notes"]
+                   if not n.get("sample") and n["id"] != store.ALARM_INDEX_ID)
+        saved = list(src.get("content") or [])
+        try:
+            at = (datetime.datetime.now() - datetime.timedelta(hours=1)).timestamp()
+            src["content"] = saved + [
+                ["alarm", {"id": "w_probe", "text": "窗口测试提醒", "at": at}]]
+            app._refresh_alarm_index()
+            app.select_folder("f_alarm")
+            app.select_note(store.ALARM_INDEX_ID)
+            self.root.update_idletasks()
+            body = app.text.get("1.0", "end")
+            self.assertIn("窗口测试提醒", body)
+            self.assertIn("已完成：是", body)
+            self.assertIn("已确认：否", body)
+            ranges = app.text.tag_ranges("link")
+            self.assertTrue(ranges, "汇总表里没有可点的内链")
+            # 库里可能本来就有别的提醒（按时间排在前面），别假定第一条就是 src。
+            # 只要能找到指向 src 的那条内链，跳转语义就成立。
+            urls = [app._link_url_at(str(r)) for r in ranges[::2]]
+            self.assertIn("note:" + src["id"], urls,
+                          "汇总表里没有指向提醒所在笔记的内链")
+            app._goto_note(src["id"])     # 模拟点 @源笔记
+            self.root.update_idletasks()
+            self.assertEqual(app.data.get("current_note"), src["id"],
+                             "内链没跳到提醒所在的笔记")
+        finally:
+            self._alarm_restore(old_f, old_n, src, saved)
+
+    def test_alarm_table_columns_are_pixel_aligned(self):
+        """长短不一的任务名 / 中英混排 / 未设时间，五列起点必须逐行相同。
+
+        对齐靠 **tag 级制表位**：不许改 widget 级 tabs（那会污染所有笔记里的
+        制表符），也不许退回按字数补空格（中文 15px / 半角空格 8px，会累积误差）。
+        """
+        import datetime
+        import store
+        app = self.app
+        old_f, old_n = app.data.get("current_folder"), app.data.get("current_note")
+        src = next(n for n in app.data["notes"]
+                   if not n.get("sample") and n["id"] != store.ALARM_INDEX_ID)
+        saved = list(src.get("content") or [])
+        try:
+            now = datetime.datetime.now()
+            src["content"] = saved + [
+                ["alarm", {"id": "c1", "text": "短",
+                           "at": (now - datetime.timedelta(hours=2)).timestamp()}],
+                ["alarm", {"id": "c2", "text": "订会议室并通知全体参会同事",
+                           "at": (now + datetime.timedelta(hours=1)).timestamp()}],
+                ["alarm", {"id": "c3", "text": "buy milk and eggs", "at": 0}],
+            ]
+            app._refresh_alarm_index()
+            app.select_folder("f_alarm")
+            app.select_note(store.ALARM_INDEX_ID)
+            self.root.update_idletasks()
+            self.root.update()
+            t = app.text
+            self.assertFalse(t.cget("tabs"),
+                             "不许改 widget 级制表位，会连带改掉普通笔记")
+            self.assertTrue(t.tag_cget(store.ALARM_ROW_TAG, "tabs"),
+                            "汇总表行没配上 tag 级制表位")
+            last = int(t.index("end-1c").split(".")[0])
+            col_x = {2: [], 3: [], 4: []}
+            for ln in range(1, last + 1):
+                cells = t.get("%d.0" % ln, "%d.end" % ln).split("\t")
+                if len(cells) != 5 or not cells[2].startswith("已完成："):
+                    continue            # 只量数据行，表头另算
+                pos = 0
+                for i, cell in enumerate(cells):
+                    if i:
+                        pos += 1
+                    if i in col_x:
+                        bb = t.bbox("%d.%d" % (ln, pos))
+                        self.assertTrue(bb, "第 %d 行量不到列坐标" % ln)
+                        col_x[i].append(bb[0])
+                    pos += len(cell)
+            self.assertGreaterEqual(len(col_x[2]), 3,
+                                    "没凑齐三条长短不一的提醒")
+            for col, xs in col_x.items():
+                self.assertEqual(len(set(xs)), 1,
+                                 "第 %d 列没垂直对齐：%r" % (col + 1, xs))
+        finally:
+            self._alarm_restore(old_f, old_n, src, saved)
+
+    def test_alarm_tab_stops_follow_body_size(self):
+        """字号一变，制表位必须按新字体重算，否则时间列会撞进任务列。"""
+        import store
+        app = self.app
+        t = app.text
+        before = tuple(str(x) for x in t.tag_cget(store.ALARM_ROW_TAG, "tabs"))
+        old = app.body_size
+        try:
+            app.body_size = old + 3
+            app._config_tags()
+            after = tuple(str(x) for x in t.tag_cget(store.ALARM_ROW_TAG, "tabs"))
+            self.assertNotEqual(before, after, "改字号后制表位没跟着变")
+            self.assertGreater(int(after[0]), int(before[0]))
+        finally:
+            app.body_size = old
+            app._config_tags()
+
+    # ---------- 每篇独立恢复码（真窗口） ----------
+    # 同样复用本文件的 root / app：模态窗靠 after 在嵌套事件循环里驱动，
+    # 驱动函数抛异常也必须把窗口销毁，否则 wait_window() 会把测试挂死。
+
+    def _drive_dialog(self, body, delay=80):
+        box = {}
+        def run():
+            wins = self._dialogs()
+            win = wins[-1] if wins else None
+            try:
+                body(win, box)
+            except Exception as e:
+                box["driver_error"] = e
+                if win is not None:
+                    try:
+                        win.grab_release()
+                        win.destroy()
+                    except Exception:
+                        pass
+        self.root.after(delay, run)
+        return box
+
+    def _button(self, win, text):
+        return next(w for w in _walk(win)
+                    if isinstance(w, tk.Button) and str(w.cget("text")) == text)
+
+    def test_recovery_dialog_gates_on_checkbox(self):
+        import secret
+        self._close_dialogs()
+        app = self.app
+        code = secret.new_recovery_code()
+        def body(win, box):
+            ok = self._button(win, "启用恢复")
+            chk = next(w for w in _walk(win) if isinstance(w, tk.Checkbutton))
+            box["initial"] = str(ok.cget("state"))
+            box["code_shown"] = any(
+                isinstance(w, tk.Label) and str(w.cget("text")) == code
+                for w in _walk(win))
+            chk.invoke()
+            box["after"] = str(ok.cget("state"))
+            ok.invoke()
+        box = self._drive_dialog(body)
+        result = app._show_recovery_code(code, secret.recovery_id(code), "季度预算")
+        self.assertIsNone(box.get("driver_error"), str(box.get("driver_error")))
+        self.assertEqual(box.get("initial"), "disabled",
+                         "没勾「已抄下」就能启用，会留下一把没人知道的钥匙")
+        self.assertEqual(box.get("after"), "normal")
+        self.assertTrue(box.get("code_shown"), "恢复码没渲染出来")
+        self.assertTrue(result)
+
+    def test_recovery_dialog_can_be_declined(self):
+        import secret
+        self._close_dialogs()
+        code = secret.new_recovery_code()
+        box = self._drive_dialog(
+            lambda win, b: self._button(win, "暂不启用").invoke())
+        result = self.app._show_recovery_code(code, secret.recovery_id(code), "季度预算")
+        self.assertIsNone(box.get("driver_error"), str(box.get("driver_error")))
+        self.assertFalse(result, "「暂不启用」不该留下恢复槽")
+
+    def test_recovery_input_rejects_bad_code(self):
+        import secret
+        self._close_dialogs()
+        code = secret.new_recovery_code()
+        def body(win, box):
+            entry = next(w for w in _walk(win) if isinstance(w, tk.Entry))
+            ok = self._button(win, "验证")
+            entry.insert(0, "BAD")
+            ok.invoke()
+            box["still_open"] = bool(win.winfo_exists())
+            box["error"] = any(
+                isinstance(w, tk.Label) and "格式不对" in str(w.cget("text"))
+                for w in _walk(win))
+            entry.delete(0, tk.END)
+            entry.insert(0, code)
+            ok.invoke()
+        box = self._drive_dialog(body)
+        got = self.app._ask_recovery_code("用恢复码恢复", "季度预算",
+                                          secret.recovery_id(code))
+        self.assertIsNone(box.get("driver_error"), str(box.get("driver_error")))
+        self.assertTrue(box.get("still_open"), "乱码不该直接关窗")
+        self.assertTrue(box.get("error"), "没给出格式错误提示")
+        self.assertEqual(got, secret.norm_recovery_code(code))
+
+    def test_password_dialog_recovery_entry_is_opt_in(self):
+        self._close_dialogs()
+        app = self.app
+        flag = {}
+        def body(win, box):
+            box["has_link"] = any(
+                isinstance(w, tk.Button) and "恢复码" in str(w.cget("text"))
+                for w in _walk(win))
+            next(w for w in _walk(win) if isinstance(w, tk.Button)
+                 and "恢复码" in str(w.cget("text"))).invoke()
+        box = self._drive_dialog(body)
+        self.assertIsNone(app._ask_password("已加密笔记", "请输入口令：", out=flag))
+        self.assertIsNone(box.get("driver_error"), str(box.get("driver_error")))
+        self.assertTrue(box.get("has_link"))
+        self.assertTrue(flag.get("recovery"))
+
+        self._close_dialogs()
+        def body2(win, box):
+            box["has_link"] = any(
+                isinstance(w, tk.Button) and "恢复码" in str(w.cget("text"))
+                for w in _walk(win))
+            self._button(win, "取消").invoke()
+        box2 = self._drive_dialog(body2)
+        self.assertIsNone(app._ask_password("导出备份", "口令："))
+        self.assertIsNone(box2.get("driver_error"), str(box2.get("driver_error")))
+        self.assertFalse(box2.get("has_link"),
+                         "不传 out 的调用不该凭空多一条恢复入口")
+
+    def test_recovery_dialog_copies_full_record(self):
+        """复制按钮给出【笔记名称】_【凭证编号】_【恢复码】，不是光一段码。"""
+        import secret
+        self._close_dialogs()
+        app = self.app
+        code = secret.new_recovery_code()
+        rid = secret.recovery_id(code)
+        want = secret.format_recovery_record("季度预算", rid, code)
+        def body(win, box):
+            box["format_hint"] = any(
+                isinstance(w, tk.Label) and "[笔记名称]" in str(w.cget("text"))
+                for w in _walk(win))
+            self._button(win, "复制恢复码").invoke()
+            try:
+                box["clip"] = win.clipboard_get()
+            except Exception as e:
+                box["clip_error"] = e
+            self._button(win, "暂不启用").invoke()
+        box = self._drive_dialog(body)
+        result = app._show_recovery_code(code, rid, "季度预算")
+        self.assertIsNone(box.get("driver_error"), str(box.get("driver_error")))
+        self.assertFalse(result)
+        self.assertTrue(box.get("format_hint"), "弹窗里没印出复制格式")
+        self.assertIsNone(box.get("clip_error"), str(box.get("clip_error")))
+        self.assertEqual(box.get("clip"), want)
+        # 关窗后剪贴板必须仍是这份凭证串，不能回退成编辑区之前复制过的正文 ——
+        # 这正是「恢复时偶尔粘到旧正文」的根因：之前写到瞬时 Toplevel，窗口一
+        # 销毁，Tk 的延迟提供回调失效，剪贴板就退回上一个所有者（很可能就是正文）。
+        try:
+            self.assertEqual(app.root.clipboard_get(), want)
+        except Exception as e:
+            self.fail("关窗后剪贴板丢失 / 回退成旧内容：%s" % e)
+
+    def test_recovery_input_accepts_full_record(self):
+        """复制出来的整条凭证能直接粘进输入框，自动取出末尾那段恢复码。"""
+        import secret
+        self._close_dialogs()
+        app = self.app
+        code = secret.new_recovery_code()
+        rid = secret.recovery_id(code)
+        record = secret.format_recovery_record("季度预算_备份", rid, code)
+        def body(win, box):
+            entry = next(w for w in _walk(win) if isinstance(w, tk.Entry))
+            entry.insert(0, record)
+            self._button(win, "验证").invoke()
+            box["still_open"] = bool(win.winfo_exists())
+        box = self._drive_dialog(body)
+        got = app._ask_recovery_code("用恢复码恢复", "季度预算_备份", rid)
+        self.assertIsNone(box.get("driver_error"), str(box.get("driver_error")))
+        self.assertFalse(box.get("still_open"), "整条凭证没被自动拆出恢复码")
+        self.assertEqual(got, secret.norm_recovery_code(code))
+
+    def test_readonly_bar_shows_recovery_entry_only_with_slot(self):
+        """2026-11-09 返修：未解锁提示条上必须常驻一条「用恢复码」入口。
+
+        用户设完恢复码、切走再点回来时看到的就是这条提示条；只有口令框里
+        藏一条小字按钮的话，等于「没有输入恢复码的入口」。无槽时则要藏起来，
+        不能给一个点进去必定失败的按钮。
+        """
+        import secret
+        app = self.app
+        old_note = app.data.get("current_note")
+        old_ro = getattr(app, "_readonly", False)
+        old_kind = getattr(app, "_ro_kind", None)
+        blob, key = secret.seal_and_key("[]", "probe-pw")
+        secret.seal_recovery(blob, key, secret.new_recovery_code())
+        n = {"id": "n_rc_bar_probe", "folder": "f_work", "content": [],
+             "sec": blob, "created": 1, "updated": 2}
+        app.data["notes"].insert(0, n)
+        try:
+            app.data["current_note"] = n["id"]
+            app._set_readonly(True, "locked")
+            self.assertEqual(app._ro_recovery.winfo_manager(), "pack",
+                             "带槽的加密笔记必须常驻恢复码入口")
+            self.assertIn("恢复码", app._ro_label.cget("text"))
+            self.assertIn("恢复码", str(app._ro_recovery.cget("text")))
+            secret.drop_recovery(n["sec"])
+            app._update_readonly_bar()
+            self.assertEqual(app._ro_recovery.winfo_manager(), "",
+                             "没有恢复槽时入口必须隐藏")
+            self.assertNotIn("恢复码", app._ro_label.cget("text"))
+        finally:
+            app.data["notes"].remove(n)
+            app.data["current_note"] = old_note
+            app._ro_kind = old_kind
+            app._set_readonly(old_ro, old_kind)
+            app._update_readonly_bar()
 
 
 if __name__ == "__main__":

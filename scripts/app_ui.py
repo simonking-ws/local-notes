@@ -16,11 +16,14 @@ from tkinter import ttk
 
 # 像素常量要跟 DPI 走：SCALE 已在 notes_app.py 顶部定好（导入本模块之前）
 import dpi
+import secret
 
 from store import (APP_NAME, save_data,
                    SMART_FOLDERS, SYSTEM_FOLDER, LOCKED_BODY_TEXT, folder_children,
                    subtree_ids, ensure_note_color, resolve_adjacent_colors,
-                   pick_note_color, NOTE_COLORS)
+                   pick_note_color, NOTE_COLORS,
+                   ALARM_INDEX_ID, ALARM_INDEX_TITLE, ALARM_ROW_TAG,
+                   alarm_index_content, _ensure_alarm_index_note)
 from theme import (FONT, _RES, build_palette, DEFAULT_THEME, THEMES, list_themes,
                    theme_label, on_accent)
 from widgets import (RoundButton, FontSizeSlider, ArrowButton,
@@ -32,6 +35,7 @@ from widgets import (RoundButton, FontSizeSlider, ArrowButton,
                      ScrollPanel, ScrollBody, HRule, Tooltip, TabStrip,
                      gutter_width, gutter_slots, gutter_hit_at,
                      SMART_ICON_ALL, SMART_ICON_STAR, SMART_ICON_LOCK,
+                     SMART_ICON_ALARM,
                      FOLDER_ICON_W, FOLDER_ICON_H, CARD_RADIUS, CARD_PADX, CARD_GAP,
                      SIDEBAR_W, LIST_W, SEARCH_PADX,
                      SEARCH_H, DLG_TEXT_W,
@@ -74,6 +78,9 @@ FOOTER_GAP = FOOTER_H - TEXT_PADY
 # 触发状态条的「底部热区」高度。比状态条本身高一截：只留 20px 的话，
 # 指针得像素级瞄准最下面那一条才碰得到，实际是「怎么移都不出来」。
 FOOTER_HOT_H = FOOTER_H + dpi.px(26)
+# 不换行时正文底部那条横向细滚动条的厚度。只在 wrap=NONE 且真有超宽长行时浮出，
+# 与右侧竖向滚动条同宽感；窗口拉宽到放得下、或切回自动换行就自动收起。
+HSCROLL_H = dpi.px(9)
 
 # 待办勾选框（字面字符 ⬜ / ✅，见 md_conv.TODO_OFF 里为什么不使用自绘控件）。
 # 未勾态的字符颜色 = chk_off 向主文字色混合 —— 和原来自绘空心框的描边同一套算法，
@@ -517,8 +524,24 @@ class UIMixin(object):
                                    fg=self._ro_accent_fg(), font=(FONT[0], 10, "bold"),
                                    anchor="w", cursor="hand2")
         self._ro_action.bind("<Button-1>", lambda e: self._unlock_current())
+        # 带恢复槽的加密笔记再给一条常驻入口：不必先打开口令框、也不必去右键
+        # 菜单里翻。has_recovery 为假时隐藏 —— 没有槽却给个必定失败的按钮更糟。
+        self._ro_recovery = tk.Label(self._ro_bar, text="忘记口令？用恢复码 →",
+                                     bg=ro,
+                                     fg=self._ro_accent_fg(),
+                                     font=(FONT[0], 10, "bold"),
+                                     anchor="w", cursor="hand2")
+        self._ro_recovery.bind("<Button-1>", lambda e: self._recover_current())
 
-        self.text = tk.Text(self.editor_frame, bd=0, padx=TEXT_PADX, pady=TEXT_PADY, wrap=tk.WORD,
+        # 自动换行是全局视图开关（settings["editor_wrap"]）：默认不换行，点工具栏
+        # 那枚 ↵ 才切到 wrap=CHAR；再点回 NONE。⚠️ 必须是 CHAR 而不是 WORD：
+        # Tk 的 word wrap 只认半角空格，一整段没空格的汉字算「一个词」，放不下时
+        # 整块被推到下一显示行、上一行留一大截空白（同一段话复制两遍最明显：
+        # 第二遍从行首重新起排）。CHAR 按字符断，一行占满才折。
+        # ⚠️ 软换行只是显示效果，正文里一个换行符都不会多 ——
+        # 内容 / 序列化 / 备份全不受影响。
+        self.text = tk.Text(self.editor_frame, bd=0, padx=TEXT_PADX, pady=TEXT_PADY,
+                            wrap=(tk.CHAR if self._editor_wrap_on() else tk.NONE),
                             undo=True,
                             font=(self.ui_font or FONT[0], self.body_size),
                             spacing1=dpi.px(4), spacing2=dpi.px(8), spacing3=dpi.px(4),
@@ -651,13 +674,22 @@ class UIMixin(object):
         self._link_tip_show_job = None
         self._link_editor = None
         self._bind_link_tip()
-        # 编辑区宽度变化 → 代码块重新对齐宽度并重算高度（否则换行行数会算错）
+        # 编辑区宽度变化 → 代码块重新对齐宽度并重算高度（否则换行行数会算错），
+        # 横向细条也按新宽度决定显隐（窗口拉宽到放得下长行就自动收起）。
         self.text.bind("<Configure>", lambda e: self._sync_code_width(), add="+")
+        self.text.bind("<Configure>", lambda e: self._sync_hscroll(), add="+")
+        # Shift+滚轮横向浏览长行：不换行时鼠标滚轮仍归正文上下滚，别抢。
+        self.text.bind("<Shift-MouseWheel>", self._on_shift_wheel)
         sy = tk.Scrollbar(self.editor_frame, command=self.text.yview)
         self._place_vscroll(sy)
         self._vscroll = sy
+        # 横向细条：与竖向那条同款系统细条，只在 wrap=NONE + 内容超宽时 place 出来。
+        self._xview_span = (0.0, 1.0)
+        self._hscroll = tk.Scrollbar(self.editor_frame, orient=tk.HORIZONTAL,
+                                     command=self.text.xview, width=HSCROLL_H)
         # 正文滚动时同步滚动条 + 浮动导航（回顶部/回底部）的显隐与可用端
-        self.text.config(yscrollcommand=self._on_text_scroll)
+        self.text.config(yscrollcommand=self._on_text_scroll,
+                         xscrollcommand=self._on_text_xscroll)
         # 右侧居中的浮动导航：浮在正文之上，只在这篇能滚时才出现
         self.jump_nav = ScrollJumpNav(self.editor_frame, self.pal,
                                       command=self._jump_scroll, base=self.pal["editor"])
@@ -1908,6 +1940,8 @@ class UIMixin(object):
             f.place(x=tx, rely=1.0, anchor="sw", width=tw, height=FOOTER_H)
             tk.Misc.lift(f)
             self._footer_visible = True
+            # 状态条占了底部 20px：不换行时的横向细条上抬，别被盖住
+            self._place_hscroll()
         except Exception:
             pass
 
@@ -1920,6 +1954,7 @@ class UIMixin(object):
                 f.place_forget()
             except Exception:
                 pass
+        self._place_hscroll()
 
     def _cancel_footer_hide(self, _e=None):
         if self._footer_job is not None:
@@ -2000,6 +2035,119 @@ class UIMixin(object):
         self._vscroll_place_fn = place
         self.editor_frame.bind("<Configure>", place, add="+")
         place()
+
+    # ---------- 正文自动换行（全局视图开关） ----------
+    def _editor_wrap_on(self):
+        """读 settings["editor_wrap"]：缺省 / 脏数据一律「不换行」（首次默认）。
+
+        这是全局视图状态，不是每篇笔记的属性：切笔记 / 切标签都不变，重启后由
+        这一项还原上次选择。只认真布尔 True，老库没有这一项就是默认不换行。
+        """
+        s = self.data.get("settings")
+        return isinstance(s, dict) and s.get("editor_wrap") is True
+
+    def _wrap_tip_text(self, on):
+        return ("自动换行：已开启，点一下关闭" if on else
+                "自动换行：已关闭，点一下开启（长行可横向滚动）")
+
+    def toggle_editor_wrap(self):
+        self.set_editor_wrap(not self._editor_wrap_on())
+
+    def set_editor_wrap(self, on):
+        """切换正文软换行。
+
+        wrap=CHAR 由 Tk 按 Text 当前宽度实时重排：窗口拉宽 / 字号放大，折行位置
+        自己跟着补上，不需要往正文里插换行符，也不需要在这里手动重排文本。
+        ⚠️ 别改回 WORD：Tk 只在空格处断词，一长串汉字是一个「词」，会整块掉到
+        下一行；同一段文字复制两次时表现为「第二遍从行首重新起排」。
+        切回 NONE 则是一行到底，长行交给横向细条 + Shift+滚轮浏览。
+        """
+        on = bool(on)
+        s = self.data.get("settings")
+        if not isinstance(s, dict):
+            s = {}
+            self.data["settings"] = s
+        s["editor_wrap"] = on
+        save_data(self.data)
+        try:
+            self.text.configure(wrap=tk.CHAR if on else tk.NONE)
+            self.text.xview_moveto(0.0)
+        except Exception:
+            return
+        b = getattr(self, "_wrap_btn", None)
+        if b is not None:
+            try:
+                b.set_selected(on)
+            except Exception:
+                pass
+        tip = getattr(self, "_wrap_tip", None)
+        if tip is not None:
+            try:
+                tip.set_text(self._wrap_tip_text(on))
+            except Exception:
+                pass
+        self._sync_hscroll()
+        # 显示行数变了：行号刻度 / 浮动导航 / 代码块宽度 / 列模式光标条按新布局重算
+        try:
+            self._gutter_schedule(0)
+            self._sync_jump_nav()
+            self._sync_code_width()
+            if self._col_active():
+                self._col_caret_show()
+        except Exception:
+            pass
+
+    # ---------- 不换行时的横向滚动 ----------
+    def _on_text_xscroll(self, first, last):
+        self._xview_span = (float(first), float(last))
+        self._place_hscroll()
+
+    def _sync_hscroll(self):
+        """窗口尺寸 / 切换换行后主动问一次 xview，别只等 Tk 的 xscrollcommand。"""
+        try:
+            first, last = self.text.xview()
+        except Exception:
+            return
+        self._xview_span = (float(first), float(last))
+        self._place_hscroll()
+
+    def _place_hscroll(self, _e=None):
+        """横向细条只在「不换行 + 真有超宽长行」时浮在正文底沿。
+
+        状态条浮出时会占掉底部 FOOTER_H，那条一出现就把横条上抬，别互相盖住。
+        """
+        sb = getattr(self, "_hscroll", None)
+        if sb is None or getattr(self, "_layout_txn", False):
+            return
+        first, last = getattr(self, "_xview_span", (0.0, 1.0))
+        if self._editor_wrap_on() or (last - first) >= 0.999:
+            if sb.winfo_ismapped():
+                sb.place_forget()
+            return
+        try:
+            x = self.text.winfo_x()
+            w = max(dpi.px(40), self.text.winfo_width() - VSCROLL_W)
+            y = (self.text.winfo_y() + self.text.winfo_height() - HSCROLL_H
+                 - (FOOTER_H if getattr(self, "_footer_visible", False) else 0))
+        except Exception:
+            return
+        sb.place(x=x, y=y, width=w, height=HSCROLL_H)
+        tk.Misc.lift(sb)
+        sb.set(first, last)
+
+    def _on_shift_wheel(self, e):
+        if self._editor_wrap_on():
+            return None
+        try:
+            # Text 没有 xscrollincrement 选项，按可视区比例走一档最稳（不依赖
+            # 「units 到底多少像素」这个 Tk 版本差异）。
+            first, _last = self.text.xview()
+            step = 0.08
+            self.text.xview_moveto(max(0.0, min(1.0,
+                first + (-step if e.delta > 0 else step))))
+        except Exception:
+            pass
+        return "break"
 
     def _style_search_box(self):
         """画搜索框的圆角底、放大镜图标与分隔竖线，并把输入框/占位文字摆进画布。
@@ -2440,6 +2588,9 @@ class UIMixin(object):
         ("todo",     "待办事项（右键：转换 / 清除）",       2),
         ("code",     "代码块（选择语言）",                  2),
         ("alarm",    "任务提醒：在正文里插一个小闹钟",        2),
+        # 第 15 枚（2026-11-09 用户指定）：自动换行是视图开关，不改正文，所以
+        # 只读笔记里也照常可点；与 ⋯ 同组，中间不再插分隔线。
+        ("wrap",     "自动换行：一行占满后自动折行",          3),
         ("more",     "更多：导出笔记 / 插入分割线 / 全局设置", 3),
     ]
 
@@ -2459,7 +2610,7 @@ class UIMixin(object):
         "link": "超链接",
         "bullet": "无序列表", "numbered": "有序列表",
         "triangle": "三角列表", "todo": "待办",
-        "code": "代码块", "alarm": "任务提醒",
+        "code": "代码块", "alarm": "任务提醒", "wrap": "自动换行",
     }
 
     def _tool_cfg(self):
@@ -2529,6 +2680,8 @@ class UIMixin(object):
         self._tool_tips = []
         self._code_btn = None
         self._more_btn = None
+        self._wrap_btn = None      # 整块重建后旧按钮已销毁，别留着指向它
+        self._wrap_tip = None
         self._tool_btns = {}
 
         hidden = self._tool_hidden()
@@ -2598,6 +2751,13 @@ class UIMixin(object):
             b = self._mk_code_ui(parent)
         elif iid == "alarm":
             b = self._mk_icon(parent, "alarm", tip, self.insert_alarm)
+        elif iid == "wrap":
+            on = self._editor_wrap_on()
+            b = self._mk_icon(parent, "wrap", self._wrap_tip_text(on),
+                              self.toggle_editor_wrap)
+            b.set_selected(on)          # 亮 = 自动换行开着；暗 = 一行到底
+            self._wrap_btn = b
+            self._wrap_tip = self._tool_tips[-1]   # _mk_icon 里刚挂上的那枚提示
         elif iid == "more":
             b = self._mk_icon(parent, "more", tip, self._open_more_menu)
             self._more_btn = b
@@ -2917,6 +3077,7 @@ class UIMixin(object):
             self._ro_bar.configure(bg=ro)
             self._ro_label.configure(bg=ro, fg=p.get("soft", "#76767e"))
             self._ro_action.configure(bg=ro, fg=acc_fg)
+            self._ro_recovery.configure(bg=ro, fg=acc_fg)
         except Exception:
             pass
         # 底部状态条（创建/修改/字数）：底色带主题色相，换肤时逐块重配色
@@ -3129,6 +3290,21 @@ class UIMixin(object):
                 cache = (key, max(8, int(bs * 1.33)))
             self._char_w_cache = cache
         _char_w = cache[1]
+        # 「任务提醒列表」汇总表：五列靠 **tag 级制表位** 按像素对齐。
+        # 只作用于带 ALARM_ROW_TAG 的行 —— 普通笔记里的制表符仍是默认制表位，
+        # 也不用切笔记时还原 widget 级配置；字号 / 字体一变本函数会重算一遍。
+        # ⚠️ 别退回「按字数补空格」：正文字体中文 15px / 半角空格 8px（1.875 倍，
+        # 不是 2），每行会按汉字数累积误差，任务名一长后面三列肉眼就歪。
+        try:
+            _mf = tkfont.Font(family=fam, size=bs)
+            _s1 = _mf.measure("2026-11-09 09:00") + _char_w
+            _s2 = _s1 + _char_w * 18        # 任务列 18 汉字宽，容得下 15 汉字 / 30 半角
+            _gap = _char_w              # 两个状态列之间留一个汉字宽，别挤成一团
+            _s3 = _s2 + _mf.measure("已完成：是") + _gap
+            _s4 = _s3 + _mf.measure("已确认：否") + _gap
+            self.text.tag_configure(ALARM_ROW_TAG, tabs=(_s1, _s2, _s3, _s4))
+        except Exception:
+            pass                            # 量不到字体就留默认制表位，别让启动白屏
         _qind = _char_w * 2
         self.text.tag_configure("quote", lmargin1=_qind, lmargin2=_qind,
                                 rmargin=_char_w,
@@ -5603,6 +5779,21 @@ class UIMixin(object):
             c.create_polygon(body, fill=col, outline=col, width=0)
             return
 
+        if fid == SMART_ICON_ALARM:
+            # 任务提醒：一只方闹钟。⚠️ 18px 里一律整数矩形拼（Canvas 不抗锯齿，
+            # oval / arc 会掉成一圈毛刺）：两枚铃铛 + 四条边框 + L 形指针 + 两只脚。
+            # 颜色跟正文里那枚小闹钟一致（star 琥珀），一眼能对上「这是同一件事」。
+            col = p["star"]
+            for a, b, cc, d in (
+                    (3, 1, 6, 3), (11, 1, 14, 3),        # 左右铃铛
+                    (4, 3, 13, 5),                       # 顶边 + 连铃的横梁
+                    (3, 5, 5, 13), (12, 5, 14, 13),      # 左右边框
+                    (4, 12, 13, 14),                     # 底边
+                    (8, 6, 9, 10), (9, 9, 11, 10),       # 时针 / 分针
+                    (3, 14, 5, 15), (12, 14, 14, 15)):   # 两只脚
+                c.create_rectangle(a, b, cc, d, fill=col, outline="", width=0)
+            return
+
         if fid == SYSTEM_FOLDER:
             # 系统区：一台显示器（屏 + 支架 + 底座）。
             # ⚠️ 全用矩形拼，**一点曲线都不能有**：Tk 的 Canvas 不抗锯齿，
@@ -5887,8 +6078,25 @@ class UIMixin(object):
         card._accent = color
         card._draw()
 
+    def _refresh_alarm_index(self):
+        """按全库提醒重建「任务提醒列表」的正文 / 内链（纯内存，不动 updated）。
+
+        它是视图不是内容：增删闹钟、时间翻过「已完成」、点过弹窗的「知道了」，
+        都得让它跟上。重写 content 而不落库 —— 每次启动 / 导入都会重算，库里
+        存的是哪一版都不影响显示；也不改 updated，否则每次重算都把它顶到
+        「全部笔记」最前面。
+        """
+        n = next((x for x in self.data["notes"]
+                  if x.get("id") == ALARM_INDEX_ID), None)
+        if n is None:
+            return
+        content, links = alarm_index_content(self.data)
+        n["content"] = content
+        n["links"] = links
+
     def refresh_notes(self):
         p = self.pal
+        self._refresh_alarm_index()   # 列表标题/预览读的是正文，先跟上最新提醒
         self._star_buttons = {}
         self._rows = {}
         cur = next((f for f in self.data["folders"] if f["id"] == self.data["current_folder"]), None)
@@ -6514,20 +6722,21 @@ class UIMixin(object):
         self._restyle_notes()
 
     def _delete_notes(self, nids):
-        """批量删除选中的笔记。内置示例笔记会被自动跳过（它唯一一份使用说明）。"""
+        """批量删除选中的笔记。系统笔记（内置说明 / 任务提醒列表）自动跳过。"""
         if not nids:
             return
         ids = set(nids)
         protected = {n["id"] for n in self.data["notes"]
-                     if n["id"] in ids and self.is_sample_note(n)}
+                     if n["id"] in ids and self.is_protected_note(n)}
         if protected:
             ids -= protected
             if not ids:
-                self._refuse_sample_delete()
+                n = next((x for x in self.data["notes"] if x["id"] in protected), None)
+                self._refuse_sample_delete(n)
                 return
         msg = "确定删除选中的 %d 条笔记？" % len(ids)
         if protected:
-            msg += "\n\n另有 %d 条内置示例笔记不会删除。" % len(protected)
+            msg += "\n\n另有 %d 条系统笔记不会删除。" % len(protected)
         if not self._ask_confirm("删除", msg, ok_text="删除", danger=True):
             return
         self.data["notes"] = [x for x in self.data["notes"] if x["id"] not in ids]
@@ -6570,16 +6779,16 @@ class UIMixin(object):
         # <B1-Motion>，表现为「浮签卡住不动、指示线不出、松手才突然生效」。
         # motion / release 统一挂在顶层窗口上（见 __init__ 与 _drag_on_motion）：
         # 事件从指针下的任意控件都会冒泡到顶层，跨行、跨栏、跨到编辑器都收得到。
-        # 内置说明笔记不建**可拖**的态：它钉在「系统」里，拖出去也留不住（下次启动
-        # 会被搬回来），中间那段时间就成了「数据看起来不对」。
+        # 系统笔记（内置说明 / 任务提醒列表）不建**可拖**的态：它们钉在各自的视图里，
+        # 拖出去也留不住（下次启动会被搬回来），中间那段时间就成了「数据看起来不对」。
         # ⚠️ 但这里**不能**把 `_drag` 置空就 return ——「松手时把笔记装进编辑器」是
         # `_finish_drag` 干的活，`_drag` 为空它第一行就退出了，表现就是「点说明笔记
         # 只高亮、正文不换」，用户看到的是「打不开了」。留一条 started=False 的记录
         # 正好复用那条收口逻辑（松手 → select_note），只是 motion 不许把它变成浮签。
         n = next((x for x in self.data["notes"] if x["id"] == nid), None)
-        if n is not None and n.get("sample"):
+        if n is not None and self.is_protected_note(n):
             self._drag = {"nid": nid, "x": e.x_root, "y": e.y_root,
-                          "started": False, "sample": True}
+                          "started": False, "sample": True}   # sample 键 = 不可拖标记
             return
         self._drag = {"nid": nid, "x": e.x_root, "y": e.y_root, "started": False}
 
@@ -6997,6 +7206,7 @@ class UIMixin(object):
         # 已经不是同一批文字了（复制出来会是新笔记的内容，离谱且难查）。
         self._colsel_drop()
         n = self.current_note()
+        self._refresh_alarm_index()   # 汇总表正开着时，正文也要跟上最新状态
         # 先假设「编辑器里的不是这篇笔记的明文」：解锁失败时正文区放占位文字，
         # 那条路必须先把这个标志立起来，否则占位话会被当成真正文写回数据库。
         # （serialize() 里的 _locked_view 守卫是同一件事的第二道保险。）
@@ -7040,7 +7250,9 @@ class UIMixin(object):
         self._editor_note = n["id"]
         # 只读态要在渲染之前定好：待办框创建时会按它决定鼠标形状
         if unlocked:
-            self._set_readonly(self.is_sample_note(n), "sample")
+            self._set_readonly(
+                self.is_protected_note(n),
+                "alarm_index" if self.is_alarm_index(n) else "sample")
         else:
             self._set_readonly(True, "locked")
         if unlocked:
@@ -7116,15 +7328,37 @@ class UIMixin(object):
             return
         try:
             if self._readonly:
-                locked = (getattr(self, "_ro_kind", "sample") == "locked")
-                self._ro_label.configure(
-                    text=("这篇笔记已加密 · 输入口令后才能查看内容"
-                          if locked else
-                          "内置示例笔记 · 内容不可编辑（文字可以选中复制）"))
+                kind = getattr(self, "_ro_kind", "sample")
+                locked = (kind == "locked")
+                can_rc = False
+                if locked:
+                    # 恢复槽在不在，决定提示条上要不要给第二条常驻入口。
+                    # 正文重加密不会动槽（secret.reseal_with_key 会原样带过来），
+                    # 所以这里按当前 sec 判定即可，不用缓存。
+                    try:
+                        n = self.current_note()
+                        can_rc = bool(n and secret.has_recovery(n.get("sec")))
+                    except Exception:
+                        can_rc = False
+                    text = ("这篇笔记已加密 · 输入口令或用恢复码查看" if can_rc
+                            else "这篇笔记已加密 · 输入口令后才能查看内容")
+                elif kind == "alarm_index":
+                    text = "任务提醒列表 · 自动汇总，内容不可编辑（点 @笔记名 可跳回原文）"
+                else:
+                    text = "内置示例笔记 · 内容不可编辑（文字可以选中复制）"
+                self._ro_label.configure(text=text)
+                rc_label = getattr(self, "_ro_recovery", None)
                 if locked:
                     self._ro_action.pack(side=tk.LEFT, padx=(dpi.px(10), 0))
+                    if rc_label is not None:
+                        if can_rc:
+                            rc_label.pack(side=tk.LEFT, padx=(dpi.px(10), 0))
+                        else:
+                            rc_label.pack_forget()
                 else:
                     self._ro_action.pack_forget()
+                    if rc_label is not None:
+                        rc_label.pack_forget()
                 bar.pack(fill=tk.X, before=self.text)
             else:
                 bar.pack_forget()
@@ -7137,6 +7371,13 @@ class UIMixin(object):
         if not nid:
             return
         self.unlock_note(nid)
+
+    def _recover_current(self):
+        """点提示条上的「忘记口令？用恢复码 →」：直接走验码 + 重设口令。"""
+        n = self.current_note()
+        if not n or not secret.has_recovery(n.get("sec")):
+            return
+        self.recover_note_with_code(n)
 
     def _sync_tool_enabled(self):
         ro = getattr(self, "_readonly", False)   # 工具栏先于编辑区构建，此时标志还没建
@@ -7557,9 +7798,11 @@ class UIMixin(object):
     def _col_paint(self):
         """按 _col 刷高亮：逐**逻辑行**取 [c0, c1)，再按屏幕行切开。
 
-        必须按屏幕行切：正文是 wrap=WORD，`tag_add(a, b)` 跨了软换行会把中间
-        那一整段也涂成蓝的（看着像整段被选）。软换行处「上一屏幕行的 lineend」
-        正好等于「下一屏幕行的 linestart」，所以沿线尾推进就能逐段切。
+        必须按屏幕行切：开了自动换行（wrap=CHAR）后 `tag_add(a, b)` 跨了软换行
+        会把中间那一整段也涂成蓝的（看着像整段被选）。软换行处「上一屏幕行的
+        lineend」正好等于「下一屏幕行的 linestart」，所以沿线尾推进就能逐段切。
+        关掉自动换行（wrap=NONE，默认）时每个逻辑行只有一个显示行，切出来仍是一段，
+        这段逻辑照常成立。
         """
         t = self.text
         try:
@@ -9096,12 +9339,16 @@ class UIMixin(object):
         win.wait_window()
         return res["v"]
 
-    def _ask_password(self, title, prompt, allow_empty=False):
+    def _ask_password(self, title, prompt, allow_empty=False, out=None):
         """口令输入框（掩码显示）。返回原样字符串，取消返回 None。
 
         不 strip：口令里的空格是口令的一部分，替用户"顺手清理"会让他下次登不进来。
         `allow_empty=True` 时允许直接确定空口令（返回 ""），用于「导出备份」——
         空口令 = 只做编码、不加密，导入时无需口令。取消仍返回 None，两者不混。
+
+        `out` 给一个 dict 时会多显示一条「用恢复码恢复」入口；点了它返回 None，
+        并把 `out["recovery"]=True` 写进去。用旁路 dict 而不是改返回值，是为了
+        不碰其它十几处调用（导出备份、改口令等）的返回值语义。
         """
         p = self.pal
         win = self._dlg_body(title)
@@ -9120,6 +9367,17 @@ class UIMixin(object):
                      relief=tk.FLAT, highlightthickness=dpi.px(1),
                      highlightbackground=p["line"], highlightcolor=p["accent"], width=30)
         e.pack(fill=tk.X, padx=dpi.px(16), ipady=dpi.px(5))
+        if out is not None:
+            def use_recovery(_=None):
+                out["recovery"] = True
+                res["v"] = None
+                win.destroy()
+            tk.Button(win, text="忘记口令？用恢复码恢复 →", bg=p["top"],
+                      fg=p["accent"], bd=0, relief=tk.FLAT, cursor="hand2",
+                      font=(FONT[0], 10), activebackground=p["top"],
+                      activeforeground=p["accent"],
+                      command=use_recovery).pack(anchor="w", padx=dpi.px(16),
+                                                 pady=(dpi.px(6), 0))
 
         def ok(_=None):
             if not var.get() and not allow_empty:
@@ -9136,6 +9394,169 @@ class UIMixin(object):
         win.bind("<Escape>", cancel)
         win.protocol("WM_DELETE_WINDOW", cancel)
         self._center_dialog(win, min_w=360)
+        e.focus_set()
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        win.wait_window()
+        return res["v"]
+
+    def _show_recovery_code(self, code, rid, note_title, replacing=False):
+        """设 / 改口令后展示**本篇**恢复码。True = 用户抄下并同意启用。
+
+        顺序是红线：先展示 → 勾选「已抄下」→ 才允许启用并写槽。反过来会留下
+        一把没人知道的钥匙，而用户还以为没启用。程序绝不保存这份码。
+        """
+        p = self.pal
+        win = self._dlg_body("保存新的恢复码" if replacing else "保存本篇恢复码")
+        res = {"v": False}
+        name = note_title or "这篇笔记"
+        head = ("改口令后已为《%s》生成新恢复码，旧码同时作废。" % name
+                if replacing else "已为《%s》生成本篇恢复码。" % name)
+        tk.Label(win, text=head, bg=p["top"], fg=p["text"], anchor="w",
+                 justify="left", font=(FONT[0], 12),
+                 wraplength=DLG_TEXT_W).pack(fill=tk.X, padx=dpi.px(16),
+                                             pady=(dpi.px(16), dpi.px(8)))
+        box = tk.Frame(win, bg=p["editor"], highlightthickness=dpi.px(1),
+                       highlightbackground=p["line"])
+        box.pack(fill=tk.X, padx=dpi.px(16))
+        tk.Label(box, text=code, bg=p["editor"], fg=p["text"],
+                 font=(FONT[0], 16, "bold")).pack(padx=dpi.px(12),
+                                                 pady=(dpi.px(12), dpi.px(4)))
+        tk.Label(box, text="凭证编号 " + secret.recovery_id_display(rid) +
+                 " · 用来对照码与笔记，不是秘密",
+                 bg=p["editor"], fg=p["soft"], font=(FONT[0], 10)).pack(
+                     padx=dpi.px(12), pady=(0, dpi.px(8)))
+
+        # 复制出去的是整条凭证 [笔记名称]-[凭证编号]-[恢复码]，不再光秃秃一段码。
+        # 剪贴板必须写 self.root 而不是这个弹窗 win：Tk 的剪贴板是「延迟提供」，
+        # 数据由拥有所有权时存活的窗口在别人来取时才给出；win 一 destroy，回调
+        # 失效，剪贴板就回退到上一个所有者（很可能是编辑区里复制过的笔记正文）。
+        # root 常驻，所有权稳定，关掉本弹窗也不丢这份凭证。
+        copied = tk.StringVar(value="")
+        def copy_code():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(
+                secret.format_recovery_record(name, rid, code))
+            self.root.update_idletasks()
+            copied.set("已复制整条凭证 · 粘贴到别处后请清空剪贴板")
+        tk.Button(win, text="复制恢复码", bg=p["top"], fg=p["accent"], bd=0,
+                  relief=tk.FLAT, cursor="hand2", font=(FONT[0], 10),
+                  activebackground=p["top"], activeforeground=p["accent"],
+                  command=copy_code).pack(anchor="w", padx=dpi.px(16),
+                                          pady=(dpi.px(6), 0))
+        # 复制格式常驻展示：让用户随时看清复制出去长什么样，不被「已复制」提示覆盖。
+        tk.Label(win, text="复制格式：[笔记名称]-[凭证编号]-[恢复码]", bg=p["top"],
+                 fg=p["soft"], anchor="w", font=(FONT[0], 10),
+                 wraplength=DLG_TEXT_W).pack(fill=tk.X, padx=dpi.px(16),
+                                             pady=(dpi.px(2), 0))
+        tk.Label(win, textvariable=copied, bg=p["top"], fg=p["soft"],
+                 anchor="w", font=(FONT[0], 10),
+                 wraplength=DLG_TEXT_W).pack(fill=tk.X, padx=dpi.px(16))
+        tk.Label(win, text=("程序不会保存这份码，只保存用它封装过的密文。请抄到"
+                            "另一台设备或密码管理器，别和 notes_data.db 放同一目录；"
+                            "丢了只能重设口令重新生成。"),
+                 bg=p["top"], fg=p["text"], anchor="w", justify="left",
+                 font=(FONT[0], 11), wraplength=DLG_TEXT_W).pack(
+                     fill=tk.X, padx=dpi.px(16), pady=(dpi.px(10), dpi.px(6)))
+
+        def ok(_=None):
+            if not checked.get():
+                return
+            res["v"] = True
+            win.destroy()
+
+        def cancel(_=None):
+            res["v"] = False
+            win.destroy()
+
+        checked = tk.IntVar(value=0)
+        def toggle():
+            on = bool(checked.get())
+            # 禁用态别用 accent 实底：那样看着像能点，而这枚按钮正是
+            # 「先抄下、才启用」的闸门，视觉上必须一眼分得出可点与否。
+            bg = p["accent"] if on else p["editor"]
+            fg = on_accent(bg) if on else p["soft"]
+            ok_btn.configure(state=tk.NORMAL if on else tk.DISABLED,
+                             bg=bg, fg=fg, activebackground=bg,
+                             activeforeground=fg)
+        tk.Checkbutton(win, text="我已抄下并保存到别处", variable=checked,
+                       command=toggle, bg=p["top"], fg=p["text"],
+                       selectcolor=p["editor"], activebackground=p["top"],
+                       activeforeground=p["text"], anchor="w", bd=0,
+                       font=(FONT[0], 11)).pack(fill=tk.X, padx=dpi.px(16))
+        btns = tk.Frame(win, bg=p["top"])
+        btns.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(10), dpi.px(14)))
+        tk.Button(btns, text="暂不启用", width=10, bg=p["editor"], fg=p["soft"],
+                  bd=dpi.px(1), relief=tk.FLAT, font=(FONT[0], 11),
+                  cursor="hand2", activebackground=p["hover"],
+                  activeforeground=p["selfg"],
+                  command=cancel).pack(side=tk.RIGHT, padx=(dpi.px(8), 0))
+        ok_btn = tk.Button(btns, text="启用恢复", width=10, bg=p["editor"],
+                           fg=p["soft"], bd=0, relief=tk.FLAT,
+                           font=(FONT[0], 11, "bold"), cursor="hand2",
+                           state=tk.DISABLED, command=ok)
+        ok_btn.pack(side=tk.RIGHT)
+        win.bind("<Return>", ok)
+        win.bind("<Escape>", cancel)
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        self._center_dialog(win, min_w=420)
+        try:
+            win.grab_set()
+        except Exception:
+            pass
+        win.wait_window()
+        return res["v"]
+
+    def _ask_recovery_code(self, title, note_title, rid=""):
+        """输入本篇恢复码，返回规范化后的码；取消返回 None。
+
+        故意不掩码：24 字符分组码掩码极易抄错，而威胁模型是「捡到 db 的人」，
+        不是肩窥。旁边给出凭证编号让用户确认没拿错另一篇的码。也接受直接粘贴
+        复制按钮给的整条凭证串，会自动取出末尾那段恢复码。
+        """
+        p = self.pal
+        win = self._dlg_body(title)
+        res = {"v": None}
+        tip = "输入《%s》的恢复码" % (note_title or "这篇笔记")
+        if rid:
+            tip += "\n凭证编号 " + secret.recovery_id_display(rid) + "（用于对照，不是秘密）"
+        tip += "\n可直接粘贴复制的整条凭证，会自动取出恢复码"
+        tk.Label(win, text=tip, bg=p["top"], fg=p["text"], anchor="w",
+                 justify="left", font=(FONT[0], 12),
+                 wraplength=DLG_TEXT_W).pack(fill=tk.X, padx=dpi.px(16),
+                                             pady=(dpi.px(16), dpi.px(8)))
+        var = tk.StringVar()
+        e = tk.Entry(win, textvariable=var, font=(FONT[0], 13), bg=p["editor"],
+                     fg=p["text"], insertbackground=p["accent"], relief=tk.FLAT,
+                     highlightthickness=dpi.px(1), highlightbackground=p["line"],
+                     highlightcolor=p["accent"], width=32)
+        e.pack(fill=tk.X, padx=dpi.px(16), ipady=dpi.px(5))
+        err = tk.StringVar(value="")
+        tk.Label(win, textvariable=err, bg=p["top"], fg=MENU_DANGER,
+                 anchor="w", font=(FONT[0], 10)).pack(fill=tk.X,
+                                                       padx=dpi.px(16))
+
+        def ok(_=None):
+            code = secret.norm_recovery_code(
+                secret.parse_recovery_record(var.get()))
+            if not code:
+                err.set("格式不对：应为 24 位数字与大写字母，可带连字符；"
+                        "也可直接粘贴复制的整条凭证。")
+                return
+            res["v"] = code
+            win.destroy()
+
+        def cancel(_=None):
+            res["v"] = None
+            win.destroy()
+
+        self._dlg_buttons(win, ok, cancel, ok_text="验证")
+        win.bind("<Return>", ok)
+        win.bind("<Escape>", cancel)
+        win.protocol("WM_DELETE_WINDOW", cancel)
+        self._center_dialog(win, min_w=420)
         e.focus_set()
         try:
             win.grab_set()

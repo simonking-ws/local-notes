@@ -27,7 +27,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 import backup                                                    # noqa: E402
-from store import _t, SMART_FOLDERS                               # noqa: E402
+from store import _t, SMART_FOLDERS, ALARM_INDEX_ID             # noqa: E402
 
 
 def runs_of(*parts):
@@ -336,12 +336,19 @@ class MergeTest(unittest.TestCase):
                 "prefs": {"body_size": 20}, "styles": {"c_00ff00": {"fg": "#00ff00"}},
                 "exported_at": "2026-10-30T10:00:00+08:00"}
 
+    def _user_ids(self, out):
+        """用户笔记的 id；末尾那篇自动生成的「任务提醒列表」不算。"""
+        return [n["id"] for n in out["notes"] if n["id"] != ALARM_INDEX_ID]
+
     def test_merge_is_idempotent(self):
         once = backup.merge(self.backup_data(), self.cur())
         twice = backup.merge(self.backup_data(), once)
-        self.assertEqual([n["id"] for n in once["notes"]], ["n1", "n2"])
-        self.assertEqual([n["id"] for n in twice["notes"]], ["n1", "n2"])
-        self.assertEqual(len(twice["notes"]), 2)
+        self.assertEqual(self._user_ids(once), ["n1", "n2"])
+        self.assertEqual(self._user_ids(twice), ["n1", "n2"])
+        self.assertEqual(len(self._user_ids(twice)), 2)
+        self.assertEqual(len([n for n in twice["notes"]
+                              if n["id"] == ALARM_INDEX_ID]), 1,
+                         "汇总表反复导入也不能翻倍")
 
     def test_merge_keeps_local_prefs_and_adds_styles(self):
         out = backup.merge(self.backup_data(), self.cur())
@@ -352,7 +359,7 @@ class MergeTest(unittest.TestCase):
     def test_same_id_different_content_gets_new_id(self):
         d = {"folders": [], "notes": [note("n1", "被改过的另一份")], "prefs": {}, "styles": {}}
         out = backup.merge(d, self.cur())
-        ids = [n["id"] for n in out["notes"]]
+        ids = self._user_ids(out)
         self.assertEqual(len(ids), 2)
         self.assertIn("n1", ids)
         self.assertNotEqual(ids[1], "n1")
@@ -387,7 +394,8 @@ class MergeTest(unittest.TestCase):
         d = {"folders": [], "notes": [note("n7", "游民", folder="f_ghost")],
              "prefs": {}, "styles": {}}
         out = backup.merge(d, self.cur())
-        self.assertEqual(out["notes"][-1]["folder"], "f_work")
+        orphan = next(n for n in out["notes"] if n["id"] == "n7")
+        self.assertEqual(orphan["folder"], "f_work")
 
     def test_smart_folders_are_not_duplicated(self):
         out = backup.merge(self.backup_data(), self.cur())

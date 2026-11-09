@@ -763,11 +763,12 @@ THEMES = {
 # 还会在首次启动时把这次默认写进库，之后只认用户自己换过的主题。
 DEFAULT_THEME = "forest"
 
-# 显示名一律按「色系意象」起，六套同一副腔调：云母白（白稿纸 + 浅灰）/ 石墨灰
-# （中性炭灰 + 琥珀金）/ 羊皮纸（暖米）/ 森林绿（绿）/ 午夜蓝（藏蓝）/
-# 晴空蓝（浅天蓝，和午夜蓝一浅一深成对）。
+# 显示名一律按「色系意象」起，六套同一副腔调：森林绿（绿）/ 云母白（白稿纸 + 浅灰）
+# / 石墨灰（中性炭灰 + 琥珀金）/ 羊皮纸（暖米）/ 午夜蓝（藏蓝）/ 晴空蓝
+# （浅天蓝，和午夜蓝一浅一深成对）。
 # ⚠️ 落库的是左边的 id，改文案不许动 id，老用户已选的主题才不会串。
-# ⚠️ 新主题一律追加在末尾：既有五套在下拉里的位置不能动。
+# ⚠️ 这里只管 id → 显示名，**展示顺序见下面 THEME_ORDER**，别把字典插入顺序当
+#    色卡顺序用；新主题仍追加在 THEMES / THEME_LABELS 末尾。
 THEME_LABELS = {
     "light":    "云母白",
     "dark":     "石墨灰",
@@ -776,6 +777,18 @@ THEME_LABELS = {
     "midnight": "午夜蓝",
     "sky":      "晴空蓝",
 }
+
+# ----------------------------------------------------------------------
+# 展示顺序（全局设置里那排色卡，以及任何按 list_themes() 列主题的地方）。
+# ⚠️ 默认主题「森林绿」排第一格：首次打开就是它，色卡第一眼该看见正在用的这套。
+#    注册表 THEMES 保持历史顺序（新主题继续追加末尾），展示顺序在这里单独调 ——
+#    只动 UI 排列，不动任何主题 id / 配色 / 落库值。
+# ⚠️ 加新主题要登记三处：THEMES + THEME_LABELS + 本元组末尾。忘登记也别慌：
+#    list_themes() 会按 THEMES 顺序把漏掉的补在最后，不会静默少一套。
+# ----------------------------------------------------------------------
+THEME_ORDER = (
+    "forest", "light", "dark", "sepia", "midnight", "sky",
+)
 
 # 森林绿里 accent 与「选中行文字」都是运行期算出来的（base 是静态表，跟不上皮肤）
 
@@ -867,8 +880,14 @@ def build_palette(theme_id):
 
 
 def list_themes():
-    """[(id, 显示名), ...]，供菜单按固定顺序列出。"""
-    return [(tid, THEME_LABELS.get(tid, tid)) for tid in THEMES]
+    """[(id, 显示名), ...]，按 THEME_ORDER 的展示顺序列出（默认主题森林绿在首位）。
+
+    THEME_ORDER 里没登记的新主题按注册表顺序补在末尾；已下线却还留在顺序表里的
+    id 直接跳过。所有枚举主题的地方都走这里，别自己遍历 THEMES 猜顺序。
+    """
+    order = [tid for tid in THEME_ORDER if tid in THEMES]
+    order += [tid for tid in THEMES if tid not in order]
+    return [(tid, THEME_LABELS.get(tid, tid)) for tid in order]
 
 
 def theme_label(tid):

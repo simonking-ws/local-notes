@@ -38,6 +38,7 @@ import punct
 SMART_ICON_ALL = "f_all"     # 全部笔记 → 清单三线
 SMART_ICON_STAR = "f_star"   # 星标笔记 → 五角星（金色）
 SMART_ICON_LOCK = "f_lock"   # 加密笔记 → 挂锁
+SMART_ICON_ALARM = "f_alarm" # 任务提醒 → 方闹钟（琥珀）
 
 # 文件夹图标画布尺寸（原 16x14 偏小，圆角细节放不下）
 FOLDER_ICON_W = dpi.px(18)
@@ -602,6 +603,34 @@ def _draw_icon(cv, name, cx, cy, s, color, stroke=ICON_STROKE):
                  mx + sgn * s * 0.16, cy,       # 腰部尖（向外）
                  mx, cy + s * 0.16,
                  mx, y0 + s * 0.89, tip, y0 + s * 0.89)
+    elif name == "wrap":
+        # 自动换行：一行走到右端再折回来的箭头（↵）。
+        # ⚠️ 16px 档一律整数矩形拼实心块面，不用 1px 描线 / arc —— Tk Canvas 走
+        # GDI 不抗锯齿，细线在这档尺寸只剩灰雾（同 _draw_section_icon 的结论）。
+        # 坐标按 16 格网格给，乘 s/16 后取整，高 DPI 下笔画同比例变粗。
+        u = s / 16.0
+        def R(a, b, c, d):
+            box = (int(round(x0 + a * u)), int(round(y0 + b * u)),
+                   int(round(x0 + c * u)), int(round(y0 + d * u)))
+            ids.append(cv.create_rectangle(*box, fill=color, outline=""))
+            return box
+        R(2, 3, 14, 5)       # 顶线：文字往右写
+        R(12, 3, 14, 12)     # 右端折下来
+        bot = R(5, 10, 14, 12)   # 底线：折回左边
+        # ⚠️ 箭头的中线必须取「底线取整后的实际中线」，不能自己再按 y0 算一遍：
+        # 工具栏按钮高常是奇数（实测 29 → cy=14.5、y0=6.5），逐坐标 round 会让
+        # 底线变成 [16,18)（中线 17），而箭头尖 round(6.5+11)=18 —— 整枚箭头比
+        # 横线低 1px，看着就是「箭头没压在线条中间」。所以从 bot 现推 mid，再用
+        # 整数半高上下对称展开；整 / .5 / 高 DPI 三种相位都不再有整像素级错位。
+        mid = (bot[1] + bot[3]) // 2
+        half = max(2, int(round(4 * u)))
+        ax0 = int(round(x0 + 1 * u))
+        ax1 = int(round(x0 + 6 * u))
+        ids.append(cv.create_polygon(
+            ax0, mid,
+            ax1, mid - half,
+            ax1, mid + half,
+            fill=color, outline=""))   # 回卷箭头
     elif name == "hr":
         # 分割线：中间一条通栏横线，上下各一条半宽短线，读作「文字 / 分割 / 文字」
         line(x0, cy, x0 + s, cy)
@@ -1034,7 +1063,8 @@ class RoundButton(tk.Canvas):
     def __init__(self, master, pal, text, command=None, font=None,
                  padx=dpi.px(11), pady=dpi.px(6), radius=BTN_RADIUS, primary=False,
                  base=None, fg=None, cursor="hand2", stretch=False, outline=None,
-                 icon=None, icon_size=ICON_SIZE, tail=None, icon_img=None):
+                 icon=None, icon_size=ICON_SIZE, tail=None, icon_img=None,
+                 selected=False):
         # Canvas 自身的底色必须等于按钮所在区域的底色：圆角矩形的四个尖角之外
         # 是画布本底，一旦两者不同（画布默认是系统灰），每个按钮外面就会多出一圈
         # 刺眼的亮方块——工具栏底色越深，这圈方块越显眼。
@@ -1054,6 +1084,9 @@ class RoundButton(tk.Canvas):
         self._outline = outline
         self._state = "normal"
         self._enabled = True
+        # 开关类按钮（工具栏「自动换行」）的选中态：常态多一层淡强调底。
+        # 只是渲染状态，命令照旧每次点击都触发，由调用方决定下一态。
+        self._selected = bool(selected)
         self._stretch = stretch
         self._icon = icon
         self._icon_size = icon_size
@@ -1216,19 +1249,24 @@ class RoundButton(tk.Canvas):
         工具栏、侧栏、顶栏、对话框各自压暗各自的那块底，换主题也不用重调。
         """
         p = self._pal
+        # 选中态从「这块底」往上派生，hover / press 也就跟着它压暗，不会一悬停
+        # 就跳回工具条本色（那样开关像坏了一样）。
+        base = self._base
+        if self._selected and self._enabled:
+            base = _mix_hex(base, p.get("accent", base), 0.16)
         if not self._enabled:
             # 禁用：不跟着鼠标变色（否则一只死按钮还在回应悬停，比不回应更怪）。
             # 主按钮把实心绿压淡，普通按钮直接融回底色。
             return _mix_hex(p["accent"], p["selfg"], 0.45) if self._primary else self._base
         if self._state == "normal":
-            return p["accent"] if self._primary else self._base
+            return p["accent"] if self._primary else base
         if self._primary:
             # 主按钮：向深绿递进
             t = 0.20 if self._state == "hover" else BTN_PRESS_MIX + 0.14
             return _mix_hex(p["accent"], p["selfg"], t)
         if self._state == "hover":
-            return _hover_bg(self._base)
-        return _press_bg(self._base)
+            return _hover_bg(base)
+        return _press_bg(base)
 
     def _cur_outline(self):
         """描边色：常态用传入的描边色，悬停/按下向强调色靠拢，让「可点」感更明确。"""
@@ -1256,7 +1294,10 @@ class RoundButton(tk.Canvas):
             # 工具条上的 B/I/U 这类小字才压得住底色（掘金的工具图标也接近主文字色）。
             if self._fg:
                 return self._fg
-            return _mix_hex(p.get("soft", "#76767e"), p.get("text", "#1f1f24"), 0.62)
+            fg = _mix_hex(p.get("soft", "#76767e"), p.get("text", "#1f1f24"), 0.62)
+            # 选中态的图标向强调色靠一截，但不到纯 accent —— 浅底上纯 accent
+            # 未必够对比（森林绿跟 WorkBuddy 皮肤走，主题色可能是浅蓝）。
+            return _mix_hex(fg, p.get("accent", fg), 0.55) if self._selected else fg
         # 悬停/按下时底色被压暗，字色往上提一档才不糊。
         return p.get("text") or p["selfg"]
 
@@ -1306,6 +1347,18 @@ class RoundButton(tk.Canvas):
         self.redraw()
         if self._command:
             self._command()
+
+    def set_selected(self, on):
+        """开关类按钮的选中态（工具栏「自动换行」）；只重画，不触发命令。"""
+        on = bool(on)
+        if on == self._selected:
+            return
+        self._selected = on
+        self.redraw()
+
+    @property
+    def selected(self):
+        return self._selected
 
     def set_enabled(self, on):
         """启/禁用。只读笔记打开时，工具栏上会改内容的按钮统一禁用。

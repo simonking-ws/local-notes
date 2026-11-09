@@ -22,6 +22,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from app_ui import UIMixin                                    # noqa: E402
+from store import ALARM_INDEX_ID                              # noqa: E402
 
 
 class _Event(object):
@@ -84,9 +85,20 @@ class _Stub(object):
     def _move_note_to_folder(self, nid, fid):
         pass
 
+    # —— 系统笔记判定（内置说明 / 任务提醒列表，两者都不许拖）——
+    def is_sample_note(self, n):
+        return bool(n and n.get("sample"))
+
+    def is_alarm_index(self, n):
+        return bool(n and n.get("id") == ALARM_INDEX_ID)
+
+    def is_protected_note(self, n):
+        return self.is_sample_note(n) or self.is_alarm_index(n)
+
 
 SAMPLE = {"id": "n_sample", "folder": "f_system", "sample": True, "content": []}
 NORMAL = {"id": "n_plain", "folder": "f_work", "content": []}
+ALARM_INDEX = {"id": ALARM_INDEX_ID, "folder": "f_alarm", "content": []}
 
 
 class TestSampleClick(unittest.TestCase):
@@ -125,6 +137,18 @@ class TestSampleClick(unittest.TestCase):
         app.note_press(_Event(state=0x0001), "n_sample")
         self.assertEqual(app.opened, [], "Shift 多选不该打开笔记")
         self.assertIn("n_sample", app._note_sel)
+
+    def test_alarm_index_is_protected_but_still_opens(self):
+        """「任务提醒列表」和说明笔记同一套保护：不许拖，但必须点得开。"""
+        app = _Stub([SAMPLE, NORMAL, ALARM_INDEX])
+        app.note_press(_Event(), ALARM_INDEX_ID)
+        self.assertIsNotNone(app._drag)
+        self.assertFalse(app._drag["started"])
+        self.assertTrue(app._drag.get("sample"), "汇总表也不许升级成拖拽")
+        app.drag_on_motion(_Event(400, 500))
+        self.assertEqual(app.drag_started, [])
+        app.finish_drag(100, 200, 0)
+        self.assertEqual(app.opened, [ALARM_INDEX_ID], "汇总表点不开就白做了")
 
 
 if __name__ == "__main__":

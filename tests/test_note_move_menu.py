@@ -86,6 +86,8 @@ class _Stub(object):
     _popup_move_note = ActionsMixin._popup_move_note
     _note_move_targets = ActionsMixin._note_move_targets
     is_sample_note = ActionsMixin.is_sample_note
+    is_alarm_index = ActionsMixin.is_alarm_index
+    is_protected_note = ActionsMixin.is_protected_note
 
     def __init__(self, notes, folders=None, chosen=None, goto=None):
         self.data = {"notes": notes, "folders": _folders() if folders is None else folders,

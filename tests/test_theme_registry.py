@@ -14,7 +14,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 from theme import (  # noqa: E402
-    THEMES, THEME_LABELS, theme_label, build_palette, list_themes,
+    THEMES, THEME_LABELS, THEME_ORDER, theme_label, build_palette, list_themes,
     DEFAULT_THEME, skin_accent, skin_look,
     FOREST_ACCENT_FALLBACK,
     _contrast_ratio, _rel_lum, _color_dist, _luminance, _hex_rgb, on_accent,
@@ -98,8 +98,29 @@ def test_theme_labels():
         "light", "dark", "sepia", "forest", "midnight", "sky"}
     assert THEME_LABELS["sky"] == "晴空蓝", "第六套主题的显示名应是「晴空蓝」"
     assert [lb for _tid, lb in list_themes()] == [
-        "云母白", "石墨灰", "羊皮纸", "森林绿", "午夜蓝", "晴空蓝"], \
-        "下拉框顺序或文案不对（新主题只能追加在末尾，别动既有五套的位置）"
+        "森林绿", "云母白", "石墨灰", "羊皮纸", "午夜蓝", "晴空蓝"], \
+        "色卡顺序或文案不对（默认主题森林绿排首位，其余保持原相对顺序）"
+
+
+def test_theme_display_order():
+    """设置窗色卡的展示顺序：默认主题森林绿第一格，其余保持原相对顺序。
+
+    只调展示顺序，不动注册表 THEMES 的历史顺序（新主题仍追加末尾）、不动 id、
+    不动落库值；THEME_ORDER 必须覆盖全部主题且不重复，漏登记的新主题补在末尾。
+    """
+    ids = [tid for tid, _lb in list_themes()]
+    assert ids[0] == DEFAULT_THEME == "forest", "森林绿（默认主题）必须排第一格"
+    assert ids[1:] == ["light", "dark", "sepia", "midnight", "sky"], \
+        "其余五套仍按原相对顺序排，别顺手挪位置"
+    assert len(ids) == len(set(ids)) == len(THEMES), "展示顺序漏了或多算了主题"
+    assert tuple(ids) == THEME_ORDER, "THEME_ORDER 与实际展示顺序不一致"
+    # 新主题忘了登记进 THEME_ORDER：兜底按注册表顺序补到末尾，不许静默丢一套
+    THEMES["__probe__"] = {"base": THEMES["light"]["base"]}
+    try:
+        assert [t for t, _lb in list_themes()][-1] == "__probe__", \
+            "THEME_ORDER 漏登记的新主题应补在末尾"
+    finally:
+        THEMES.pop("__probe__", None)
 
 
 def test_default_theme_is_forest_on_first_run():
@@ -253,6 +274,13 @@ class SkyThemeTest(unittest.TestCase):
         test_theme_labels()
 
 
+class ThemeOrderTest(unittest.TestCase):
+    """让 unittest discover 也能收集到「色卡展示顺序」这组约束。"""
+
+    def test_display_order(self):
+        test_theme_display_order()
+
+
 class DefaultThemeTest(unittest.TestCase):
     """让 unittest discover 也能收集到「首次默认森林绿」这条约束。"""
 
@@ -276,6 +304,7 @@ if __name__ == "__main__":
     print("")
     ok = True
     for fn in (test_all_themes_readable, test_theme_labels,
+               test_theme_display_order,
                test_default_theme_is_forest_on_first_run,
                test_skin_theme_removed, test_sky_matches_reference,
                test_dark_themes_distinct, test_on_accent_readable,

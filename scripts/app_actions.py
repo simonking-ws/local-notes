@@ -17,6 +17,8 @@ import win_frame
 
 from store import (APP_NAME, uid, _t, seed, store, save_data,
                    SMART_FOLDERS, SYSTEM_FOLDER, pick_note_color, _ensure_note_colors,
+                   _note_head,
+                   ALARM_INDEX_ID, ALARM_INDEX_TITLE, _ensure_alarm_index_note,
                    folder_children, folder_depth, folder_ancestors,
                    set_all_collapsed, subtree_ids, MAX_FOLDER_DEPTH)
 from theme import FONT, on_accent
@@ -357,8 +359,8 @@ class ActionsMixin(object):
         n = next((x for x in self.data["notes"] if x["id"] == nid), None)
         if not n:
             return
-        if n.get("sample"):
-            # 兜底（拖拽入口已经拦过）：内置说明留在「系统」里，别处留不住它
+        if self.is_protected_note(n):
+            # 兜底（拖拽入口已经拦过）：系统笔记钉在自己的视图里，别处留不住它
             return
         n["folder"] = fid
         n["updated"] = __import__("time").time() * 1000
@@ -395,7 +397,7 @@ class ActionsMixin(object):
         就跟着切到新家，和拖拽落定后的手感一致。
         """
         n = next((x for x in self.data["notes"] if x["id"] == nid), None)
-        if not n or self.is_sample_note(n):
+        if not n or self.is_protected_note(n):
             return
         targets = self._note_move_targets(exclude=[n.get("folder")])
         if not targets:
@@ -423,37 +425,39 @@ class ActionsMixin(object):
             # 全是示例笔记（实际只有一篇）时整项置灰；混选时照常可点，
             # 由 _delete_notes 把示例笔记剔除后再删其余的。
             picked = [x for x in self.data["notes"] if x["id"] in self._note_sel]
-            only_sample = bool(picked) and all(self.is_sample_note(x) for x in picked)
+            only_sample = bool(picked) and all(self.is_protected_note(x) for x in picked)
             m.add("删除选中的 %d 条笔记" % len(self._note_sel), icon="trash",
                   danger=True, enabled=not only_sample,
                   command=lambda: self._delete_notes(list(self._note_sel)))
             m.popup(event.x_root, event.y_root)
             return
+        protected = self.is_protected_note(n)
+        who = "自动汇总表" if self.is_alarm_index(n) else "内置说明"
         m.add("置顶" if not n["pinned"] else "取消置顶", icon="pin",
-              command=lambda: self._popup_pin(nid))
+              enabled=not protected, command=lambda: self._popup_pin(nid))
         m.add("星标" if not n.get("starred", False) else "取消星标", icon="star",
-              command=lambda: self.toggle_star(nid))
+              enabled=not protected, command=lambda: self.toggle_star(nid))
         goto = self._goto_item(n)
         if goto:
-            m.add(goto[0], icon="folder", enabled=goto[1],
+            m.add(goto[0], icon="folder", enabled=goto[1] and not protected,
                   command=lambda: self._popup_goto_folder(nid))
         # 「移动到文件夹…」：拖拽只认左栏**此刻看得见**的那一行，收着的子层得先
         # 逐级展开；右键给一条直达路径，从整棵文件夹树里挑（见 _popup_move_note）。
         # 不能移的两种情况照系统文件夹菜单的规矩办：项留着、置灰、写明原因，
         # 凭空少一行会让人以为「是不是没点到」。
-        sample = self.is_sample_note(n)
-        targets = ([] if sample else
+        targets = ([] if protected else
                    self._note_move_targets(exclude=[n.get("folder")]))
-        if sample:
-            move_label = "移动到文件夹…（内置说明不可移）"
+        if protected:
+            move_label = "移动到文件夹…（%s不可移）" % who
         elif not targets:
             move_label = "移动到文件夹…（没有其他文件夹）"
         else:
             move_label = "移动到文件夹…"
         m.add(move_label, icon="move", enabled=bool(targets),
               command=lambda: self._popup_move_note(nid))
-        if not sample:
+        if not protected:
             sealed = secret.is_blob(n.get("sec"))
+            has_rc = secret.has_recovery(n.get("sec"))
             if sealed:
                 unlocked = bool(self._note_key(nid) and n.get("content"))
                 if unlocked:
@@ -461,15 +465,22 @@ class ActionsMixin(object):
                           command=lambda: self.change_note_password(nid))
                     m.add("取消加密…", icon="unlock",
                           command=lambda: self.clear_note_password(nid))
+                    m.add("重新生成本篇恢复码…" if has_rc else "为本篇生成恢复码…",
+                          icon="lock", command=lambda: self.add_recovery_code(nid))
                 else:
                     m.add("输入口令解锁…", icon="lock",
                           command=lambda: self.unlock_note(nid))
+                    if has_rc:
+                        m.add("用恢复码恢复…", icon="lock",
+                              command=lambda: self.recover_note_with_code(n))
             else:
                 m.add("设置加密口令…", icon="lock",
                       command=lambda: self.set_note_password(nid))
         m.add_separator()
-        m.add("删除笔记（内置示例，不可删）" if sample else "删除笔记",
-              icon="trash", danger=True, enabled=not sample,
+        m.add(("删除笔记（%s，不可删）" % (
+                  "自动汇总表" if self.is_alarm_index(n) else "内置示例"))
+              if protected else "删除笔记",
+              icon="trash", danger=True, enabled=not protected,
               command=lambda: self._popup_delete(nid))
         m.popup(event.x_root, event.y_root)
 
@@ -3602,6 +3613,20 @@ class ActionsMixin(object):
     def _alarm_is_fired(self, data):
         return bool(self._alarm_fired_map().get(self._alarm_key(data)))
 
+    def _alarm_acked_map(self):
+        """`{"<note_id>|<alarm_id>": 时间戳}`：用户**真点过弹窗「知道了」**才算已确认。
+
+        与 alarm_fired 分开存（2026-11-09 用户定义）：fired 是「系统处理过这条
+        提醒」，里面还包括关机期间过期、回来自动补记的 stale —— 那些没有人
+        确认过，混进来「已确认」就成了假的。两个都是本机会话状态，跟库走、
+        不进备份（见 backup.STATE_KEYS）。
+        """
+        st = self.data.setdefault("settings", {})
+        m = st.get("alarm_acked")
+        if not isinstance(m, dict):
+            m = st["alarm_acked"] = {}
+        return m
+
     # ----- 到点提醒：单个轮询，扫全库 -----
 
     def _alarm_bind(self):
@@ -3672,6 +3697,16 @@ class ActionsMixin(object):
                 save_data(self.data)
             except Exception:
                 pass
+        # 「已完成」跟着时钟走：汇总表常开时，提醒时刻翻过去的那一分钟也要
+        # 把「否」改成「是」。只在正文真的变了才重载编辑器（只读笔记，不会打断输入）。
+        if self.data.get("current_note") == ALARM_INDEX_ID:
+            idx = next((x for x in self.data["notes"]
+                        if x.get("id") == ALARM_INDEX_ID), None)
+            if idx is not None:
+                old = idx.get("content")
+                self._refresh_alarm_index()
+                if idx.get("content") != old:
+                    self.load_editor()
 
     def _alarm_popup(self, note_id, data):
         """到点浮窗：置顶小卡片，一个「知道了」。"""
@@ -3695,9 +3730,31 @@ class ActionsMixin(object):
                  fg=p.get("text", "#222222"), font=(FONT[0], 11), bd=0,
                  padx=dpi.px(14), anchor="w", justify="left",
                  wraplength=dpi.px(260)).pack(fill=tk.X, pady=(dpi.px(2), 0))
+        tk.Label(body, text="点「知道了」会记为已确认，并同步到任务提醒列表",
+                 bg=bg, fg=p.get("soft", "#888888"), font=(FONT[0], 8), bd=0,
+                 padx=dpi.px(14), anchor="w").pack(fill=tk.X, pady=(dpi.px(3), 0))
         row = tk.Frame(body, bg=bg)
         row.pack(fill=tk.X, padx=dpi.px(14), pady=(dpi.px(9), dpi.px(11)))
-        tk.Button(row, text="知道了", command=win.destroy, relief=tk.FLAT, bd=0,
+
+        def _ack():
+            # ⚠️ 只在这里写 alarm_acked：_alarm_check 里那些「过期自动补记」的
+            # stale 只进 alarm_fired，绝不能顺手算成用户确认过
+            self._alarm_acked_map()["%s|%s" % (
+                note_id, data.get("id") or "")] = time.time()
+            try:
+                save_data(self.data)
+            except Exception:
+                pass
+            self._refresh_alarm_index()
+            # 汇总表正开着就立刻重刷，别等下一次切笔记才看到「已确认：是」
+            if self.data.get("current_note") == ALARM_INDEX_ID:
+                self.load_editor()
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        tk.Button(row, text="知道了", command=_ack, relief=tk.FLAT, bd=0,
                   bg=accent, fg=on_accent(accent), activebackground=accent,
                   activeforeground=on_accent(accent), font=(FONT[0], 9),
                   padx=dpi.px(14), pady=dpi.px(3), cursor="hand2").pack(side=tk.RIGHT)
@@ -3805,7 +3862,14 @@ class ActionsMixin(object):
                 return True             # _try_open 成功时会把 _cur_pw 补回来
             # 解不开：口令不同（或密文坏了），往下走正常询问流程
         for _ in range(3):
-            pw = self._ask_password("已加密笔记", "这篇笔记已加密，请输入口令：")
+            flag = {}
+            # 只有带恢复槽的笔记才显示这条入口，免得给每篇都挂一个点进去
+            # 必定失败的按钮。点了它走完整的「验码 → 重设口令」流程。
+            pw = self._ask_password(
+                "已加密笔记", "这篇笔记已加密，请输入口令：",
+                out=flag if secret.has_recovery(n.get("sec")) else None)
+            if flag.get("recovery"):
+                return self.recover_note_with_code(n)
             if pw is None:
                 return False
             if self._try_open(n, pw):
@@ -3830,14 +3894,44 @@ class ActionsMixin(object):
             return None
         return pw
 
+    def _offer_recovery_code(self, n, blob, key, replacing=False):
+        """设 / 改口令后生成**本篇**恢复码，展示一次；勾选「已抄下」才写槽。
+
+        返回规范化后的码（供调用方在提交前自检），未启用返回 None。程序只落
+        封装后的密文，恢复码本身用完即弃，绝不进 settings / prefs / 备份元数据。
+        """
+        code = secret.new_recovery_code()
+        ok = self._show_recovery_code(code, secret.recovery_id(code),
+                                      _note_head(n), replacing=replacing)
+        if not ok:
+            return None
+        try:
+            secret.seal_recovery(blob, key, code)
+        except (ValueError, TypeError):
+            self._show_error("恢复码",
+                             "恢复槽生成失败：这篇笔记仍已加密，但没有恢复能力。")
+            return None
+        return secret.norm_recovery_code(code)
+
+    def _apply_new_seal(self, n, blob, key, pw, content=None):
+        """把重设 / 新建的密文一次性装回笔记（恢复流程与普通流程共用）。"""
+        n["sec"] = blob
+        if content is not None:
+            n["content"] = content
+        self._keys[n["id"]] = key
+        self._cur_pw = pw          # 新口令就是「当前这篇」的口令，不是恢复码
+        save_data(self.data)
+        self.refresh_notes()
+        self._refresh_folder_counts()
+
     def set_note_password(self, nid=None):
         """给笔记设置口令（已有口令则改为「修改口令」）。"""
         n = self._pick_note(nid)
         if not n:
             self._show_info("提示", "请先选择一条笔记。")
             return
-        if self.is_sample_note(n):
-            self._show_info("无法加密", "内置示例笔记是只读的，不需要（也不能）加密。")
+        if self.is_protected_note(n):
+            self._show_info("无法加密", "系统笔记是只读的，不需要（也不能）加密。")
             return
         if secret.is_blob(n.get("sec")):
             self.change_note_password(n["id"])
@@ -3852,16 +3946,16 @@ class ActionsMixin(object):
         blob, key = secret.seal_and_key(
             json.dumps(n.get("content") or [], ensure_ascii=False), pw)
         secret.stamp_hint(blob, self._head_char(n))
-        n["sec"] = blob
-        self._keys[n["id"]] = key
-        save_data(self.data)
-        self.refresh_notes()
+        enabled = self._offer_recovery_code(n, blob, key)
+        self._apply_new_seal(n, blob, key, pw)
         # 「加密笔记」是智能分类，条数按密文列算 —— 就地刷新左栏计数，
         # 否则要点一圈文件夹（重建行）才会发现这篇已经算进去了。
-        self._refresh_folder_counts()
         self._show_info("已加密",
-                        "这篇笔记已加密。\n\n"
-                        "切换笔记或重新打开程序后，需要输入口令才能查看内容。")
+                        "这篇笔记已加密。" +
+                        ("\n\n本篇恢复码已生效，忘了口令可用它恢复。"
+                         if enabled else
+                         "\n\n本篇未启用恢复，忘记口令将无法找回内容。") +
+                        "\n\n切换笔记或重新打开程序后，需要输入口令才能查看内容。")
 
     def change_note_password(self, nid=None):
         n = self._pick_note(nid)
@@ -3875,11 +3969,107 @@ class ActionsMixin(object):
             return
         blob, key = secret.seal_and_key(
             json.dumps(n.get("content") or [], ensure_ascii=False), pw)
+        # 换 salt 等于换 key：旧槽里封的是旧 key，不重封装的话用户手上那张码会
+        # 静默失效，直到真忘记口令才发现。每篇独立码下最省事也最诚实的做法是
+        # 重新生成一份新码并当场展示，旧码明确作废。
         secret.stamp_hint(blob, self._head_char(n))
+        enabled = self._offer_recovery_code(n, blob, key, replacing=True)
+        self._apply_new_seal(n, blob, key, pw)
+        self._show_info("已更新",
+                        "加密口令已更新。" +
+                        ("\n\n本篇恢复码已重新生成，旧码已作废。"
+                         if enabled else
+                         "\n\n本篇未启用恢复，旧恢复码已作废。"))
+
+    def recover_note_with_code(self, n=None):
+        """忘记口令时用本篇恢复码取回正文，并**当场重设新口令**。
+
+        关卡：输码 → rid 比对 → 槽 tag 验签 → 主 tag 验签 → 两遍新口令 →
+        内存中构造完整新 blob（新 salt / nonce / 新恢复槽）并自检，再一次保存。
+        任一步失败都不动原 blob，笔记仍保持原来的加密状态。
+        """
+        n = n if isinstance(n, dict) else self._pick_note(n)
+        if not n or not secret.has_recovery(n.get("sec")):
+            self._show_info("无法恢复", "这篇笔记没有设置恢复码，只能用原口令解锁。")
+            return False
+        sec = n["sec"]
+        rc = secret.recovery_of(sec) or {}
+        code = self._ask_recovery_code(
+            "用恢复码恢复",
+            _note_head(n) or secret.hint_of(sec) or "这篇笔记",
+            rc.get("rid") or "")
+        if not code:
+            return False
+        try:
+            key = secret.open_recovery(sec, code)
+            plain = secret.open_with_key(sec, key)   # 取回 key 仍要过主 tag
+            content = json.loads(plain)
+        except secret.BadPassword as e:
+            self._show_error("无法恢复", "%s。未对笔记做任何修改。" % e)
+            return False
+        except Exception:
+            self._show_error("无法恢复", "密文损坏，未对笔记做任何修改。")
+            return False
+        if not isinstance(content, list):
+            content = []
+        pw = self._ask_pw_twice(
+            "重设加密口令",
+            "恢复码已验证。请为这篇笔记设置一个新口令：\n\n"
+            "不重设的话磁盘上仍是旧密文，下次打开照样要原口令。")
+        if not pw:
+            return False
+        try:
+            blob, new_key = secret.seal_and_key(plain, pw)
+            secret.stamp_hint(blob, secret.hint_of(sec))
+            new_code = self._offer_recovery_code(n, blob, new_key, replacing=True)
+            if secret.open_with_key(blob, new_key) != plain:
+                raise ValueError("新密文自检失败")
+            if new_code and secret.open_recovery(blob, new_code) != new_key:
+                raise ValueError("新恢复槽自检失败")
+        except Exception:
+            self._show_error("无法恢复", "重设失败，原笔记未做任何修改。")
+            return False
+        if self.data.get("current_note") != n["id"]:
+            self.data["current_note"] = n["id"]
+        self._apply_new_seal(n, blob, new_key, pw, content=content)
+        self.load_editor()
+        self._show_info("已恢复",
+                        "这篇笔记已用新口令重新加密，落盘仍是密文。\n\n" +
+                        ("新的本篇恢复码已生成，旧码作废。"
+                         if new_code else "本篇未启用恢复。"))
+        return True
+
+    def add_recovery_code(self, nid=None):
+        """给已解锁的加密笔记补建 / 重新生成本篇恢复码（老笔记升级入口）。
+
+        每篇一份码，所以没有「批量补建」：老笔记、当初选了「暂不启用」的笔记，
+        都在本篇解锁后单独补。先在副本上建槽，用户取消时原 blob 分毫不动。
+        """
+        n = self._pick_note(nid)
+        if not n or not secret.is_blob(n.get("sec")):
+            return
+        if not self._ensure_unlocked(n):
+            return
+        key = self._note_key(n["id"])
+        if not key:
+            return
+        old = secret.has_recovery(n["sec"])
+        if old and not self._ask_confirm(
+                "重新生成恢复码",
+                "程序不保存恢复码，所以无法「查看」旧码，只能换一张新的。\n\n"
+                "重新生成后旧码立即作废，确定继续吗？",
+                ok_text="重新生成", danger=True):
+            return
+        blob = dict(n["sec"])
+        secret.drop_recovery(blob)
+        code = self._offer_recovery_code(n, blob, key, replacing=old)
+        if not code:
+            return
         n["sec"] = blob
-        self._keys[n["id"]] = key
         save_data(self.data)
-        self._show_info("已更新", "加密口令已更新。")
+        self._show_info("恢复码",
+                        ("本篇恢复码已重新生成，旧码作废。" if old else
+                         "本篇恢复码已生成。") + "请按刚才弹窗的提示另行保管。")
 
     def clear_note_password(self, nid=None):
         """取消加密：先解出明文（要有口令），再把密文整块删掉。"""
@@ -3989,8 +4179,27 @@ class ActionsMixin(object):
         """
         return bool(n and n.get("sample"))
 
-    def _refuse_sample_delete(self):
-        """删除内置示例笔记时的统一提示。"""
+    def is_alarm_index(self, n):
+        """是否是「任务提醒列表」这张自动生成的汇总表（固定 id 判定）。"""
+        return bool(n and n.get("id") == ALARM_INDEX_ID)
+
+    def is_protected_note(self, n):
+        """系统笔记：内置说明 + 任务提醒列表。两者都不能删 / 移 / 改名 / 上锁。
+
+        ⚠️ 判定只认「标记 / 固定 id」，别拿标题比：汇总表的正文是程序每次重写的，
+        用户从任何入口都改不动它，标题恒等于常量，但也别给「用户把笔记改名成
+        「任务提醒列表」就莫名其妙被锁死」留门。
+        """
+        return self.is_sample_note(n) or self.is_alarm_index(n)
+
+    def _refuse_sample_delete(self, n=None):
+        """删除系统笔记时的统一提示（两类各说各的，别把报表说成使用说明）。"""
+        if self.is_alarm_index(n):
+            self._show_info("无法删除",
+                            "「任务提醒列表」是「任务提醒」分类下的自动汇总表，不能删除、"
+                            "不能编辑，也不能移动。\n\n"
+                            "它由全库的任务提醒实时生成，要改内容请回到原来的笔记里改闹钟。")
+            return
         self._show_info("无法删除",
                         "「%s」是内置的使用说明，既不能删除，也不能编辑。\n\n"
                         "它里面列出了全部快捷键，随时可以回来看。\n"
@@ -4001,8 +4210,8 @@ class ActionsMixin(object):
         if not n:
             self._show_info("提示", "请先在中间列表选择一条笔记。")
             return
-        if self.is_sample_note(n):
-            self._refuse_sample_delete()
+        if self.is_protected_note(n):
+            self._refuse_sample_delete(n)
             return
         if not self._ask_confirm("删除", "确定删除这条笔记？", ok_text="删除", danger=True):
             return
@@ -4234,6 +4443,11 @@ class ActionsMixin(object):
         if fid == SYSTEM_FOLDER:
             self._show_info("提示", "「系统」文件夹的名字是程序固定的，不能改。")
             return
+        if fid in SMART_FOLDERS:
+            # 智能分类（含「任务提醒」）是程序固定的视图，名字与落库 id 一一对应。
+            # 右键菜单已经置灰，这里再兜一道：双击重命名 / 快捷键等别的入口同样拦住。
+            self._show_info("提示", "智能分类是程序固定的视图，名字不能改，也不能移动。")
+            return
         name = self._ask_text("重命名文件夹", "文件夹名称：", f["name"])
         if not name:
             return
@@ -4289,8 +4503,16 @@ class ActionsMixin(object):
             m.add_separator()
             m.add("删除文件夹（系统文件夹不可删）", icon="trash", enabled=False)
         else:
-            m.add("重命名", icon="pencil", command=lambda: self.rename_folder(fid))
-            if not f.get("smart"):
+            if f.get("smart"):
+                # 智能分类四项全列出来、全置灰并写明原因：菜单里凭空少几行，
+                # 用户会以为「是不是没点到」。「任务提醒」同样受这一套保护。
+                m.add("重命名（智能分类不可改）", icon="pencil", enabled=False)
+                m.add("新建子文件夹（智能分类下不能建）", icon="folder", enabled=False)
+                m.add("移动笔记到…（智能分类不可整体移动）", icon="folder", enabled=False)
+                m.add_separator()
+                m.add("删除文件夹（智能分类不可删）", icon="trash", enabled=False)
+            else:
+                m.add("重命名", icon="pencil", command=lambda: self.rename_folder(fid))
                 # 「新建子文件夹」放在最前：树里最常见的下意识动作就是「在这儿再开一层」
                 too_deep = folder_depth(fid, self.data["folders"]) + 1 > MAX_FOLDER_DEPTH
                 m.add("新建子文件夹" if not too_deep else
@@ -4306,9 +4528,6 @@ class ActionsMixin(object):
                 m.add_separator()
                 m.add("删除文件夹", icon="trash", danger=True,
                       command=lambda: self.del_folder(fid))
-            else:
-                m.add("新建子文件夹（智能分类下不能建）", icon="folder", enabled=False)
-                m.add("删除文件夹（智能文件夹不可删）", icon="trash", enabled=False)
         m.popup(event.x_root, event.y_root)
 
     def _move_notes_out(self, fid):

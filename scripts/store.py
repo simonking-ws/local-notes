@@ -15,9 +15,11 @@ import sys
 import json
 import time
 import sqlite3
+import unicodedata
 
 from md_conv import (TODO_OFF, TODO_ON, TODO_MARKS, TODO_GAP, TODO_GAP_TAG,
                      LI_INDENT, list_marker)
+import alarm
 import secret
 
 
@@ -294,7 +296,7 @@ SAMPLE_KEY_GROUPS = [
 
 # markdown 输入快捷的说明表：(敲什么, 变成什么)。
 # 「右移两格」这类说明不再写进表里：新版每一条都是真列表项，缩进已经摆在眼前。
-# ⚠️ 说明要短：正文是 wrap=WORD，一行约 35 个汉字，长句子会在空格处提前折行。
+# ⚠️ 说明要短：窄窗口下一行约 35 个汉字，长句子就算按字符折行也难读。
 SAMPLE_MD = [
     ("# + 空格", "一级标题，## 是二级"),
     ("- + 空格", "项目符号，* 和 + 也行"),
@@ -362,10 +364,10 @@ def _sample_intro():
 def _sample_start_section():
     """「三步开始」：第一次打开的人真正要做的三件事。
 
-    ⚠️ 正文是 wrap=WORD（见 app_ui 里 Text 的构造）：Tk 只在**空格**处断行，
-    一串没有空格的汉字算一个「词」，整块放不下就整体掉到下一行，上一行留出一大段
-    空白。所以说明笔记里每一条都要短（正文一屏约 35 个汉字宽，一条控制在 30 字内），
-    否则宽窗口还行、把两栏拖窄就参差不齐。
+    ⚠️ 正文默认 wrap=NONE、开自动换行时是 wrap=CHAR（按字符断，见 app_ui 里
+    Text 的构造），不会再出现旧 WORD 时代「整段汉字算一个词、放不下就整体掉到
+    下一行」的空白。但说明笔记每一条仍要短（窄窗口一行约 35 个汉字，一条控制在
+    30 字内），否则折成两三行读起来像几段。
     """
     out = _line("三步开始", ["h2"])
     out += _item("写点什么", _k("Ctrl+N") + _t(" 新建一篇，停手半秒自动保存"))
@@ -418,8 +420,9 @@ def _sample_keys_section():
 def _sample_footer():
     """结尾：这篇为什么只读，以及上锁的入口。
 
-    ⚠️ 别在句子里塞「 → 」这类两侧带空格的箭头：正文是 wrap=WORD，空格就是断行点，
-    整句会在箭头后面断掉，下一行从行首重新开始，读起来像是两段。
+    ⚠️ 别在句子里塞「 → 」这类两侧带空格的箭头：老版正文是 wrap=WORD，空格就是
+    断行点，整句会在箭头后面断掉、像是两段。现在按字符折行不会再断在那里，但
+    文案仍沿用这套写法，省得老笔记 / 导出 PDF 里冒出突兀的断句。
     """
     out = _line("关于这篇说明", ["h2"])
     out += _line("这篇是内置说明：不能编辑，也不能删除，随时回来查快捷键。"
@@ -490,8 +493,27 @@ def plain_of(n):
 # 左栏把笔记分成两组：「智能分类」（按条件筛出来的视图，没有真实归属，不能删、
 # 不能当新建笔记的落点）和「文件夹」（用户自己建的真实归属）。
 # 顺序即左栏的显示顺序；名字是唯一真相，老库里的旧名由 _ensure_smart_folders 统一。
-SMART_FOLDERS = ("f_all", "f_star", "f_lock")
-SMART_FOLDER_NAMES = {"f_all": "全部笔记", "f_star": "星标笔记", "f_lock": "加密笔记"}
+# ⚠️ 新智能分类一律追加末尾（2026-11-09 加的 f_alarm 就钉在 f_lock 后面）：
+# 顺序只影响左栏，落库用的是 id，动顺序不会串主题 / 不会串视图。
+SMART_FOLDERS = ("f_all", "f_star", "f_lock", "f_alarm")
+SMART_FOLDER_NAMES = {"f_all": "全部笔记", "f_star": "星标笔记",
+                      "f_lock": "加密笔记", "f_alarm": "任务提醒"}
+
+# 「任务提醒列表」：智能分类 f_alarm 下唯一的一篇系统笔记，程序自动生成、只读。
+# 和 SYSTEM_FOLDER 一样**只认固定 id**，不多存一个标记字段（id 与标记各说一套
+# 迟早会对不上）。它的 folder 指向 f_alarm：智能分类不是真实归属，所以普通文件夹
+# 视图里永远不会冒出这一篇；只有 smart_notes("f_alarm") 认它。
+ALARM_INDEX_ID = "n_alarm_index"
+ALARM_INDEX_TITLE = "任务提醒列表"
+
+# 汇总表用 **tag 级制表位** 分列：\t 后的字段由 Tk 按像素定位，与字体、任务名
+# 长短、中英文混排都无关。实测正文字体中文 15px / 半角空格 8px（1.875 倍，不是 2），
+# 按「中文算 2 格补空格」每行会按汉字数累积误差；交给制表位才真的对齐。
+# tabs 只挂在 ALARM_ROW_TAG 上，普通笔记里的 \t 仍是默认制表位，也不用切笔记时
+# 还原 widget 级配置；具体像素在 app_ui._config_tags() 里按当前字号现算。
+ALARM_ROW_TAG = "alarm_row"
+ALARM_TASK_COL = 30      # 「任务」列显示宽度上限（半角列；约 15 个汉字）
+ALARM_HEADERS = ("提醒时间", "任务", "已完成", "已确认", "来源笔记")
 
 # 「系统」文件夹：程序自带的一格，专放内置说明笔记。用户不能改名、删除、移动它，
 # 也不能把别的笔记拖进去。判定只认固定 id —— 它本来就是唯一的，多存一个字段
@@ -510,6 +532,9 @@ def smart_notes(fid, notes):
 
     f_lock「加密笔记」只认 `sec` 里有没有密文 —— 加密笔记落库时正文和 plain 都是空的，
     所以这里（和搜索）都不需要解密，也不可能靠关键词命中。
+
+    f_alarm「任务提醒」不是筛选条件：它固定只给那一篇自动生成的「任务提醒列表」
+    （见 ALARM_INDEX_ID）。其它智能分类是跨文件夹的聚合视图，这一格是一张报表。
     """
     notes = notes or []
     if fid == "f_all":
@@ -518,6 +543,8 @@ def smart_notes(fid, notes):
         return [n for n in notes if n.get("starred", False)]
     if fid == "f_lock":
         return [n for n in notes if secret.is_blob(n.get("sec"))]
+    if fid == "f_alarm":
+        return [n for n in notes if n.get("id") == ALARM_INDEX_ID]
     return [n for n in notes if n.get("folder") == fid]
 
 
@@ -746,7 +773,8 @@ def _ensure_system_folder(data):
     data["folders"] = folders
     # 普通笔记的退路：优先「工作」；本机连它都没有（极端的导入场景）就退到
     # 第一个普通文件夹 —— 总比留一格指向不存在的文件夹、笔记只在「全部」里可见好
-    real_ids = [f["id"] for f in folders if f.get("id") != SYSTEM_FOLDER]
+    real_ids = [f["id"] for f in folders
+                if f.get("id") != SYSTEM_FOLDER and f.get("id") not in SMART_FOLDERS]
     fallback = "f_work" if "f_work" in real_ids else (real_ids[0] if real_ids else "f_work")
     for n in (data.get("notes") or []):
         if not isinstance(n, dict):
@@ -776,13 +804,181 @@ def new_sample_note(now=None, folder=SYSTEM_FOLDER):
             "pinned": True, "starred": False, "created": now, "updated": now}
 
 
+# ---------- 「任务提醒列表」汇总笔记 ----------
+# 它是程序按全库 alarm 元素实时生成的一张报表，不是用户写的笔记：
+#   * 固定 id（ALARM_INDEX_ID），不存额外的标记字段；
+#   * 每次启动 / 刷新列表 / 打开它都重算正文，用户改不动也不需要改；
+#   * 备份不导出（和内置说明一样，导入后当场重建）。
+def _note_head(n):
+    """笔记第一行的纯文本（汇总表里当「源笔记名」用）。"""
+    s = []
+    for it in n.get("content") or []:
+        if not isinstance(it, list) or not it:
+            continue
+        if it[0] == "t":
+            if len(it) > 1 and it[1] == "\n":
+                break
+            s.append(it[1] if len(it) > 1 else "")
+        elif it[0] in ("hr", "code", "alarm", "w"):
+            break
+    out = "".join(s).strip()
+    if out:
+        return out
+    # 加密笔记的正文落库是空的（明文只在 sec 密文里），别显示成「未命名笔记」
+    return "已加密笔记" if secret.is_blob(n.get("sec")) else "未命名笔记"
+
+
+def _disp_w(s):
+    """显示宽度：全角 / 东亚宽字符算 2 列，其余 1 列；省略号按 2 列。"""
+    return sum(2 if (ch == "…" or
+                     unicodedata.east_asian_width(ch) in ("W", "F")) else 1
+               for ch in s)
+
+
+def _one_line(s):
+    """单元格里不能留会破坏表格的控制字符：制表符会凭空多切出一列。"""
+    return (str(s or "").replace("\r", " ").replace("\n", " ")
+            .replace("\t", " ").strip())
+
+
+def _clip_task(s, max_w):
+    """压成一行再按显示宽度截断；超长尾巴用 … 表示，全文回原笔记看。"""
+    s = _one_line(s)
+    if _disp_w(s) <= max_w:
+        return s
+    budget = max_w - 2                 # 给省略号留 2 列
+    out, used = [], 0
+    for ch in s:
+        w = 2 if (ch == "…" or
+                  unicodedata.east_asian_width(ch) in ("W", "F")) else 1
+        if used + w > budget:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out).rstrip() + "…"
+
+
+def _alarm_row(cells):
+    """一条表格行：制表符分列，逐字符挂 ALARM_ROW_TAG（制表位只认带标签的行）。
+
+    cells 是 `[(文本, 额外标签), ...]`。内链那格额外带 lk_N + 共用的 link：
+    少了 link 点击不生效，少了 ALARM_ROW_TAG 这一行就没有制表位。
+    ⚠️ 行尾换行刻意不带标签：实测不带也生效，还不会把标签范围连到下一行。
+    """
+    out = []
+    for i, (s, extra) in enumerate(cells):
+        if i:
+            out += _t("\t", [ALARM_ROW_TAG])
+        out += _t(s, [ALARM_ROW_TAG] + list(extra or []))
+    return out + [["t", "\n", []]]
+
+
+def alarm_index_content(data, now=None):
+    """扫全库任务提醒，返回「任务提醒列表」的 `(content, links)`。纯函数，不碰 UI。
+
+    排版是一张 **五列表格**：提醒时间 / 任务 / 已完成 / 已确认 / 来源笔记，
+    列间用制表符分隔、逐字符挂 ALARM_ROW_TAG；真正对齐由
+    `app_ui._config_tags()` 配在这个标签上的 **tag 级制表位**按像素完成。
+    不用空格补齐：正文字体中文 15px、半角空格 8px（1.875 倍，不是 2），
+    按字数补空格会按汉字数累积误差，制表位则与内容长度完全无关。
+    数据列自带字段名（「已完成：是」），上面再加一行加粗表头点题。
+
+    - 已完成：`alarm.is_done()` = 提醒时刻已过，跟着时钟自动翻面，不落库。
+    - 已确认：`settings["alarm_acked"]` 里有 `<note_id>|<alarm_id>` 才算 —— 只有
+      用户真点过到点弹窗的「知道了」会写它；关机期间过期、回来自动补记的
+      `alarm_fired` 不算确认（两条状态各管一件事）。
+    - 有时间的按时间升序（最早该做的排最前），没设时间的沉底。
+    - 任务名压成一行，超长按显示宽度截断加 …；末尾 @源笔记标题 是 note: 内链。
+    """
+    now = time.time() if now is None else now
+    acked = (data.get("settings") or {}).get("alarm_acked") or {}
+    rows = []
+    for n in data.get("notes") or []:
+        if not isinstance(n, dict) or n.get("id") == ALARM_INDEX_ID:
+            continue                      # 别把汇总笔记自己也算进去
+        for it in n.get("content") or []:
+            if (not isinstance(it, list) or len(it) < 2 or it[0] != "alarm"
+                    or not isinstance(it[1], dict)):
+                continue
+            rows.append((n.get("id") or "", it[1], _note_head(n)))
+    rows.sort(key=lambda r: (0 if (r[1].get("at") or 0) else 1,
+                             r[1].get("at") or 0, r[2]))
+
+    out = _line(ALARM_INDEX_TITLE, ["title"])
+    out += _line("共 %d 条 · 提醒时间已过即算「已完成」，点过到点弹窗的「知道了」才算「已确认」。"
+                 "任务过长会截断，点 @笔记名 跳回原文看全文。" % len(rows), ["quote"])
+    out += [["t", "\n", []]]
+    if not rows:
+        out += _line("还没有任务提醒。在任意笔记里点工具栏的小闹钟插入一条，这里会自动列出来。")
+        return out, {}
+
+    # 表头与数据行用同一套制表位，列起点才会严丝合缝地落在同一条竖线上
+    out += _alarm_row([(h, ["bold"]) for h in ALARM_HEADERS])
+
+    links = {}
+    for i, (nid, d, title) in enumerate(rows, 1):
+        tag = "lk_%d" % i
+        # note: 前缀由 mention.note_url 定义；这里的字符串必须与它一致，
+        # 否则 _on_link_click 认不出内链、点击会当成普通网址丢给浏览器
+        links[tag] = "note:%s" % nid
+        when = alarm.fmt_full(d.get("at")) or "未设时间"
+        done = "已完成：" + ("是" if alarm.is_done(d, now) else "否")
+        conf = "已确认：" + ("是" if acked.get("%s|%s" % (nid, d.get("id") or "")) else "否")
+        task = _clip_task(d.get("text"), ALARM_TASK_COL) or "（未填写任务）"
+        # lk_N 记 URL，"link" 是共用可点标签（点击/手型事件绑在它上面），两者都要；
+        # ALARM_ROW_TAG 也必须一起挂，否则这一格会跳回默认制表位
+        out += _alarm_row([(when, []), (task, []), (done, []), (conf, []),
+                           ("@" + _one_line(title), [tag, "link"])])
+    return out, links
+
+
+def _ensure_alarm_index_note(data, now=None):
+    """确保「任务提醒列表」在、归位、正文与全库提醒一致。返回是否改动（幂等）。
+
+    启动时与覆盖/合并导入后各跑一次。**不改 updated**：汇总笔记常驻列表第一位
+    靠的是 f_alarm 视图里只有它一条，不该因为每次重算内容就被顶到「全部笔记」最前。
+    """
+    raw = data.get("notes") or []
+    notes = [n for n in raw if isinstance(n, dict)]
+    changed = len(notes) != len(raw)
+    me = next((n for n in notes if n.get("id") == ALARM_INDEX_ID), None)
+    ts = (now if now is not None else time.time()) * 1000
+    if me is None:
+        me = {"id": ALARM_INDEX_ID, "created": ts, "updated": ts}
+        notes.append(me)          # 追加到末尾：别把用户的笔记整体往后挪一格
+        changed = True
+    for k, v in (("folder", "f_alarm"), ("pinned", False), ("starred", False)):
+        if me.get(k) != v:
+            me[k] = v
+            changed = True
+    # 它是系统报表：不该带密文、也不该被当成内置说明（那会走进说明笔记的
+    # 升级/重建流程）。color / order 留给通用逻辑，不在这里来回删。
+    for k in ("sec", "sample"):
+        if k in me:
+            me.pop(k)
+            changed = True
+    if not me.get("created"):
+        me["created"] = ts
+        changed = True
+    data["notes"] = notes
+    content, links = alarm_index_content(data, now)
+    if me.get("content") != content:
+        me["content"] = content
+        changed = True
+    if (me.get("links") or {}) != links:
+        me["links"] = links
+        changed = True
+    return changed
+
+
 def seed():
     now = time.time() * 1000
-    return {
+    d = {
         "folders": [
             {"id": "f_all", "name": "全部笔记", "smart": True},
             {"id": "f_star", "name": "星标笔记", "smart": True},
             {"id": "f_lock", "name": "加密笔记", "smart": True},
+            {"id": "f_alarm", "name": "任务提醒", "smart": True},
             {"id": SYSTEM_FOLDER, "name": SYSTEM_FOLDER_NAME},
             {"id": "f_work", "name": "工作"},
             {"id": "f_life", "name": "个人"},
@@ -806,6 +1002,8 @@ def seed():
         "current_folder": "f_all",
         "current_note": None,
     }
+    _ensure_alarm_index_note(d, now / 1000.0)
+    return d
 
 
 def _fix_sample_note(data):
@@ -1194,11 +1392,15 @@ class Store(object):
         （比如只改了 URL 就顺手 save），漏了就会出现"改了没存"。
         """
         sec = n.get("sec")
+        # 只增删恢复槽时主 tag 不变（正文一个字节没动），但槽必须落盘 / 进备份，
+        # 否则用户以为「已启用恢复」，重开程序却发现槽没存下来。
+        rc = sec.get("recovery") if isinstance(sec, dict) else None
         return (n.get("updated"), n.get("starred"), n.get("pinned"),
                 n.get("folder"), len(n.get("content") or []), n.get("sample"),
                 n.get("order"), n.get("color"),
                 len(n.get("links") or {}),
-                (sec or {}).get("tag") if isinstance(sec, dict) else None)
+                (sec or {}).get("tag") if isinstance(sec, dict) else None,
+                rc.get("tag") if isinstance(rc, dict) else None)
 
     # ---------- 搜索 ----------
     def search_ids(self, folder, q, folder_ids=None):

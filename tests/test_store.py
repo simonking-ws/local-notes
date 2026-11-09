@@ -26,7 +26,7 @@ from store import (Store, plain_of, _t, _cb, seed, _fix_sample_note,  # noqa: E4
                    _mark_sample_note, _upgrade_sample_note, like_escape,
                    folder_children, folder_depth, folder_ancestors, subtree_ids,
                    normalize_folder_parents, set_all_collapsed, MAX_FOLDER_DEPTH,
-                   _ensure_system_folder, SYSTEM_FOLDER)
+                   _ensure_system_folder, SYSTEM_FOLDER, ALARM_INDEX_ID)
 from md_conv import TODO_OFF, TODO_ON, TODO_GAP, TODO_GAP_TAG, LI_INDENT   # noqa: E402
 
 
@@ -92,25 +92,29 @@ class SerializeTest(unittest.TestCase):
 class SeedAndFixTest(unittest.TestCase):
     def test_seed_has_smart_folders_and_notes(self):
         d = seed()
-        self.assertEqual([f["id"] for f in d["folders"]][:3],
-                         ["f_all", "f_star", "f_lock"])
-        self.assertTrue(all(f.get("smart") for f in d["folders"][:3]))
-        self.assertEqual(len(d["notes"]), 4)
+        self.assertEqual([f["id"] for f in d["folders"]][:4],
+                         ["f_all", "f_star", "f_lock", "f_alarm"])
+        self.assertTrue(all(f.get("smart") for f in d["folders"][:4]))
+        # 4 篇用户可见的示例笔记 + 1 篇自动生成的「任务提醒列表」
+        self.assertEqual(len([n for n in d["notes"]
+                              if n["id"] != ALARM_INDEX_ID]), 4)
+        self.assertEqual(len([n for n in d["notes"]
+                              if n["id"] == ALARM_INDEX_ID]), 1)
 
 
 class SmartFolderTest(unittest.TestCase):
-    """左栏「智能分类」：三个视图必须在、名字是现行文案、且排在真实文件夹前面。"""
+    """左栏「智能分类」：四个视图必须在、名字是现行文案、且排在真实文件夹前面。"""
 
     def test_adds_missing_lock_folder_to_old_library(self):
         d = {"folders": [{"id": "f_all", "name": "全部备忘录", "smart": True},
                          {"id": "f_work", "name": "工作"}]}
         self.assertTrue(store._ensure_smart_folders(d))
         self.assertEqual([f["id"] for f in d["folders"]],
-                         ["f_all", "f_star", "f_lock", "f_work"])
-        self.assertEqual([f["name"] for f in d["folders"][:3]],
-                         ["全部笔记", "星标笔记", "加密笔记"])
-        self.assertTrue(all(f.get("smart") for f in d["folders"][:3]))
-        self.assertFalse(d["folders"][3].get("smart"))
+                         ["f_all", "f_star", "f_lock", "f_alarm", "f_work"])
+        self.assertEqual([f["name"] for f in d["folders"][:4]],
+                         ["全部笔记", "星标笔记", "加密笔记", "任务提醒"])
+        self.assertTrue(all(f.get("smart") for f in d["folders"][:4]))
+        self.assertFalse(d["folders"][4].get("smart"))
 
     def test_is_idempotent(self):
         d = seed()
@@ -126,7 +130,7 @@ class SmartFolderTest(unittest.TestCase):
                          {"id": "f_star", "name": "星标笔记", "smart": True}]}
         self.assertTrue(store._ensure_smart_folders(d))
         self.assertEqual([f["id"] for f in d["folders"]],
-                         ["f_all", "f_star", "f_lock", "f_work"])
+                         ["f_all", "f_star", "f_lock", "f_alarm", "f_work"])
 
     def test_smart_notes_filter(self):
         notes = [
@@ -140,6 +144,11 @@ class SmartFolderTest(unittest.TestCase):
         self.assertEqual([n["id"] for n in store.smart_notes("f_star", notes)], ["b"])
         # 加密笔记只看 sec 有没有密文：内容（明文）此时根本不在内存里
         self.assertEqual([n["id"] for n in store.smart_notes("f_lock", notes)], ["c"])
+        # 「任务提醒」不是筛选条件：固定只给那篇自动生成的汇总表
+        self.assertEqual(store.smart_notes("f_alarm", notes), [])
+        self.assertEqual([n["id"] for n in store.smart_notes(
+            "f_alarm", notes + [{"id": ALARM_INDEX_ID, "folder": "f_alarm"}])],
+            [ALARM_INDEX_ID])
         self.assertEqual([n["id"] for n in store.smart_notes("f_work", notes)],
                          ["a", "c"])
 
@@ -169,11 +178,12 @@ class StoreTest(TmpCase):
     def test_first_load_seeds_initial_data(self):
         s = Store(self.path())
         d = s.load()
-        self.assertEqual(len(d["folders"]), 6)      # 三个智能分类 + 工作 / 个人 + 系统
-        self.assertEqual(len(d["notes"]), 4)
+        self.assertEqual(len(d["folders"]), 7)      # 四个智能分类 + 工作 / 个人 + 系统
+        self.assertEqual(len([n for n in d["notes"]
+                              if n["id"] != ALARM_INDEX_ID]), 4)
         # 「系统」是文件夹里的第一格（在「工作」上面），说明笔记住在里面
         self.assertEqual([f["id"] for f in d["folders"]],
-                         ["f_all", "f_star", "f_lock", SYSTEM_FOLDER,
+                         ["f_all", "f_star", "f_lock", "f_alarm", SYSTEM_FOLDER,
                           "f_work", "f_life"])
         sample = [n for n in d["notes"] if n.get("sample")][0]
         self.assertEqual(sample["folder"], store.SYSTEM_FOLDER)
@@ -529,11 +539,15 @@ class ImportTest(unittest.TestCase):
              "notes": [{"id": "n1", "folder": "f_gone", "content": _t("孤儿")},
                        {"id": "n2", "content": "坏数据"}]}
         out = self._overwrite(d)
-        # 三个智能分类打头，紧跟程序自带的「系统」，然后才是备份里的真实文件夹
-        self.assertEqual([f["id"] for f in out["folders"]][:5],
-                         ["f_all", "f_star", "f_lock", SYSTEM_FOLDER, "f_mine"])
-        # 覆盖导入会补一篇内置说明（备份本身不导出它），只断言备份里那一条
-        self.assertEqual([n["id"] for n in out["notes"] if not n.get("sample")], ["n1"])
+        # 四个智能分类打头，紧跟程序自带的「系统」，然后才是备份里的真实文件夹
+        self.assertEqual([f["id"] for f in out["folders"]][:6],
+                         ["f_all", "f_star", "f_lock", "f_alarm",
+                          SYSTEM_FOLDER, "f_mine"])
+        # 覆盖导入会补一篇内置说明 + 一篇任务提醒汇总表（备份本身都不导出），
+        # 这里只断言备份里那一条用户笔记
+        self.assertEqual([n["id"] for n in out["notes"]
+                          if not n.get("sample") and n["id"] != ALARM_INDEX_ID],
+                         ["n1"])
         got = next(n for n in out["notes"] if n["id"] == "n1")
         self.assertEqual(got["folder"], "f_work")
 
@@ -544,12 +558,12 @@ class ImportTest(unittest.TestCase):
                          {"id": "f_new", "name": "新文件夹"}],
              "notes": [note("dup", "备份里的同名 id"), note("other", "备份里新的")]}
         out = self._merge(d, cur)
-        # 合并后的文件夹列表同样以三个智能分类打头（它们是视图，不在备份里也补），
+        # 合并后的文件夹列表同样以四个智能分类打头（它们是视图，不在备份里也补），
         # 紧跟程序自带的「系统」，其余按备份里的顺序（系统不随备份走）
         self.assertEqual([f["id"] for f in out["folders"]],
-                         ["f_all", "f_star", "f_lock", SYSTEM_FOLDER,
+                         ["f_all", "f_star", "f_lock", "f_alarm", SYSTEM_FOLDER,
                           "f_work", "f_new"])
-        ids = [n["id"] for n in out["notes"]]
+        ids = [n["id"] for n in out["notes"] if n["id"] != ALARM_INDEX_ID]
         self.assertEqual(ids[0], "dup")
         self.assertNotIn("dup", ids[1:])                # 冲突的另起新 id
         self.assertIn("other", ids)
@@ -669,7 +683,9 @@ class SaveFailureTest(unittest.TestCase):
             snap = json.load(f)
         back, _warn = backup.decode(snap)
         back = backup.overwrite(back)
-        self.assertEqual([n["id"] for n in back["notes"] if not n.get("sample")], ["n1"])
+        self.assertEqual([n["id"] for n in back["notes"]
+                          if not n.get("sample") and n["id"] != ALARM_INDEX_ID],
+                         ["n1"])
 
     def test_close_clears_singleton(self):
         """close() 之后 store() 必须重新连库，不能返回已关闭的连接。"""
