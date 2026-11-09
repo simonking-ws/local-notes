@@ -27,7 +27,7 @@ import alarm                                                   # noqa: E402
 import backup                                                  # noqa: E402
 from store import (_t, SMART_FOLDERS, SMART_FOLDER_NAMES, smart_notes,
                    ALARM_INDEX_ID, ALARM_INDEX_TITLE,
-                   ALARM_ROW_TAG, ALARM_TASK_COL, ALARM_HEADERS,
+                   ALARM_ROW_TAG, ALARM_TASK_COL, ALARM_HEADERS, ALARM_COLS,
                    alarm_index_content, _ensure_alarm_index_note,
                    _ensure_smart_folders, seed, _disp_w)        # noqa: E402
 
@@ -71,6 +71,11 @@ def _rows(content):
     return [ln for ln in _text(content).split("\n") if "\t" in ln]
 
 
+def _cells(content):
+    """数据行逐格切好（去掉表头），下标即列号。"""
+    return [r.split("\t") for r in _rows(content)[1:]]
+
+
 class TestSmartFolder(unittest.TestCase):
     def test_alarm_folder_is_right_after_lock(self):
         self.assertEqual(tuple(SMART_FOLDERS[:3]), ("f_all", "f_star", "f_lock"))
@@ -109,13 +114,14 @@ class TestIndexContent(unittest.TestCase):
         d = _data([_note("n1", "周会待办", [
             {"id": "a1", "text": "交周报", "at": PAST}])],
             acked={"n1|a1": NOW})
-        content, links = alarm_index_content(d, NOW)
+        content, links, _tips = alarm_index_content(d, NOW)
         s = _text(content)
         self.assertIn(ALARM_INDEX_TITLE, s)
         self.assertIn("2026-11-09 09:00", s, "什么时间：完整年月日 + 时分")
         self.assertIn("交周报", s, "做什么任务")
-        self.assertIn("已完成：是", s, "时间已过 = 已完成")
-        self.assertIn("已确认：是", s, "点过弹窗 = 已确认")
+        row = _cells(content)[0]
+        self.assertEqual(row[2], "是", "时间已过 = 已完成")
+        self.assertEqual(row[3], "是", "点过弹窗 = 已确认")
         self.assertIn("@周会待办", s)
         self.assertEqual(links, {"lk_1": "note:n1"}, "内链必须指向源笔记 id")
         self.assertIn("@周会待办", _linked(content, "lk_1"))
@@ -127,13 +133,14 @@ class TestIndexContent(unittest.TestCase):
         future = {"id": "a2", "text": "买菜", "at": FUTURE}
         no_time = {"id": "a3", "text": "随手记", "at": 0}
         d = _data([_note("n1", "杂事", [past, future, no_time])])
-        s = _text(alarm_index_content(d, NOW)[0])
-        self.assertEqual(s.count("已完成：是"), 1)
-        self.assertEqual(s.count("已完成：否"), 2, "未来 / 未设时间都不算完成")
-        self.assertIn("未设时间", s)
+        done = [c[2] for c in _cells(alarm_index_content(d, NOW)[0])]
+        self.assertEqual(done.count("是"), 1)
+        self.assertEqual(done.count("否"), 2, "未来 / 未设时间都不算完成")
+        self.assertIn("未设时间", _text(alarm_index_content(d, NOW)[0]))
         # 同一份数据，把「现在」推到 19:00，未来的那条自动翻成已完成
-        later = _text(alarm_index_content(d, _ts(2026, 11, 9, 19, 0))[0])
-        self.assertEqual(later.count("已完成：是"), 2)
+        later = [c[2] for c in _cells(
+            alarm_index_content(d, _ts(2026, 11, 9, 19, 0))[0])]
+        self.assertEqual(later.count("是"), 2)
 
     def test_acked_is_independent_from_fired(self):
         """过期自动补记只写 alarm_fired，绝不能算「已确认」。"""
@@ -141,11 +148,11 @@ class TestIndexContent(unittest.TestCase):
             {"id": "a1", "text": "交周报", "at": PAST}])],
             acked={})
         d["settings"]["alarm_fired"] = {"n1|a1": NOW}
-        s = _text(alarm_index_content(d, NOW)[0])
-        self.assertIn("已完成：是", s)
-        self.assertIn("已确认：否", s, "fired 不等于 acked")
+        row = _cells(alarm_index_content(d, NOW)[0])[0]
+        self.assertEqual(row[2], "是")
+        self.assertEqual(row[3], "否", "fired 不等于 acked")
         d["settings"]["alarm_acked"]["n1|a1"] = NOW
-        self.assertIn("已确认：是", _text(alarm_index_content(d, NOW)[0]))
+        self.assertEqual(_cells(alarm_index_content(d, NOW)[0])[0][3], "是")
 
     def test_empty_state_and_sort(self):
         d = _data([_note("n1", "只有文字")])
@@ -267,7 +274,7 @@ class TestTableLayout(unittest.TestCase):
                 {"id": "a2", "text": "订会议室并通知全体参会同事", "at": FUTURE},
                 {"id": "a3", "text": "buy milk and eggs", "at": 0}]),
         ])
-        content, links = alarm_index_content(d, NOW)
+        content, links, _tips = alarm_index_content(d, NOW)
         rows = _rows(content)
         self.assertEqual(len(rows), 4, "1 行表头 + 3 行数据")
         self.assertEqual(tuple(rows[0].split("\t")), ALARM_HEADERS)
@@ -275,8 +282,8 @@ class TestTableLayout(unittest.TestCase):
             cells = r.split("\t")
             self.assertEqual(len(cells), 5, "每行必须是五列：%r" % r)
             self.assertTrue(cells[0] == "未设时间" or len(cells[0]) == 16)
-            self.assertTrue(cells[2].startswith("已完成："))
-            self.assertTrue(cells[3].startswith("已确认："))
+            self.assertIn(cells[2], ("是", "否"), "状态列只写是 / 否，字段名在表头")
+            self.assertIn(cells[3], ("是", "否"))
             self.assertTrue(cells[4].startswith("@"))
         self.assertEqual(set(links.values()), {"note:n1"})
 
@@ -284,7 +291,7 @@ class TestTableLayout(unittest.TestCase):
         """少了 ALARM_ROW_TAG，那一行的 tag 级制表位就不生效、整行会错位。"""
         d = _data([_note("n1", "周会", [
             {"id": "a1", "text": "交周报", "at": PAST}])])
-        content, _links = alarm_index_content(d, NOW)
+        content, _links, _tips = alarm_index_content(d, NOW)
         tagged = _linked(content, ALARM_ROW_TAG)
         for r in _rows(content):
             self.assertIn(r, tagged, "这一行有字符漏挂 %s：%r" % (ALARM_ROW_TAG, r))
@@ -298,19 +305,50 @@ class TestTableLayout(unittest.TestCase):
                 "显示省略号而不会把后面的列挤歪")
         d = _data([_note("n1", "周会", [
             {"id": "a1", "text": long, "at": PAST}])])
-        content, links = alarm_index_content(d, NOW)
+        content, links, _tips = alarm_index_content(d, NOW)
         cells = _rows(content)[1].split("\t")
         self.assertEqual(len(cells), 5, "截断不能多切或少切列")
         self.assertTrue(cells[1].endswith("…"))
         self.assertLessEqual(_disp_w(cells[1]), ALARM_TASK_COL)
         self.assertNotIn("挤歪", cells[1], "超长尾巴不该漏进表格")
-        self.assertEqual(cells[2], "已完成：是")
+        self.assertEqual(cells[2], "是")
         self.assertEqual(links, {"lk_1": "note:n1"})
+
+    def test_every_column_has_fixed_width_and_ticks_the_tips(self):
+        """五列都按 ALARM_COLS 截断；真被截的那几格把全文交给 tips（悬停用）。"""
+        long_task = ("这是一个特别长的任务名称用来验证超过列宽之后会被截断"
+                     "显示省略号而不会把后面的列挤歪")
+        long_title = "这是一篇标题特别特别长的来源笔记用来验证第五列也会被截断"
+        d = _data([_note("n1", long_title, [
+            {"id": "a1", "text": long_task, "at": PAST}])])
+        content, _links, tips = alarm_index_content(d, NOW)
+        cells = _rows(content)[1].split("\t")
+        self.assertEqual(len(cells), 5)
+        for i, cell in enumerate(cells):
+            self.assertLessEqual(
+                _disp_w(cell), ALARM_COLS[i],
+                "第 %d 列超了固定宽度，后面的列会被顶歪：%r" % (i + 1, cell))
+        self.assertTrue(cells[1].endswith("…"), "任务列该截断")
+        self.assertTrue(cells[4].endswith("…"), "来源笔记列同样固定宽度、同样截断")
+        # 标签必须落在那一格自己的文字上，否则悬停会定位到别的格
+        self.assertEqual(_linked(content, "ac_1_2"), cells[1])
+        self.assertEqual(_linked(content, "ac_1_5"), cells[4])
+        self.assertEqual(len(tips), 2, "只有被截断的两格进 tips")
+        self.assertIn(long_task, tips.values(), "全文要原样留着，不能是截断后的")
+        self.assertIn("@" + long_title, tips.values())
+
+    def test_short_cells_get_no_tooltip(self):
+        """没被截断的格子不挂标签、不进 tips —— 浮一条一模一样的字只是噪音。"""
+        d = _data([_note("n1", "周会", [
+            {"id": "a1", "text": "交周报", "at": PAST}])])
+        content, _links, tips = alarm_index_content(d, NOW)
+        self.assertEqual(tips, {})
+        self.assertEqual(_linked(content, "ac_"), "", "不该有任何 ac_ 标签")
 
     def test_control_chars_cannot_split_a_column(self):
         d = _data([_note("n1", "周\t会\n待办", [
             {"id": "a1", "text": "买菜\t做饭\n顺便", "at": PAST}])])
-        content, _links = alarm_index_content(d, NOW)
+        content, _links, _tips = alarm_index_content(d, NOW)
         cells = _rows(content)[1].split("\t")
         self.assertEqual(len(cells), 5, "任务 / 标题里的制表符不能凭空多切一列")
         self.assertNotIn("\t", cells[1])
@@ -318,7 +356,7 @@ class TestTableLayout(unittest.TestCase):
         self.assertTrue(cells[4].startswith("@"))
 
     def test_empty_state_has_no_header(self):
-        content, links = alarm_index_content(
+        content, links, _tips = alarm_index_content(
             _data([_note("n1", "只有文字")]), NOW)
         self.assertEqual(_rows(content), [], "空表不该挂个孤零零的表头")
         self.assertEqual(links, {})

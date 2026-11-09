@@ -18,7 +18,7 @@ import win_frame
 from store import (APP_NAME, uid, _t, seed, store, save_data,
                    SMART_FOLDERS, SYSTEM_FOLDER, pick_note_color, _ensure_note_colors,
                    _note_head,
-                   ALARM_INDEX_ID, ALARM_INDEX_TITLE, _ensure_alarm_index_note,
+                   ALARM_INDEX_ID, ALARM_CELL_TAG,
                    folder_children, folder_depth, folder_ancestors,
                    set_all_collapsed, subtree_ids, MAX_FOLDER_DEPTH)
 from theme import FONT, on_accent
@@ -2932,6 +2932,109 @@ class ActionsMixin(object):
         self.text.bind("<Button-1>", lambda e: self._hide_link_tip(), add="+")
         self.text.bind("<Key>", lambda e: self._hide_link_tip(), add="+")
         self.text.bind("<MouseWheel>", lambda e: self._hide_link_tip(), add="+")
+        # 「任务提醒列表」被截断的格子：指针压上去浮出全文。同一个 <Motion> 上
+        # 两条绑定互不干扰（上面那条只管链接），收起的时机也一样
+        self.text.bind("<Motion>", self._on_cell_motion, add="+")
+        self.text.bind("<Leave>", lambda e: self._hide_cell_tip(), add="+")
+        self.text.bind("<Button-1>", lambda e: self._hide_cell_tip(), add="+")
+        self.text.bind("<Key>", lambda e: self._hide_cell_tip(), add="+")
+        self.text.bind("<MouseWheel>", lambda e: self._hide_cell_tip(), add="+")
+
+    # ---------- 悬停看「任务提醒列表」里被截断的格子 ----------
+    # 五列固定宽度（store.ALARM_COLS），超宽的格子在正文里只剩前半截 + …；
+    # 原样文字由 alarm_index_content 收在 tips 里（app.refresh 时缓存到
+    # _alarm_cell_tips），这里只负责「指针压在哪一格 → 把那一格的全文字浮出来」。
+
+    def _cell_tag_at(self, idx):
+        """idx 落在一个被截断的格子上时返回它的标签名，否则 None。"""
+        try:
+            for name in self.text.tag_names(idx):
+                if name.startswith(ALARM_CELL_TAG):
+                    return name
+        except Exception:
+            pass
+        return None
+
+    def _on_cell_motion(self, event):
+        """指针在正文里移动：停在汇总表被截断的格子上就把全文浮出来。
+
+        汇总表是只读的系统报表，这一层只做展示 —— 不给链接那种「就地编辑」
+        小窗，免得让人以为报表里的格子能改。
+        """
+        if event is None:
+            return
+        n = self.current_note()
+        if not n or n.get("id") != ALARM_INDEX_ID:
+            if self._cell_tip_tag is not None:
+                self._hide_cell_tip()
+            return
+        try:
+            idx = self.text.index("@%d,%d" % (event.x, event.y))
+        except Exception:
+            return
+        tag = self._cell_tag_at(idx)
+        # 窗还在就不再重建：<Motion> 每一像素都会来一次，反复 destroy+create
+        # 会让提示一直闪。窗被收掉（滚轮 / 离开）后回到同一格要能重新浮出，
+        # 所以判据是「同一格 **且** 窗还在」
+        if tag == self._cell_tip_tag and self._cell_tip_win is not None:
+            return
+        self._cell_tip_tag = tag
+        if not tag:
+            self._hide_cell_tip()
+            return
+        full = (getattr(self, "_alarm_cell_tips", None) or {}).get(tag)
+        if not full:
+            self._hide_cell_tip()       # 标签在、全文没了（刷新过一轮）就当没截断
+            return
+        self._cell_tip_show(event.x_root + dpi.px(14), event.y_root + dpi.px(18),
+                            full)
+
+    def _cell_tip_show(self, x, y, text):
+        p = self.pal
+        self._drop_cell_tip_win()      # 只收窗，**别动 _cell_tip_tag**：它被清掉的话
+        #                                下一次 <Motion> 会当成「换了一格」重建窗口，肉眼就是闪
+        try:
+            win = tk.Toplevel(self.root)
+            win.wm_overrideredirect(True)
+            # 跟闹钟提示同一套：主窗临时置顶时，浮窗不跟着置顶就会被自家窗口盖住
+            win.attributes("-topmost", True)
+            win.configure(bg=_popover_border(p))
+            # wraplength 按像素给：任务名可以很长，一行铺满屏幕还不如折成几行
+            lbl = tk.Label(win, text=text, bg=_popover_bg(p),
+                           fg=p.get("text", "#222222"), font=(FONT[0], 10),
+                           bd=0, justify="left", anchor="w",
+                           wraplength=dpi.px(420),
+                           padx=dpi.px(10), pady=dpi.px(6))
+            lbl.pack(padx=dpi.px(1), pady=dpi.px(1))
+            win.update_idletasks()
+            w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+            # 夹进**鼠标所在那块屏**的工作区（多屏时 winfo_screenwidth 只报主屏）
+            area = win_frame.work_area_at(x, y, fallback=win)
+            px, py = win_frame.clamp_pos(area, x, y, w, h, pad=dpi.px(4))
+            win.geometry("+%d+%d" % (px, py))
+            self._cell_tip_win = win
+        except Exception:
+            self._cell_tip_win = None
+
+    def _drop_cell_tip_win(self):
+        """只销毁浮窗，保留「指针压着哪一格」的记忆。"""
+        win = getattr(self, "_cell_tip_win", None)
+        self._cell_tip_win = None
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+    def _hide_cell_tip(self):
+        """收起浮窗，并把「指针压着哪一格」一并清掉。
+
+        ⚠️ 和 _alarm_tip_hide 不同，这里必须清 _cell_tip_tag：它唯一的用途是
+        去重，清了下次移动才会重新判断；而闹钟那边的 _alarm_hover 还要靠
+        它判断「是否还在同一枚上」，两者语义不同别照抄。
+        """
+        self._cell_tip_tag = None
+        self._drop_cell_tip_win()
 
     def _schedule_link_tip_hide(self, ms=200):
         self._cancel_link_tip_hide()

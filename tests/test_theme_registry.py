@@ -17,7 +17,7 @@ from theme import (  # noqa: E402
     THEMES, THEME_LABELS, THEME_ORDER, theme_label, build_palette, list_themes,
     DEFAULT_THEME, skin_accent, skin_look,
     FOREST_ACCENT_FALLBACK,
-    _contrast_ratio, _rel_lum, _color_dist, _luminance, _hex_rgb, on_accent,
+    _contrast_ratio, _color_dist, _luminance, _hex_rgb, on_accent,
     _status_bar_bg, _readonly_bar_bg, _tab_idle_bg, _toolbar_bg, _sel_bg,
 )
 

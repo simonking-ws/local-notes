@@ -22,8 +22,8 @@ from store import (APP_NAME, save_data,
                    SMART_FOLDERS, SYSTEM_FOLDER, LOCKED_BODY_TEXT, folder_children,
                    subtree_ids, ensure_note_color, resolve_adjacent_colors,
                    pick_note_color, NOTE_COLORS,
-                   ALARM_INDEX_ID, ALARM_INDEX_TITLE, ALARM_ROW_TAG,
-                   alarm_index_content, _ensure_alarm_index_note)
+                   ALARM_INDEX_ID, ALARM_ROW_TAG, ALARM_COLS,
+                   alarm_index_content)
 from theme import (FONT, _RES, build_palette, DEFAULT_THEME, THEMES, list_themes,
                    theme_label, on_accent)
 from widgets import (RoundButton, FontSizeSlider, ArrowButton,
@@ -673,6 +673,10 @@ class UIMixin(object):
         self._link_tip_job = None
         self._link_tip_show_job = None
         self._link_editor = None
+        # 「任务提醒列表」里被截断的格子：全文表 + 指针当前压着的那一格
+        self._alarm_cell_tips = {}
+        self._cell_tip_tag = None
+        self._cell_tip_win = None
         self._bind_link_tip()
         # 编辑区宽度变化 → 代码块重新对齐宽度并重算高度（否则换行行数会算错），
         # 横向细条也按新宽度决定显隐（窗口拉宽到放得下长行就自动收起）。
@@ -3297,12 +3301,18 @@ class UIMixin(object):
         # 不是 2），每行会按汉字数累积误差，任务名一长后面三列肉眼就歪。
         try:
             _mf = tkfont.Font(family=fam, size=bs)
-            _s1 = _mf.measure("2026-11-09 09:00") + _char_w
-            _s2 = _s1 + _char_w * 18        # 任务列 18 汉字宽，容得下 15 汉字 / 30 半角
-            _gap = _char_w              # 两个状态列之间留一个汉字宽，别挤成一团
-            _s3 = _s2 + _mf.measure("已完成：是") + _gap
-            _s4 = _s3 + _mf.measure("已确认：否") + _gap
-            self.text.tag_configure(ALARM_ROW_TAG, tabs=(_s1, _s2, _s3, _s4))
+            # 列距按 store.ALARM_COLS 的固定列宽算：一格最多 `w` 个半角列，
+            # 换算成像素就是 w 个数字宽，再加一点空隙防止贴死。制表位必须
+            # **略大于**格子的最大宽度 —— 内容一旦顶到制表位，Tk 会直接跳到
+            # 下一个制表位，整行右移一格，比截断难看得多（内容侧已由
+            # _clip_cell 保证不超过 w 列，这里只是再留一道余量）。
+            _pad = dpi.px(6)
+            _x = 0
+            _tabs = []
+            for _w in ALARM_COLS[:-1]:
+                _x += _mf.measure("0" * _w) + _pad
+                _tabs.append(_x)
+            self.text.tag_configure(ALARM_ROW_TAG, tabs=tuple(_tabs))
         except Exception:
             pass                            # 量不到字体就留默认制表位，别让启动白屏
         _qind = _char_w * 2
@@ -4139,20 +4149,36 @@ class UIMixin(object):
                               fg=p["text"], outline=p["line"], padx=dpi.px(18), pady=dpi.px(7))
         b_check.pack(side=tk.LEFT, padx=(0, dpi.px(8)))
         b_check.bind_events()
-        # 回调里要用到按钮自己（查询期间置灰、把字换成「检查中…」），构造那一刻
-        # b_check 还没赋值，所以先建再挂。Canvas 没有 -command 选项，只能走 set_command。
-        b_check.set_command(lambda: self._check_update_start(
-            dlg, note, btn_row, b_check))
         b_close = RoundButton(inner, p, "关闭", command=dlg.destroy,
                               base=p["editor"], fg=p["soft"], outline=p["line"],
                               padx=dpi.px(22), pady=dpi.px(7))
         b_close.pack(side=tk.LEFT)
         b_close.bind_events()
+        # 「后台下载」：**只在下载真的在跑的时候才出现**（初始不 pack）。位置在
+        # 「下载更新 / 取消下载」和「关闭」之间 —— pack 的先后就是摆放顺序，
+        # 它是后来才显示的那一枚，不带 before 会跑到「关闭」右边去。
+        b_bg = RoundButton(inner, p, "后台下载", base=p["editor"],
+                           fg=p["soft"], outline=p["line"],
+                           padx=dpi.px(18), pady=dpi.px(7))
+        b_bg.bind_events()
+
+        # 更新这一组控件打包成 ctx 往下传：下载任务跑在后台线程里，这张窗随时
+        # 可能被关掉、再开一张新的。所有回调都拿 ctx 里的 dlg 判存活，不持有
+        # 「当时那张窗」的隐式引用 —— 否则第一张窗关掉之后，新窗上的按钮就全哑了。
+        ctx = {"dlg": dlg, "note": note, "btn_row": btn_row,
+               "btn": b_check, "bg": b_bg, "close": b_close}
+        # 回调里要用到按钮自己（查询期间置灰、把字换成「检查中…」），构造那一刻
+        # b_check 还没赋值，所以先建再挂。Canvas 没有 -command 选项，只能走 set_command。
+        b_check.set_command(lambda: self._check_update_start(ctx))
+        b_bg.set_command(lambda: self._update_go_background(ctx))
 
         dlg.bind("<Escape>", lambda _e: dlg.destroy())
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
         # 这把尺子的长度就是「关于」量出来的：另外两张窗跟着它走
         self._center_dialog(dlg, min_w=_panel_width(dlg), center_y=True)
+        # 上次点「后台下载」关掉窗之后，任务还在跑（或已经下好了）：接着画出来。
+        # 放在居中之后 —— 它可能多出一行进度，高度变了要重新居中。
+        self._update_restore(ctx)
         try:
             dlg.grab_set()
         except Exception:
@@ -4194,37 +4220,37 @@ class UIMixin(object):
 
         self.root.after(interval, poll)
 
-    def _check_update_start(self, dlg, note, btn_row, btn):
+    def _check_update_start(self, ctx):
         """「检查更新」：按钮先变「检查中…」并置灰，查完再还原。
 
         置灰不只是防连点 —— 网络卡住时 8 秒才超时，不给反馈的话用户会以为
         按钮坏了，然后一直点。
         """
-        if getattr(self, "_upd_busy", False):
+        if getattr(self, "_upd_busy", False) or self._upd_downloading():
             return
         self._upd_busy = True
-        btn.set_enabled(False)
-        btn.set_text("检查中…")
+        ctx["btn"].set_enabled(False)
+        ctx["btn"].set_text("检查中…")
 
         def done(ok, payload):
             self._upd_busy = False
             try:
-                if not dlg.winfo_exists():
+                if not self._upd_alive(ctx):
                     return                  # 查询期间用户把关于窗关了
-                btn.set_text("检查更新")
-                btn.set_enabled(True)
+                ctx["btn"].set_text("检查更新")
+                ctx["btn"].set_enabled(True)
                 if ok:
                     res = payload
                 else:
                     res = {"state": "error",
                            "error": "检查更新时出错：%s" % payload}
-                self._render_update_result(dlg, note, btn_row, btn, res)
+                self._render_update_result(ctx, res)
             except tk.TclError:
                 pass                        # 窗口刚好在这一刻被销毁
 
         self._run_bg(updater.check, done)
 
-    def _render_update_result(self, dlg, note, btn_row, btn, res):
+    def _render_update_result(self, ctx, res):
         """把检查结果写进关于窗底部那一行，并按新的内容高度重新居中。
 
         按钮承担「下一步」：有新版本时它从「检查更新」变成「下载更新」，下载
@@ -4232,12 +4258,17 @@ class UIMixin(object):
         —— 这张窗的宽度是「关于」量出来的标尺（_panel_width），其他地方都照它走。
         """
         p = self.pal
+        note, btn, btn_row = ctx["note"], ctx["btn"], ctx["btn_row"]
         state = res.get("state")
         link = ""
+        # 重查会重新决定"下一步"，上一轮的下载任务就作废了（含它下好的包：
+        # prepare 会自己复用 .zip，这里只丢状态，不动磁盘）
+        self._upd_job = None
+        self._upd_show_bg(ctx, False)
         # 先把按钮复位成「检查更新」：上一次可能停在「下载更新」或「立即更新」
         # 上，不复位就会出现「点重查却进了另一个动作」的错乱
         btn.set_text("检查更新")
-        btn.set_command(lambda: self._check_update_start(dlg, note, btn_row, btn))
+        btn.set_command(lambda: self._check_update_start(ctx))
         if state == "new":
             asset = updater.pick_asset(res)
             size = updater.human_size((asset or {}).get("size"))
@@ -4250,8 +4281,7 @@ class UIMixin(object):
             link = res.get("html_url") or (GITHUB_URL + "/releases")
             if asset:
                 btn.set_text("下载更新")
-                btn.set_command(lambda: self._update_start_download(
-                    dlg, note, btn_row, btn, res))
+                btn.set_command(lambda: self._update_start_download(ctx, res))
             else:
                 # 没有可下载的包（只剩源码）：只能开网页，别给一个点了就报错的按钮
                 btn.set_text("打开发布页")
@@ -4273,12 +4303,65 @@ class UIMixin(object):
         if not note.winfo_manager():
             note.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(10), 0), before=btn_row)
         # 内容高度变了：_center_dialog 支持重复调用（它会先松开 minsize 再重新量）
-        self._relayout_dialog(dlg)
+        self._relayout_dialog(ctx["dlg"])
 
     # ---------------- 自动更新：下载 → 校验 → 退出后替换 ----------------
     # 这一段全部建立在「Windows 不允许覆盖正在运行的 exe」这条硬约束上：
     # 应用内只能做到"把新版本准备好并验证无误"，真正的替换必须在进程退出
     # 之后由批处理执行（见 updater.BAT 里的逐条注释）。
+    #
+    # 下载任务挂在 self._upd_job 上、**不挂在关于窗上**：用户点「后台下载」把
+    # 窗一关，任务照跑（关窗不是取消，取消有单独那枚按钮）。再点「关于」时
+    # `_update_restore` 把 job 的当前状态重新画出来 —— 进度、已就绪、失败都算。
+
+    def _upd_alive(self, ctx):
+        """这张关于窗还在不在。下载结束那一刻它通常已经被关掉了。"""
+        try:
+            return bool(ctx["dlg"].winfo_exists())
+        except Exception:
+            return False
+
+    def _upd_downloading(self):
+        job = getattr(self, "_upd_job", None)
+        return bool(job and job.get("state") == "downloading")
+
+    def _upd_show_bg(self, ctx, on):
+        """显示 / 收起「后台下载」。位置靠 pack(before=...) 钉住，重复调用安全。"""
+        bg = ctx.get("bg")
+        if bg is None:
+            return
+        try:
+            shown = bool(bg.winfo_manager())
+            if on and not shown:
+                bg.pack(side=tk.LEFT, padx=(0, dpi.px(8)), before=ctx["close"])
+            elif not on and shown:
+                bg.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _upd_job_begin(self, res):
+        """开一个新的后台下载任务。
+
+        任务里只放数据（release / 进度 dict）和「当前那张关于窗」的 ctx：窗被关掉
+        就只是 `job["ui"]` 变 None，任务本身照跑 —— 这是「后台下载」的前提。
+        """
+        job = {"res": res, "state": "downloading", "info": None,
+               "message": "", "error": False, "ui": None,
+               "prog": {"done": 0, "total": 0, "cancel": False,
+                        "phase": "download"}}
+        self._upd_job = job
+        return job
+
+    def _update_go_background(self, ctx):
+        """「后台下载」：关掉这张窗，任务照旧在跑。
+
+        这里真的什么都不用做 —— 下载本来就在后台线程里，进度只写在 job 上。
+        下次点「关于」，`_update_restore` 会把进度接着画出来。
+        """
+        try:
+            ctx["dlg"].destroy()
+        except tk.TclError:
+            pass
 
     def _relayout_dialog(self, dlg):
         """内容行变高/变矮后重新居中。_center_dialog 设计上可重复调用。"""
@@ -4298,78 +4381,139 @@ class UIMixin(object):
                     % updater.APP_EXE)
         return ""
 
-    def _update_start_download(self, dlg, note, btn_row, btn, res):
-        """点「下载更新」：后台下载 + 校验 + 解包，进度就地显示在结果行上。"""
-        if getattr(self, "_upd_busy", False):
+    def _update_start_download(self, ctx, res):
+        """点「下载更新」：起一个后台任务，进度就地显示在结果行上。
+
+        任务一旦开始就**不再属于这张窗**：关掉窗它照跑，重新打开关于时由
+        `_update_restore` 接着显示。
+        """
+        if getattr(self, "_upd_busy", False) or self._upd_downloading():
             return
-        p = self.pal
+        note = ctx["note"]
         if not note.winfo_manager():
-            note.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(10), 0), before=btn_row)
+            note.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(10), 0),
+                      before=ctx["btn_row"])
         why = self._update_blocked_reason()
         if why:
             # 光标保持 hand2：上一轮挂的「打开更新说明」绑定还在，这行文字仍然可点
             # —— 自动替换走不通时，那条路就是唯一的出路，别让它看着像不可点
             note.configure(fg=MENU_DANGER, cursor="hand2", text=why)
+            btn = ctx["btn"]
             btn.set_text("检查更新")
-            btn.set_command(lambda: self._check_update_start(dlg, note, btn_row, btn))
-            self._relayout_dialog(dlg)
+            btn.set_command(lambda: self._check_update_start(ctx))
+            self._upd_show_bg(ctx, False)
+            self._relayout_dialog(ctx["dlg"])
             return
 
-        self._upd_busy = True
-        # 代次：用户取消后再点一次、或窗口关掉再开，旧那轮的轮询要能自己停下来
-        self._upd_gen = getattr(self, "_upd_gen", 0) + 1
-        gen = self._upd_gen
-        prog = {"done": 0, "total": 0, "cancel": False, "phase": "download"}
+        job = self._upd_job_begin(res)
+        job["ui"] = ctx
+        self._upd_show_progress(ctx, job)
+        self._run_bg(lambda: updater.prepare(res, job["prog"]),
+                     lambda ok, payload: self._upd_job_done(job, ok, payload))
 
+    def _upd_show_progress(self, ctx, job):
+        """画「正在下载」这一屏：首次开始下载，和重新打开关于窗时都走这里。"""
+        note = ctx["note"]
+        if not note.winfo_manager():
+            note.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(10), 0),
+                      before=ctx["btn_row"])
+        btn = ctx["btn"]
+        btn.set_enabled(True)
         btn.set_text("取消下载")
         # 取消只置一个标记，真正的停止由下载循环在下一块数据前看到 —— 不从
         # 界面线程去动子线程里的状态，也不去 kill 它（那会留下写了一半的文件）
-        btn.set_command(lambda: prog.__setitem__("cancel", True))
-        self._update_poll_progress(dlg, note, prog, gen)
+        btn.set_command(lambda: job["prog"].__setitem__("cancel", True))
+        self._upd_show_bg(ctx, True)
+        self._update_poll_progress(ctx, job)      # 立刻画一帧，再排下一帧
+        self._relayout_dialog(ctx["dlg"])
 
-        def done(ok, payload):
-            if gen != getattr(self, "_upd_gen", 0):
-                return                      # 已经开始了新一轮
-            self._upd_busy = False
-            # 告诉进度轮询"收摊"：它每 150ms 写一次文本，如果不等它停，最后
-            # 一帧会把下面刚写好的结论盖回「正在取消…」（实测踩到过）
-            prog["closed"] = True
-            try:
-                if not dlg.winfo_exists():
-                    return
-            except tk.TclError:
-                return
-            btn.set_enabled(True)
-            btn.set_text("下载更新")
-            btn.set_command(lambda: self._update_start_download(
-                dlg, note, btn_row, btn, res))
-            if ok:
-                self._update_ready(dlg, note, btn_row, btn, payload)
-                return
+    def _upd_show_failure(self, ctx, job):
+        """下载没成（取消 / 网络断 / 校验失败）：写一行结论，按钮回到「下载更新」。"""
+        note = ctx["note"]
+        if not note.winfo_manager():
+            note.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(10), 0),
+                      before=ctx["btn_row"])
+        # 用户自己点的取消不算错误，别用红字骂他
+        note.configure(fg=MENU_DANGER if job.get("error") else self.pal["soft"],
+                       cursor="arrow", text=job.get("message") or "下载失败。")
+        btn = ctx["btn"]
+        btn.set_enabled(True)
+        btn.set_text("下载更新")
+        btn.set_command(lambda: self._update_start_download(ctx, job["res"]))
+        self._upd_show_bg(ctx, False)
+        self._relayout_dialog(ctx["dlg"])
+
+    def _upd_job_done(self, job, ok, payload):
+        """下载 / 校验 / 解包跑完了，在主线程里收尾。
+
+        **这时关于窗可能早就被关了**（用户点了「后台下载」）：结论只写进 job，
+        等下次打开关于窗再画，绝不 assume 控件还在。
+        """
+        if job is not getattr(self, "_upd_job", None):
+            return                          # 已经被新一轮替掉了
+        # 告诉进度轮询"收摊"：它每 150ms 写一次文本，如果不等它停，最后
+        # 一帧会把下面刚写好的结论盖回「正在取消…」（实测踩到过）
+        job["prog"]["closed"] = True
+        self._upd_busy = False
+        if ok:
+            job["state"] = "ready"
+            job["info"] = payload
+        else:
+            job["state"] = "failed"
+            job["error"] = not isinstance(payload, updater.Cancelled)
             if isinstance(payload, updater.Cancelled):
-                note.configure(fg=p["soft"], cursor="arrow",
-                               text="已取消下载（下次从断点继续）。")
+                job["message"] = "已取消下载（下次从断点继续）。"
             elif isinstance(payload, updater.UpdateError):
-                note.configure(fg=MENU_DANGER, cursor="arrow", text=str(payload))
+                job["message"] = str(payload)
             else:
-                note.configure(fg=MENU_DANGER, cursor="arrow",
-                               text="下载时出错：%s" % payload)
-            self._relayout_dialog(dlg)
+                job["message"] = "下载时出错：%s" % payload
 
-        self._run_bg(lambda: updater.prepare(res, prog), done)
+        ctx = job.get("ui")
+        if ctx is None or not self._upd_alive(ctx):
+            job["ui"] = None
+            return
+        try:
+            if job["state"] == "ready":
+                self._update_ready(ctx, job["info"])
+            else:
+                self._upd_show_failure(ctx, job)
+        except tk.TclError:
+            pass                            # 窗刚好在这一刻被销毁
 
-    def _update_poll_progress(self, dlg, note, prog, gen):
+    def _update_restore(self, ctx):
+        """关于窗建好后，把上一次留下的下载任务接着画出来。
+
+        没有这一步，「后台下载」就是一道单向门：关掉窗以后再也看不到进度，
+        只能凭猜。三种状态各自还原成对应的那一屏。
+        """
+        job = getattr(self, "_upd_job", None)
+        if not job:
+            return
+        state = job.get("state")
+        job["ui"] = ctx
+        if state == "downloading":
+            self._upd_show_progress(ctx, job)
+        elif state == "ready" and job.get("info"):
+            self._update_ready(ctx, job["info"])
+        elif state == "failed":
+            self._upd_show_failure(ctx, job)
+
+    def _update_poll_progress(self, ctx, job):
         """每 150ms 把 prog 里的两个数字读出来写成一句人话。
 
         子线程只往 dict 里写整数（GIL 保证读到的不会是被撕裂的值），绝不碰
         控件；这里每帧只做一次 configure，文本长度也控制在不会折行的范围内 ——
         进度行一变高变矮，整张窗就会跟着抖。
         """
-        if gen != getattr(self, "_upd_gen", 0) or prog.get("closed"):
+        prog = job["prog"]
+        if job is not getattr(self, "_upd_job", None) or prog.get("closed"):
+            return
+        if job.get("ui") is not ctx:
+            return                          # 这张窗已经被后来开的那张顶掉了
+        if not self._upd_alive(ctx):
+            job["ui"] = None                # 窗关了：任务继续，别再往它上面画
             return
         try:
-            if not dlg.winfo_exists():
-                return
             done = int(prog.get("done") or 0)
             total = int(prog.get("total") or 0)
             phase = prog.get("phase") or "download"
@@ -4386,25 +4530,32 @@ class UIMixin(object):
                     updater.human_size(done) or "0 B", updater.human_size(total))
             else:
                 text = "正在下载… %s" % (updater.human_size(done) or "0 B")
-            note.configure(text=text, fg=self.pal["soft"], cursor="arrow")
+            ctx["note"].configure(text=text, fg=self.pal["soft"], cursor="arrow")
         except tk.TclError:
             return
-        self._after(150, lambda: self._update_poll_progress(dlg, note, prog, gen))
+        self._after(150, lambda: self._update_poll_progress(ctx, job))
 
-    def _update_ready(self, dlg, note, btn_row, btn, info):
+    def _update_ready(self, ctx, info):
         """下载校验都过了：只差「退出去让批处理替换」。"""
         p = self.pal
+        note = ctx["note"]
+        if not note.winfo_manager():
+            note.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(10), 0),
+                      before=ctx["btn_row"])
         how = "校验通过" if info.get("verified") else "发布未提供校验值"
         note.configure(fg=p["soft"], cursor="arrow",
                        text="更新包已就绪（%s，%s）。点「立即更新」会重启并完成安装。"
                             % (info.get("version") or "", how))
+        btn = ctx["btn"]
         btn.set_enabled(True)
         btn.set_text("立即更新")
-        btn.set_command(lambda: self._update_apply(dlg, note, btn, info))
-        self._relayout_dialog(dlg)
+        btn.set_command(lambda: self._update_apply(ctx, info))
+        self._upd_show_bg(ctx, False)
+        self._relayout_dialog(ctx["dlg"])
 
-    def _update_apply(self, dlg, note, btn, info):
+    def _update_apply(self, ctx, info):
         """最后一步：存一份快照 → 拉起批处理 → 退出本进程。"""
+        note, btn = ctx["note"], ctx["btn"]
         btn.set_enabled(False)
         btn.set_text("正在重启…")
         # 快照固定落在 data/updates/，用户从「数据管理 → 导入数据」里直接能选到；
@@ -4420,8 +4571,9 @@ class UIMixin(object):
             note.configure(fg=MENU_DANGER, cursor="arrow",
                            text="没能启动更新程序：%s" % e)
             return
+        self._upd_job = None
         try:
-            dlg.destroy()
+            ctx["dlg"].destroy()
         except tk.TclError:
             pass
         self.root.destroy()
@@ -6090,9 +6242,11 @@ class UIMixin(object):
                   if x.get("id") == ALARM_INDEX_ID), None)
         if n is None:
             return
-        content, links = alarm_index_content(self.data)
+        content, links, tips = alarm_index_content(self.data)
         n["content"] = content
         n["links"] = links
+        # 被截断格子的全文只给悬停提示用：每次重算都换一份，不落库
+        self._alarm_cell_tips = tips
 
     def refresh_notes(self):
         p = self.pal
@@ -7205,6 +7359,9 @@ class UIMixin(object):
         # 矩形高亮同理：不清的话新笔记顶上会挂着上一篇那片蓝块，而它指向的
         # 已经不是同一批文字了（复制出来会是新笔记的内容，离谱且难查）。
         self._colsel_drop()
+        # 换笔记：上一张表里浮出的「格子全文」气泡不能跟着飘过来（它的定位
+        # 依据是旧正文，新正文里同一个位置早已是别的字）
+        self._hide_cell_tip()
         n = self.current_note()
         self._refresh_alarm_index()   # 汇总表正开着时，正文也要跟上最新状态
         # 先假设「编辑器里的不是这篇笔记的明文」：解锁失败时正文区放占位文字，

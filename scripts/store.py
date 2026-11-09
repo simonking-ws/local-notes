@@ -512,7 +512,17 @@ ALARM_INDEX_TITLE = "任务提醒列表"
 # tabs 只挂在 ALARM_ROW_TAG 上，普通笔记里的 \t 仍是默认制表位，也不用切笔记时
 # 还原 widget 级配置；具体像素在 app_ui._config_tags() 里按当前字号现算。
 ALARM_ROW_TAG = "alarm_row"
-ALARM_TASK_COL = 30      # 「任务」列显示宽度上限（半角列；约 15 个汉字）
+# 五列**固定宽度**（半角列，一个汉字算 2 列）。每一格超宽都截断加 …，鼠标悬浮
+# 在正文里由 app_actions._on_cell_motion 用 _alarm_cell_tips 查全文浮出来。
+# 这组数还决定整张表的宽度：默认窗口的正文区约 590px，半角一列约 9px，
+# 17+20+6+6+12 = 61 列 ≈ 549px，加列间空隙 573px —— 五列一屏放得下，不用横向拖。
+# 两个状态列只有 6 列，是因为格子里只写「是 / 否」—— 字段名在表头，格子里再
+# 重复一遍「已完成：」要多吃 4 个汉字宽，任务名就只剩七八个字了。
+# ⚠️ 改了这里要同步 app_ui._config_tags() 的制表位：那儿的列距就是按这组数算的，
+# 只改一边会出现「格子截得短、列却留得宽」的空当。
+ALARM_COLS = (17, 20, 6, 6, 12)
+ALARM_TASK_COL = ALARM_COLS[1]      # 旧名，留作兼容（「任务」列宽）
+ALARM_CELL_TAG = "ac_"              # 单元格标签前缀：ac_<行号>_<列号>，只挂被截断的格
 ALARM_HEADERS = ("提醒时间", "任务", "已完成", "已确认", "来源笔记")
 
 # 「系统」文件夹：程序自带的一格，专放内置说明笔记。用户不能改名、删除、移动它，
@@ -841,8 +851,13 @@ def _one_line(s):
             .replace("\t", " ").strip())
 
 
-def _clip_task(s, max_w):
-    """压成一行再按显示宽度截断；超长尾巴用 … 表示，全文回原笔记看。"""
+def _clip_cell(s, max_w):
+    """压成一行再按显示宽度截断；超宽尾巴用 … 表示，全文留给悬浮提示。
+
+    返回的字符串保证 `_disp_w(...) <= max_w`，所以它落在固定宽度的格子内、
+    不会把后面的列顶歪。真被截了才和入参不同 —— 调用方拿这个判断要不要挂
+    悬浮提示（没截的格子浮一条一模一样的文字只会碍事）。
+    """
     s = _one_line(s)
     if _disp_w(s) <= max_w:
         return s
@@ -874,21 +889,25 @@ def _alarm_row(cells):
 
 
 def alarm_index_content(data, now=None):
-    """扫全库任务提醒，返回「任务提醒列表」的 `(content, links)`。纯函数，不碰 UI。
+    """扫全库任务提醒，返回「任务提醒列表」的 `(content, links, tips)`。纯函数，不碰 UI。
 
     排版是一张 **五列表格**：提醒时间 / 任务 / 已完成 / 已确认 / 来源笔记，
     列间用制表符分隔、逐字符挂 ALARM_ROW_TAG；真正对齐由
     `app_ui._config_tags()` 配在这个标签上的 **tag 级制表位**按像素完成。
     不用空格补齐：正文字体中文 15px、半角空格 8px（1.875 倍，不是 2），
     按字数补空格会按汉字数累积误差，制表位则与内容长度完全无关。
-    数据列自带字段名（「已完成：是」），上面再加一行加粗表头点题。
+    上面一行加粗表头定字段名，数据行的状态列只写「是 / 否」（表头已经说过
+    这一列是什么，格子里再重复一遍字段名纯属占宽度）。
 
     - 已完成：`alarm.is_done()` = 提醒时刻已过，跟着时钟自动翻面，不落库。
     - 已确认：`settings["alarm_acked"]` 里有 `<note_id>|<alarm_id>` 才算 —— 只有
       用户真点过到点弹窗的「知道了」会写它；关机期间过期、回来自动补记的
       `alarm_fired` 不算确认（两条状态各管一件事）。
     - 有时间的按时间升序（最早该做的排最前），没设时间的沉底。
-    - 任务名压成一行，超长按显示宽度截断加 …；末尾 @源笔记标题 是 note: 内链。
+    - **五列都是固定宽度**（ALARM_COLS，按显示宽度算），超宽的格截断加 …；
+      被截断的那一格多挂一枚 `ac_<行>_<列>` 标签，全文按标签收进 `tips` ——
+      鼠标悬浮在正文里时由 app_actions 用它把原样文字浮出来。
+      `tips` 只在内存里用（不落库：它每次都跟着 content 现算）。
     """
     now = time.time() if now is None else now
     acked = (data.get("settings") or {}).get("alarm_acked") or {}
@@ -906,30 +925,43 @@ def alarm_index_content(data, now=None):
 
     out = _line(ALARM_INDEX_TITLE, ["title"])
     out += _line("共 %d 条 · 提醒时间已过即算「已完成」，点过到点弹窗的「知道了」才算「已确认」。"
-                 "任务过长会截断，点 @笔记名 跳回原文看全文。" % len(rows), ["quote"])
+                 "过长的格子会截断，鼠标停上去看全文，点 @笔记名 跳回原文。" % len(rows), ["quote"])
     out += [["t", "\n", []]]
     if not rows:
         out += _line("还没有任务提醒。在任意笔记里点工具栏的小闹钟插入一条，这里会自动列出来。")
-        return out, {}
+        return out, {}, {}
 
     # 表头与数据行用同一套制表位，列起点才会严丝合缝地落在同一条竖线上
-    out += _alarm_row([(h, ["bold"]) for h in ALARM_HEADERS])
+    out += _alarm_row([(_clip_cell(h, ALARM_COLS[i]), ["bold"])
+                       for i, h in enumerate(ALARM_HEADERS)])
 
-    links = {}
+    links, tips = {}, {}
     for i, (nid, d, title) in enumerate(rows, 1):
         tag = "lk_%d" % i
         # note: 前缀由 mention.note_url 定义；这里的字符串必须与它一致，
         # 否则 _on_link_click 认不出内链、点击会当成普通网址丢给浏览器
         links[tag] = "note:%s" % nid
         when = alarm.fmt_full(d.get("at")) or "未设时间"
-        done = "已完成：" + ("是" if alarm.is_done(d, now) else "否")
-        conf = "已确认：" + ("是" if acked.get("%s|%s" % (nid, d.get("id") or "")) else "否")
-        task = _clip_task(d.get("text"), ALARM_TASK_COL) or "（未填写任务）"
-        # lk_N 记 URL，"link" 是共用可点标签（点击/手型事件绑在它上面），两者都要；
-        # ALARM_ROW_TAG 也必须一起挂，否则这一格会跳回默认制表位
-        out += _alarm_row([(when, []), (task, []), (done, []), (conf, []),
-                           ("@" + _one_line(title), [tag, "link"])])
-    return out, links
+        # 只写「是 / 否」：「已完成」「已确认」这两个字段名在表头上，格子里再重复
+        # 一遍要多占 4 个汉字宽，那点宽度留给任务名更值
+        done = "是" if alarm.is_done(d, now) else "否"
+        conf = "是" if acked.get("%s|%s" % (nid, d.get("id") or "")) else "否"
+        task = _one_line(d.get("text")) or "（未填写任务）"
+        head = "@" + _one_line(title)
+        cells = []
+        for col, full in enumerate((when, task, done, conf, head)):
+            shown = _clip_cell(full, ALARM_COLS[col])
+            # 来源笔记那格：lk_N 记 URL，"link" 是共用的可点标签（点击/手型事件
+            # 绑在它上面），两者都要；ALARM_ROW_TAG 由 _alarm_row 统一挂
+            extra = [tag, "link"] if col == 4 else []
+            if shown != full:
+                # 只有真被截断的格才挂标签：没截的格子浮一条一模一样的文字只是噪音
+                cell_tag = "%s%d_%d" % (ALARM_CELL_TAG, i, col + 1)
+                tips[cell_tag] = full
+                extra = extra + [cell_tag]
+            cells.append((shown, extra))
+        out += _alarm_row(cells)
+    return out, links, tips
 
 
 def _ensure_alarm_index_note(data, now=None):
@@ -961,7 +993,9 @@ def _ensure_alarm_index_note(data, now=None):
         me["created"] = ts
         changed = True
     data["notes"] = notes
-    content, links = alarm_index_content(data, now)
+    # tips（被截断格子的全文）只在界面里悬停时用：它每次都由 content 现算，
+    # 落库毫无意义，这里直接丢掉
+    content, links, _tips = alarm_index_content(data, now)
     if me.get("content") != content:
         me["content"] = content
         changed = True

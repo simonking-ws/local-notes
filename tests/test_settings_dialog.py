@@ -656,6 +656,112 @@ class TestSettingsDialog(unittest.TestCase):
 
         self._with_visible_host(check)
 
+    # ---------- 下载更新：点「后台下载」关窗，任务继续 ----------
+    def _about(self):
+        self._close_dialogs()
+        self.app.open_about()
+        self.root.update_idletasks()
+        self.root.update()
+        return self._dialogs()[-1]
+
+    def _rbtn(self, win, text):
+        """按文字找圆角按钮（RoundButton 没有 -text 选项，只能比 `.text`）。"""
+        import widgets
+        return next((w for w in _walk(win)
+                     if isinstance(w, widgets.RoundButton) and w.text == text), None)
+
+    def _label_texts(self, win):
+        out = []
+        for w in _walk(win):
+            if isinstance(w, tk.Label):
+                try:
+                    out.append(str(w.cget("text")))
+                except tk.TclError:
+                    pass
+        return out
+
+    def _pump(self, cond, timeout=8.0):
+        """转事件循环直到 cond() 为真。下载在子线程里，进度靠 after 轮询推进。"""
+        import time
+        end = time.time() + timeout
+        while time.time() < end:
+            self.root.update_idletasks()
+            self.root.update()
+            if cond():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_background_download_keeps_running_after_closing_about(self):
+        """点「后台下载」关掉关于窗，下载不能跟着没；再开关于要能看到进度。
+
+        锁的是「任务挂在哪」：任务和窗口同生命周期的话，窗一销毁、轮询撞上
+        `winfo_exists()` 就静默退出，用户等于点了「取消」却看不出来 —— 过半小时
+        也不知道包到底下好没有。
+        """
+        import threading
+        from unittest import mock
+        import updater
+
+        release = {"state": "new", "version": "v9.9.9", "html_url": "",
+                   "assets": [{"name": "x.zip", "size": 1000,
+                               "url": "http://127.0.0.1:1/x.zip", "digest": ""}]}
+        done_info = {"version": "v9.9.9", "dir": "", "src": "", "exe": "",
+                     "sha256": "", "verified": True}
+        gate = threading.Event()
+
+        def fake_prepare(res, progress):
+            progress["done"], progress["total"] = 500, 1000
+            gate.wait(10)                   # 模拟"还在下载"
+            progress["done"] = 1000
+            return dict(done_info)
+
+        self.app._upd_job = None
+        try:
+            with mock.patch.object(updater, "check", side_effect=lambda: dict(release)), \
+                    mock.patch.object(updater, "prepare", side_effect=fake_prepare), \
+                    mock.patch.object(self.app, "_update_blocked_reason",
+                                      return_value=""):
+                dlg = self._about()
+                self._rbtn(dlg, "检查更新")._on_release(None)
+                self.assertTrue(self._pump(lambda: self._rbtn(dlg, "下载更新")),
+                                "检查更新没给出「下载更新」")
+                bg = self._rbtn(dlg, "后台下载")
+                self.assertIsNotNone(bg, "关于窗里没有「后台下载」按钮")
+                self.assertFalse(bg.winfo_manager(),
+                                 "还没开始下载就把「后台下载」摆出来了")
+
+                self._rbtn(dlg, "下载更新")._on_release(None)
+                self.assertTrue(
+                    self._pump(lambda: any("正在下载" in t
+                                           for t in self._label_texts(dlg))),
+                    "点了下载没有显示进度")
+                self.assertTrue(bg.winfo_manager(), "下载中没出现「后台下载」")
+
+                bg._on_release(None)
+                self.assertFalse(dlg.winfo_exists(), "点「后台下载」没关掉关于窗")
+                self.assertTrue(self.app._upd_downloading(),
+                                "关窗把下载任务一起弄没了")
+
+                dlg2 = self._about()
+                self.assertTrue(
+                    self._pump(lambda: any("正在下载" in t
+                                           for t in self._label_texts(dlg2))),
+                    "重新打开关于窗没有显示下载进度")
+                bg2 = self._rbtn(dlg2, "后台下载")
+                self.assertIsNotNone(bg2, "重新打开后「后台下载」按钮没了")
+                self.assertTrue(bg2.winfo_manager(),
+                                "重新打开后「后台下载」没摆出来")
+
+                gate.set()
+                self.assertTrue(self._pump(lambda: self._rbtn(dlg2, "立即更新")),
+                                "下载完成没变成「立即更新」")
+                self.assertEqual(self.app._upd_job["state"], "ready")
+        finally:
+            gate.set()
+            self.app._upd_job = None
+            self._close_dialogs()
+
     def test_toolbar_color_button_shares_fg_with_peers_in_every_theme(self):
         """工具栏「文字颜色 / 下划线颜色」(A) 的字色必须和 B/I/U 一模一样。
 
@@ -1034,8 +1140,13 @@ class TestSettingsDialog(unittest.TestCase):
             self.root.update_idletasks()
             body = app.text.get("1.0", "end")
             self.assertIn("窗口测试提醒", body)
-            self.assertIn("已完成：是", body)
-            self.assertIn("已确认：否", body)
+            # 状态列只写是 / 否（字段名在表头），按格切出来断言
+            rows = [ln.split("\t") for ln in body.split("\n")
+                    if len(ln.split("\t")) == 5]
+            probe = [r for r in rows if r[1] == "窗口测试提醒"]
+            self.assertEqual(len(probe), 1, "没找到刚插入的那条提醒")
+            self.assertEqual(probe[0][2], "是", "时间已过 = 已完成")
+            self.assertEqual(probe[0][3], "否", "没点过弹窗 = 未确认")
             ranges = app.text.tag_ranges("link")
             self.assertTrue(ranges, "汇总表里没有可点的内链")
             # 库里可能本来就有别的提醒（按时间排在前面），别假定第一条就是 src。
@@ -1086,8 +1197,8 @@ class TestSettingsDialog(unittest.TestCase):
             col_x = {2: [], 3: [], 4: []}
             for ln in range(1, last + 1):
                 cells = t.get("%d.0" % ln, "%d.end" % ln).split("\t")
-                if len(cells) != 5 or not cells[2].startswith("已完成："):
-                    continue            # 只量数据行，表头另算
+                if len(cells) != 5 or cells[2] not in ("是", "否"):
+                    continue            # 只量数据行（表头那行的状态列是字段名）
                 pos = 0
                 for i, cell in enumerate(cells):
                     if i:
@@ -1103,6 +1214,54 @@ class TestSettingsDialog(unittest.TestCase):
                 self.assertEqual(len(set(xs)), 1,
                                  "第 %d 列没垂直对齐：%r" % (col + 1, xs))
         finally:
+            self._alarm_restore(old_f, old_n, src, saved)
+
+    def test_alarm_clipped_cell_shows_full_text_on_hover(self):
+        """超宽格子截成 …，指针压上去要浮出全文，移开就收起。
+
+        这条路只做展示：汇总表是只读报表，别做成链接那种可就地编辑的小窗。
+        """
+        import datetime
+        import store
+        app = self.app
+        old_f, old_n = app.data.get("current_folder"), app.data.get("current_note")
+        src = next(n for n in app.data["notes"]
+                   if not n.get("sample") and n["id"] != store.ALARM_INDEX_ID)
+        saved = list(src.get("content") or [])
+        long_task = ("这是一个特别长的任务名称用来验证超过列宽之后会被截断"
+                     "显示省略号并能悬浮看到全文")
+        try:
+            src["content"] = saved + [
+                ["alarm", {"id": "h1", "text": long_task,
+                           "at": datetime.datetime.now().timestamp()}]]
+            app._refresh_alarm_index()
+            app.select_folder("f_alarm")
+            app.select_note(store.ALARM_INDEX_ID)
+            self.root.update_idletasks()
+            self.root.update()
+
+            tag = next((k for k, v in app._alarm_cell_tips.items()
+                        if v == long_task), None)
+            self.assertIsNotNone(tag, "超长任务没进 tips，悬浮就没有全文可看")
+            r = app.text.tag_ranges(tag)
+            self.assertTrue(r, "格子标签没挂到正文上")
+            bb = app.text.bbox(r[0])
+            self.assertTrue(bb, "格子不在可视区，量不到坐标")
+            app.text.event_generate("<Motion>", x=bb[0] + 4,
+                                    y=bb[1] + bb[3] // 2)
+            self.root.update()
+            win = getattr(app, "_cell_tip_win", None)
+            self.assertIsNotNone(win, "悬停在截断的格子上没有浮出全文")
+            self.assertIn(long_task,
+                          [w.cget("text") for w in win.winfo_children()],
+                          "浮出来的不是原文全文")
+
+            app.text.event_generate("<Motion>", x=2, y=2)
+            self.root.update()
+            self.assertIsNone(getattr(app, "_cell_tip_win", None),
+                              "指针移开后浮窗还挂着")
+        finally:
+            app._hide_cell_tip()
             self._alarm_restore(old_f, old_n, src, saved)
 
     def test_alarm_tab_stops_follow_body_size(self):
