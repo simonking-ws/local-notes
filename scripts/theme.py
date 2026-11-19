@@ -20,6 +20,9 @@ def _res_dir():
 _RES = _res_dir()
 
 FONT = ("PingFang SC", 13)  # 中文优先，回退雅黑
+# 正文字号上下限：读库兜底、设置窗滑杆、预览盒按最大字号算高都引用同一对常量，
+# 免得改边界时漏改一处（预览盒尺寸按 MAX 算，改小 MAX 忘了改这里会留一大片空白）。
+BODY_SIZE_MIN, BODY_SIZE_MAX = 8, 25
 # 若系统无 PingFang，则退回微软雅黑
 try:
     import tkinter.font as tkfont

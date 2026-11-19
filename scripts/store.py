@@ -975,11 +975,18 @@ def _note_head(n):
     return "已加密笔记" if secret.is_blob(n.get("sec")) else "未命名笔记"
 
 
+def _char_w(ch):
+    """单字符显示宽度：全角 / 东亚宽字符与省略号算 2 列，其余 1 列。
+
+    由 _disp_w 与 _clip_cell 共用 —— 这两处口径必须一致，否则表格里算得下、
+    截出来却超宽，列就被顶歪了。抽出来避免将来改一处漏一处。
+    """
+    return 2 if (ch == "…" or unicodedata.east_asian_width(ch) in ("W", "F")) else 1
+
+
 def _disp_w(s):
     """显示宽度：全角 / 东亚宽字符算 2 列，其余 1 列；省略号按 2 列。"""
-    return sum(2 if (ch == "…" or
-                     unicodedata.east_asian_width(ch) in ("W", "F")) else 1
-               for ch in s)
+    return sum(_char_w(ch) for ch in s)
 
 
 def _one_line(s):
@@ -1001,8 +1008,7 @@ def _clip_cell(s, max_w):
     budget = max_w - 2                 # 给省略号留 2 列
     out, used = [], 0
     for ch in s:
-        w = 2 if (ch == "…" or
-                  unicodedata.east_asian_width(ch) in ("W", "F")) else 1
+        w = _char_w(ch)
         if used + w > budget:
             break
         out.append(ch)
@@ -1025,8 +1031,12 @@ def _alarm_row(cells):
     return out + [["t", "\n", []]]
 
 
-def alarm_index_content(data, now=None):
+def alarm_index_content(data, now=None, rows=None):
     """扫全库任务提醒，返回「任务提醒列表」的 `(content, links, tips)`。纯函数，不碰 UI。
+
+    `rows` 是可选的预扫描结果 `[(note_id, alarm_dict, note_head)]`：调用方（如
+    `_alarm_check`）若刚扫过一遍全库找提醒，可以把它传进来复用，省掉这里再扫一遍。
+    不传就照旧自己扫。
 
     排版是一张 **四列表格**：提醒时间 / 任务 / 状态 / 来源笔记，列间用制表符
     分隔、逐字符挂 ALARM_ROW_TAG；真正对齐由 `app_ui._config_tags()` 配在
@@ -1047,15 +1057,16 @@ def alarm_index_content(data, now=None):
     """
     now = time.time() if now is None else now
     acked = (data.get("settings") or {}).get("alarm_acked") or {}
-    rows = []
-    for n in data.get("notes") or []:
-        if not isinstance(n, dict) or n.get("id") == ALARM_INDEX_ID:
-            continue                      # 别把汇总笔记自己也算进去
-        for it in n.get("content") or []:
-            if (not isinstance(it, list) or len(it) < 2 or it[0] != "alarm"
-                    or not isinstance(it[1], dict)):
-                continue
-            rows.append((n.get("id") or "", it[1], _note_head(n)))
+    if rows is None:
+        rows = []
+        for n in data.get("notes") or []:
+            if not isinstance(n, dict) or n.get("id") == ALARM_INDEX_ID:
+                continue                  # 别把汇总笔记自己也算进去
+            for it in n.get("content") or []:
+                if (not isinstance(it, list) or len(it) < 2 or it[0] != "alarm"
+                        or not isinstance(it[1], dict)):
+                    continue
+                rows.append((n.get("id") or "", it[1], _note_head(n)))
     def _sort_key(r):
         d = r[1]
         if not d.get("at"):
@@ -1776,7 +1787,10 @@ def dump_pending(d, reason=""):
     它们一起算进校验和，免得兜底文件自己先「校验不通过」。
     """
     from backup import encode as _encode   # 延迟导入：backup 依赖本模块，写在这里断环
-    path = os.path.join(BASE, "%s%s.json" % (PENDING_PREFIX, time.strftime("%Y%m%d-%H%M%S")))
+    # 加毫秒后缀：同一秒内多次保存失败（如连续重载）不能互相覆盖兜底快照，
+    # 早先那份可能才是更完整的现场。
+    stamp = time.strftime("%Y%m%d-%H%M%S") + "-%03d" % (int(time.time() * 1000) % 1000)
+    path = os.path.join(BASE, "%s%s.json" % (PENDING_PREFIX, stamp))
     try:
         snap = _encode(d, extra={"_pending": True, "_reason": str(reason or "")})
     except Exception:

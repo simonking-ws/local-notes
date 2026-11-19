@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 import types                                            # noqa: E402
 import tkinter as tk                                    # noqa: E402
+import dpi                                              # noqa: E402
 import app_ui                                           # noqa: E402
 import app_actions                                      # noqa: E402
 
@@ -196,9 +197,53 @@ class EditorFoldTest(unittest.TestCase):
         chip = self.h._fold_chips[tag]
         self.assertEqual(self.h.text.index(str(chip)),
                          self.h._fold_chip_expected(2))
-        self.assertEqual(chip._fold_label, "⋯ 2 行")
+        self.assertEqual(chip._fold_label, "⋯ 2 行已折叠")
+        # 占位条是横贯的淡底虚线条，宽于旧版「⋯ N 行」文字片
+        self.assertGreater(int(chip.cget("width")), dpi.px(150))
+        self.assertEqual(int(chip.cget("height")), dpi.px(22))
         # chip 不占字符：正文内容原封不动
         self.assertIn("第三行", self.h.text.get("1.0", "end"))
+
+    def test_chip_click_unfolds(self):
+        """方案 B：点占位条整条 → 展开对应折叠块。"""
+        self._fold("2.0", "5.0")
+        tag = self.h._folds[0]
+        chip = self.h._fold_chips[tag]
+        self.h._fold_chip_click(tag)
+        self.assertEqual(self.h._folds, [])
+        self.assertFalse(chip.winfo_exists())
+
+    def test_chip_hover_repaints(self):
+        """方案 B：悬停只改底色档位、不折叠、不动撤销栈。"""
+        self._fold("2.0", "5.0")
+        chip = self.h._fold_chips[self.h._folds[0]]
+        self.h._chip_hover(chip, True)
+        self.assertTrue(chip._fold_hover)
+        self.h._chip_hover(chip, False)
+        self.assertFalse(chip._fold_hover)
+        self.assertEqual(len(self.h._folds), 1)
+
+    def test_gutter_fold_span_line(self):
+        """方案 D：折叠头在 gutter 里画 ▶ 之外，还画一条向下的竖线串到下一格。"""
+        self._fold("2.0", "5.0")
+        drawn = []
+
+        class _FakeG(object):
+            def create_line(self, *a, **kw):
+                drawn.append((a, kw))
+
+            def create_polygon(self, *a, **kw):
+                pass
+
+        g = _FakeG()
+        self.h._gutter_fold_items = {}
+        self.h._gutter_fold_mark(g, 2, 40, 20,
+                                 {"editor": "#fff", "accent": "#4a7"},
+                                 digit_right=20, slot_w=18)
+        self.assertEqual(len(drawn), 1, "应有 1 条竖线")
+        _a, kw = drawn[0]
+        self.assertIn("fill", kw)                  # 淡 accent，非默认黑
+        self.assertNotEqual(kw["fill"], "")
 
     def test_sync_repositions_chip_after_edit(self):
         """在折叠头上补字后，chip 应回到新的行末位置。"""

@@ -27,7 +27,7 @@ from store import (load_data, save_data, store, plain_of, _fix_sample_note,
                     RECYCLE_FOLDER, recycle_item_view,
                     APP_NAME, SEAL_TITLE_MASK, set_save_error_hook,
                     dump_pending, pending_files)
-from theme import build_palette, DEFAULT_THEME, THEMES
+from theme import build_palette, DEFAULT_THEME, THEMES, BODY_SIZE_MIN, BODY_SIZE_MAX
 from widgets import (SIDEBAR_W, LIST_W, SIDE_MIN, SIDE_MAX, LIST_MIN, LIST_MAX)
 from app_ui import UIMixin
 from app_actions import ActionsMixin
@@ -390,7 +390,11 @@ class NotesApp(UIMixin, ActionsMixin):
             idx = {n["id"]: n for n in self.data["notes"]}
             ids = store().search_ids(self.data["current_folder"], q,
                                      self.folder_subtree(self.data["current_folder"]))
-            return [idx[i] for i in ids if i in idx]
+            hits = [idx[i] for i in ids if i in idx]
+            # ⚠️ 必须按 note_sort_key 重排，跟不搜索时（下方 sorted）同一套口径。
+            # SQLite 那边排的是 pinned/starred/updated —— 既忽略手动拖拽的 order，
+            # 又把星标提到手动顺序之前；直接用 search_ids 的顺序，搜与不搜列表会跳变。
+            return sorted(hits, key=self.note_sort_key)
         lst = self.folder_notes(self.data["current_folder"])
         return sorted(lst, key=self.note_sort_key)
 
@@ -536,7 +540,12 @@ class NotesApp(UIMixin, ActionsMixin):
         n = time.localtime()
         if d.tm_yday == n.tm_yday and d.tm_year == n.tm_year:
             return time.strftime("%H:%M", d)
-        if (n.tm_yday - d.tm_yday) == 1 and d.tm_year == n.tm_year:
+        # 「昨天」用日期对象做差：tm_yday 差 1 且同年的写法在 1 月 1 日看去年
+        # 12 月 31 日会失效（跨年 yday 不连续），那样会显示日期而不是「昨天」。
+        import datetime
+        today = datetime.date(n.tm_year, n.tm_mon, n.tm_mday)
+        that = datetime.date(d.tm_year, d.tm_mon, d.tm_mday)
+        if (today - that).days == 1:
             return "昨天"
         if d.tm_year == n.tm_year:
             return "%d月%d日" % (d.tm_mon, d.tm_mday)
@@ -556,7 +565,7 @@ class NotesApp(UIMixin, ActionsMixin):
             sz = int(self.data.get("settings", {}).get("body_size", 12))
         except Exception:
             sz = 12
-        return min(25, max(8, sz))
+        return min(BODY_SIZE_MAX, max(BODY_SIZE_MIN, sz))
 
     def _read_side_w(self):
         """文件夹列宽度（像素）。拖过分隔条就记在 settings["side_w"]，没记就用默认 216。"""

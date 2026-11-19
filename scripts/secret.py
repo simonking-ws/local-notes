@@ -33,6 +33,10 @@ ITERATIONS = 200000          # 20 万次：本机约 60~80ms，解锁时一次�
 SALT_LEN = 16
 NONCE_LEN = 12
 _KEY_LEN = 32
+# 解密前校验密文头里的 iter：头在验 tag 之前就能被改（损坏的备份 / 恶意构造的
+# sec 块），写成一个巨大值会把解锁卡死数分钟。下限放得很低以兼容历史版本，
+# 上限与 backup 容器保持一致。这不是安全边界（伪造 tag 仍需口令），纯防 DoS。
+MIN_ITER, MAX_ITER = 1000, 5000000
 
 
 class BadPassword(Exception):
@@ -76,6 +80,17 @@ def _auth(mac_key, blob):
         _b64d(blob["nonce"]),
         _b64d(blob["data"]),
     ]), hashlib.sha256).digest()
+
+
+def _check_iters(value, default):
+    """把密文头里的 iter 读成合法整数，越界抛 BadPassword（防 DoS）。"""
+    try:
+        iters = int(value or default)
+    except (TypeError, ValueError):
+        raise BadPassword("密文头里的派生参数不合法")
+    if iters < MIN_ITER or iters > MAX_ITER:
+        raise BadPassword("密文头里的派生参数不合法")
+    return iters
 
 
 def derive_key(password, salt, iterations=ITERATIONS):
@@ -151,10 +166,10 @@ def open_with_key(blob, key):
 def open_sealed(blob, password):
     """校验并解密，返回 (明文, 密钥)。口令错 / 密文被改动都抛 BadPassword。"""
     try:
-        iters = int(blob.get("iter") or ITERATIONS)
         salt = _b64d(blob["salt"])
     except Exception:
         raise BadPassword("密文头损坏")
+    iters = _check_iters(blob.get("iter"), ITERATIONS)
     key = derive_key(password, salt, iters)
     return open_with_key(blob, key), key
 
@@ -375,11 +390,11 @@ def open_recovery(blob, code):
         raise BadPassword("恢复码不属于这篇笔记")
     try:
         salt = _b64d(rc.get("salt"))
-        iters = int(rc.get("iter") or RC_ITERATIONS)
         wrap = _b64d(rc.get("wrap"))
         want = _b64d(rc.get("tag"))
     except Exception:
         raise BadPassword("恢复槽已损坏")
+    iters = _check_iters(rc.get("iter"), RC_ITERATIONS)
     if len(wrap) != _KEY_LEN:
         raise BadPassword("恢复槽已损坏")
     kek = hashlib.pbkdf2_hmac("sha256", c.encode("ascii"), salt, iters, _KEY_LEN)

@@ -258,6 +258,14 @@ class TestFilename(unittest.TestCase):
         name = exporter.safe_filename("长" * 200, "txt")
         self.assertLessEqual(len(name), 80 + 4)
 
+    def test_windows_reserved_names(self):
+        """标题是 CON / COM1 等保留设备名：加前缀规避，否则导出会失败或写进设备。"""
+        for reserved in ("CON", "con", "PRN", "AUX", "NUL", "COM1", "LPT9"):
+            name = exporter.safe_filename(reserved, "md")
+            self.assertTrue(name.startswith("_"),
+                            "保留名 %s 没规避：%s" % (reserved, name))
+        self.assertEqual(exporter.safe_filename("CON", "md"), "_CON.md")
+
 
 if __name__ == "__main__":
     unittest.main()

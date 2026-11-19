@@ -2821,7 +2821,7 @@ class TabStrip(tk.Frame):
 
     def _clip(self, s, avail):
         """按像素截断，超了补省略号（Tk 的 Label 不会自己省略）。"""
-        if self._font is None or avail <= 8:
+        if self._font is None or avail <= dpi.px(8):
             return s
         if self._measure(s) <= avail:
             return s

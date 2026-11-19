@@ -4911,6 +4911,8 @@ class ActionsMixin(object):
         if self._alarm_card_state(data) == alarm.STATE_PENDING:
             m.add("完成（记为已确认）", enabled=not ro,
                   command=lambda: self._alarm_ack_card(name))
+        # 危险项前加分隔线，跟笔记 / 文件夹 / 回收站菜单的分组保持一致
+        m.add_separator()
         m.add("删除提醒", danger=True, enabled=not ro,
               command=lambda: self._alarm_remove(name))
         m.popup(event.x_root, event.y_root)
@@ -4967,15 +4969,33 @@ class ActionsMixin(object):
         self._alarm_start_tick()
 
     def _alarm_prune_keys(self):
-        """清掉过期槽位键：重复提醒每天都生一个 @2026-11-18，
-        不清的话 settings 会无限长（一年 365 条 × 提醒数）。只保留近 30 天。"""
+        """清掉过期 / 悬空槽位键：重复提醒每天都生一个 @2026-11-18，
+        不清的话 settings 会无限长（一年 365 条 × 提醒数）。只保留近 30 天。
+        同时清掉指向已不存在笔记的键（删笔记时没即时清，这里统一兜底）。"""
         try:
             cutoff = (datetime.date.today() - datetime.timedelta(days=30)).isoformat()
+            live_ids = {n.get("id") for n in (self.data.get("notes") or [])
+                        if isinstance(n, dict)}
+            # 回收站里的笔记还能还原：它们的提醒状态必须留着，不能当悬空键清掉
+            try:
+                import imgstore
+                live_ids |= {n.get("id") for n in
+                             imgstore.notes_from_recycle(store().recycle_all())
+                             if isinstance(n, dict)}
+            except Exception:
+                pass
             for m in (self._alarm_fired_map(), self._alarm_acked_map()):
                 # once 的旧键没有 @，保留；带 @ 的只留日期 >= cutoff
                 gone = []
                 for k in m:
-                    if not isinstance(k, str) or "@" not in k:
+                    if not isinstance(k, str):
+                        continue
+                    # "<note_id>|<alarm_id>[@slot]"：note_id 已不在全库 → 悬空键
+                    owner = k.split("|", 1)[0]
+                    if owner and owner not in live_ids:
+                        gone.append(k)
+                        continue
+                    if "@" not in k:
                         continue
                     tail = k.rsplit("@", 1)[1]
                     if tail != "start" and tail < cutoff:
@@ -5012,12 +5032,16 @@ class ActionsMixin(object):
         now = time.time()
         fired = self._alarm_fired_map()
         items = []
+        rows = []          # 顺带备好汇总表要的三元组，省得下面再全库扫一遍
         for n in self.data.get("notes") or []:
             nid = n.get("id")
+            if nid == ALARM_INDEX_ID:       # 汇总笔记自己不算（与 alarm_index_content 同口径）
+                continue
             for it in n.get("content") or []:
                 if it[0] != "alarm" or len(it) < 2 or not isinstance(it[1], dict):
                     continue
                 d = it[1]
+                rows.append((nid or "", d, _note_head(n)))
                 if d.get("at"):
                     items.append((nid, d))
         # 过滤「当前周期已响过」交给 due_all：重复提醒的键带 @日期，
@@ -5059,7 +5083,7 @@ class ActionsMixin(object):
                         if x.get("id") == ALARM_INDEX_ID), None)
             if idx is not None:
                 old = idx.get("content")
-                self._refresh_alarm_index()
+                self._refresh_alarm_index(rows=rows)   # 复用本轮扫描，少扫一遍全库
                 if idx.get("content") != old:
                     self.load_editor()
 

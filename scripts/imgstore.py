@@ -241,12 +241,33 @@ def _proxy_url(url, tpl=None):
     return (tpl or IMAGE_PROXY).format(quote(tail, safe="/:@?"))
 
 
+# 远程图下载上限：一个失控 / 恶意 URL 返回超大响应会在 resp.read() 处把内存
+# 吃掉。正常图片远小于此，超限立即中止。
+MAX_FETCH_BYTES = 40 * 1024 * 1024
+
+
 def _http_open(u, timeout=20.0):
     """统一 HTTP 入口（独立成函数便于测试替换）。"""
     import urllib.request
     req = urllib.request.Request(u, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+        # Content-Length 预检（多数服务器会给），省得已经下完才发现超限
+        try:
+            declared = int(resp.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            declared = 0
+        if declared > MAX_FETCH_BYTES:
+            raise ValueError("图片太大（>%d MB），已跳过。" % (MAX_FETCH_BYTES >> 20))
+        chunks, total = [], 0
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_FETCH_BYTES:
+                raise ValueError("图片太大（>%d MB），已跳过。" % (MAX_FETCH_BYTES >> 20))
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 
 def fetch_bytes(url, timeout=20.0):
@@ -365,13 +386,17 @@ def gc_orphans(notes, base=None, dry_run=False, keep=()):
     删除笔记 / 图床上传成功后调用；回收站快照里的笔记也算引用方（调用方把
     回收站 payload 里的 notes 一起传进来），否则「删了还能还原」就断了图。
     """
-    refs = collect_refs(notes) | set(str(x) for x in (keep or ()))
     d = media_dir(base)
     removed = []
     try:
-        names = os.listdir(d)
+        names = [x for x in os.listdir(d) if _NAME_RE.match(x)]
     except OSError:
         return removed
+    if not names:
+        # 常见情况（全库没图 / 图已删净）：media 无合法 PNG，直接返回，
+        # 省掉 collect_refs 遍历全库 content —— _flush_save 每次落库都会走到这。
+        return removed
+    refs = collect_refs(notes) | set(str(x) for x in (keep or ()))
     for name in names:
         if not _NAME_RE.match(name):
             continue

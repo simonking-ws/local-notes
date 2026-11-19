@@ -337,8 +337,8 @@ class TestSettingsDialog(unittest.TestCase):
         track = [str(slider.itemcget(i, "fill")).lower() for i in slider.find_all()]
         self.assertIn(new_pal["accent"].lower(), track, "滑杆轨道还画着旧主题色")
         rounds = [w for w in _walk(dlg) if isinstance(w, widgets.RoundButton)]
-        # 五枚：全不选 / 全选（工具栏节）+ 测试上传（图片节）+ 确定 / 取消
-        self.assertEqual(len(rounds), 5, "五枚圆角按钮不全了")
+        # 六枚：全不选 / 全选（工具栏节）+ 浏览 / 测试上传（图片节）+ 确定 / 取消
+        self.assertEqual(len(rounds), 6, "六枚圆角按钮不全了")
         for b in rounds:
             self.assertEqual(str(b.cget("bg")).lower(), new_pal["editor"].lower(),
                              "按钮画布底色没换")
@@ -375,6 +375,78 @@ class TestSettingsDialog(unittest.TestCase):
                                msg="换主题把滚动位置甩回顶部了")
         self.app.set_theme("forest")
         self._close_dialogs()
+
+    def test_find_bar_hover_uses_current_theme_after_switch(self):
+        """查找浮条按钮的悬停色必须跟着当前主题走，不能闪回建窗时的旧板。
+
+        `_find_open` 建浮条时按钮的 <Enter>/<Leave> 闭包若捕获旧 pal，换肤后
+        `_restyle_find_bar` 只重配静态色、不重绑事件，一悬停就冒出旧主题色。
+        """
+        import widgets
+        from theme import build_palette
+        self._close_dialogs()
+        self.app.set_theme("light")
+        self.app._find_open()                 # 建浮条，按钮绑定此时捕获 light 板
+        self.root.update_idletasks()
+        bar = self.app._find_bar
+        self.assertIsNotNone(bar, "查找浮条没建起来")
+        # 找一枚有 hand2 光标的按钮 Label（✕ / ↓ / ↑）
+        btn = next((w for w in _walk(bar) if isinstance(w, tk.Label)
+                    and str(w.cget("cursor")) == "hand2"), None)
+        self.assertIsNotNone(btn, "找不到查找浮条按钮")
+
+        self.app.set_theme("dark")            # 换肤：pal 换成新对象
+        self.root.update_idletasks()
+        new_pal = dict(build_palette("dark"))
+        btn.event_generate("<Enter>")
+        self.root.update_idletasks()
+        # 悬停用 _hover_bg(editor) 派生、文字用 text；两者都必须来自新板
+        from app_ui import _hover_bg
+        self.assertEqual(str(btn.cget("bg")).lower(),
+                         _hover_bg(new_pal["editor"]).lower(),
+                         "悬停底色闪回了旧主题")
+        self.assertEqual(str(btn.cget("fg")).lower(), new_pal["text"].lower(),
+                         "悬停字色闪回了旧主题")
+        btn.event_generate("<Leave>")
+        self.root.update_idletasks()
+        self.assertEqual(str(btn.cget("bg")).lower(), new_pal["editor"].lower(),
+                         "离开后浮条底色闪回了旧主题")
+        self.app.set_theme("forest")
+        self._close_dialogs()
+
+    def test_cancel_rolls_back_theme_and_font(self):
+        """主题 / 字体是点选即落库的；点「取消」必须把它们也还原。
+
+        同窗的字号 / 勾选靠「确定」收尾，这两项却是即时生效 —— 若取消不回滚，
+        用户点了取消还留着半路改掉的皮肤和字体，语义自相矛盾。
+        """
+        import widgets
+        self.app.set_theme("forest")
+        self.app.ui_font = ""
+        self.app.data.setdefault("settings", {})["font_family"] = ""
+        self.root.update_idletasks()
+        dlg = self._open()
+
+        # 在窗内改主题 + 改字体（都即时落库）
+        self._switch(dlg, "石墨灰")
+        fam_cb = next(w for w in _walk(dlg) if isinstance(w, widgets.ThemedComboBox))
+        idx = fam_cb._values.index("微软雅黑")
+        fam_cb._choose(idx)          # 走完整选择路径，触发 on_family 即时落库
+        self.root.update_idletasks()
+
+        self.assertEqual(self.app._current_theme(), "dark", "前置：主题没切成石墨灰")
+        self.assertEqual(self.app.ui_font, "Microsoft YaHei", "前置：字体没切成微软雅黑")
+
+        # 点「取消」
+        rounds = [w for w in _walk(dlg) if isinstance(w, widgets.RoundButton)]
+        cancel_btn = next(b for b in rounds if b.text == "取消")
+        cancel_btn.command()          # command() 返回回调本身，直接调用
+        self.root.update_idletasks()
+
+        self.assertEqual(self.app._current_theme(), "forest", "取消后主题没回滚")
+        self.assertEqual((self.app.ui_font or ""), "", "取消后字体没回滚")
+        self.assertEqual(self.app.data["settings"].get("font_family", ""), "",
+                         "取消后落库的字体没回滚")
 
     def test_consecutive_theme_switches_do_not_go_stale(self):
         """连着切好几轮：每轮都得拿「上一轮的新板」当旧板，不能一直用建窗那套。"""
@@ -733,6 +805,46 @@ class TestSettingsDialog(unittest.TestCase):
                             "换主题后色卡位图没重算（还是旧主题的像素）")
         self._close_dialogs()
         self.app.set_theme("forest")
+
+    def test_import_mode_dialog_explanations_share_font_size(self):
+        """导入弹窗三条说明文案（导出时间 / 当前数据 / 覆盖合并差别）字号一致。
+
+        三者同为 fg=soft 的说明文字、在同一张窗里上下紧邻，字号必须同档。
+        曾出现「11 / 11 / 10」——最后那条讲覆盖与合并差别的说明小一号，
+        和图片与图床节那处是同一类问题。
+        """
+        import tkinter.font as tkfont
+
+        def size_of(font):
+            # cget("font") 形如 "{PingFang SC} 11"；字号在末段
+            return int(str(font).split()[-1])
+
+        def body(win, box):
+            texts = {}
+            for w in _walk(win):
+                if isinstance(w, tk.Label):
+                    try:
+                        txt = str(w.cget("text"))
+                    except tk.TclError:
+                        continue
+                    texts[txt] = size_of(w.cget("font"))
+            box["fonts"] = texts
+            # 关掉弹窗，让 wait_window 返回（「取消」是自绘 RoundButton，不是 tk.Button）
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            win.destroy()
+
+        box = self._drive_dialog(body)
+        self.app._ask_import_mode("2 个文件夹、7 条笔记", exported_at="2026-11-20 09:00")
+        self.assertIsNone(box.get("driver_error"), str(box.get("driver_error")))
+        fonts = box.get("fonts", {})
+        keys = [k for k in fonts if k.startswith("导出时间：")
+                or k.startswith("当前数据：") or k.startswith("覆盖 = ")]
+        self.assertEqual(len(keys), 3, "三条说明文案没找全：%s" % list(fonts))
+        self.assertEqual({fonts[k] for k in keys}, {11},
+                         "导入弹窗说明字号不一致：%s" % {k[:8]: fonts[k] for k in keys})
 
     def test_info_dialogs_are_vertically_centered(self):
         """顶栏三张信息窗（设置 / 数据管理 / 关于）整窗垂直居中，且中心一致。
@@ -1649,6 +1761,29 @@ class TestSettingsDialog(unittest.TestCase):
         self.assertIsNone(box2.get("driver_error"), str(box2.get("driver_error")))
         self.assertFalse(box2.get("has_link"),
                          "不传 out 的调用不该凭空多一条恢复入口")
+
+    def test_empty_password_shows_hint_instead_of_silent_return(self):
+        """空口令点「确定」不能静默无反应：要显示提示并保持弹窗。"""
+        self._close_dialogs()
+
+        def body(win, box):
+            # 空着口令直接点确定
+            self._button(win, "确定").invoke()
+            self.root.update_idletasks()
+            box["still_open"] = bool(win.winfo_exists()) if win else False
+            # 不查 winfo_ismapped：unittest 里弹窗未真实 map 时它恒为 0
+            box["hint"] = any(
+                isinstance(w, tk.Label) and "口令不能为空" in str(w.cget("text"))
+                for w in _walk(win)) if win else False
+            # 再取消退出，让 wait_window 返回
+            self._button(win, "取消").invoke()
+
+        box = self._drive_dialog(body)
+        result = self.app._ask_password("解锁", "请输入口令：")
+        self.assertIsNone(box.get("driver_error"), str(box.get("driver_error")))
+        self.assertTrue(box.get("still_open"), "空口令点确定把窗口关掉了")
+        self.assertTrue(box.get("hint"), "空口令没显示提示，用户以为卡死")
+        self.assertIsNone(result)
 
     def test_recovery_dialog_copies_full_record(self):
         """复制按钮给出【笔记名称】_【凭证编号】_【恢复码】，不是光一段码。"""

@@ -161,6 +161,13 @@ def _check_state(runs):
     return any(mark in head for mark in _TODO_ON_MARKS)
 
 
+# Windows 保留设备名：CON/PRN/AUX/NUL、COM1-9、LPT1-9（含带编号的变体）。
+# 标题恰好是这些名字时，导出成 CON.md 会失败或被重定向到设备，必须避开。
+_RESERVED_NAMES = ({"CON", "PRN", "AUX", "NUL"}
+                   | {"COM%d" % i for i in range(1, 10)}
+                   | {"LPT%d" % i for i in range(1, 10)})
+
+
 def safe_filename(title, ext):
     """按笔记标题拼一个安全文件名（Windows 不允许的那几个字符一律抹掉）。"""
     name = _BAD_NAME.sub(" ", (title or "").strip()).strip(" .")
@@ -169,6 +176,10 @@ def safe_filename(title, ext):
         name = "未命名笔记"
     if len(name) > 80:                     # 加上目录后别超 MAX_PATH
         name = name[:80].rstrip(" .")
+    # 保留名加前缀规避（下划线开头，不区分大小写；COM¹ 这类上标变体也会命中白名单外，
+    # 但那不是合法 ASCII 文件名， practical 场景以 ASCII 保留名为准）
+    if name.split(".")[0].upper() in _RESERVED_NAMES:
+        name = "_" + name
     return "%s.%s" % (name, ext.lstrip("."))
 
 

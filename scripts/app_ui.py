@@ -12,7 +12,6 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import ttk
 
 # 像素常量要跟 DPI 走：SCALE 已在 notes_app.py 顶部定好（导入本模块之前）
 import dpi
@@ -28,7 +27,7 @@ from store import (APP_NAME, save_data, store,
                    ALARM_INDEX_ID, ALARM_ROW_TAG, ALARM_COLS,
                    ALARM_STATE_TAG_PREFIX, alarm_index_content)
 from theme import (FONT, _RES, build_palette, DEFAULT_THEME, THEMES, list_themes,
-                   theme_label, on_accent)
+                   theme_label, on_accent, BODY_SIZE_MIN, BODY_SIZE_MAX)
 from widgets import (RoundButton, FontSizeSlider, ArrowButton,
                      ThemedComboBox,
                      SidebarToggle, SettingsButton, DataButton, AboutButton,
@@ -105,9 +104,11 @@ GMARK_Y_NUDGE = 2           # 标签相对行号格中心的向下偏移（视�
 # **必须**进 _is_ephemeral_tag：折叠是阅读视图状态，不该写进正文——序列化过滤
 # 掉，切笔记 / 重启回到展开态。折叠头行号 = tag 区间起点行 − 1。
 GFOLD_PREFIX = "gfold_"
-# 折叠头行末尾的「⋯ N 行」提示片（嵌入窗口，window_create 挂在 head 行末，
-# 不占正文字符 —— serialize 对非代码块 / 分割线的嵌入窗口一律跳过，不落库）。
-GFOLD_CHIP_FONT = (FONT[0], 9)
+# 折叠头行末的占位条（嵌入窗口，window_create 挂在 head 行末，不占正文字符 ——
+# serialize 对非代码块 / 分割线的嵌入窗口一律跳过，不落库）。折叠后那几行被
+# elide 掉，占位条是正文里唯一的可见标识：横贯的淡底虚线条 + ▶ +「N 行已折叠」，
+# 整条可点展开。字号 11 与正文同档（旧版 9 太淡、看不出是导航元素）。
+GFOLD_CHIP_FONT = (FONT[0], 11)
 # Text 的 pack 底部外边距：把被 TEXT_PADY 让出去的那 8px 还给底部留白。
 FOOTER_GAP = FOOTER_H - TEXT_PADY
 # 触发状态条的「底部热区」高度。比状态条本身高一截：只留 20px 的话，
@@ -1030,8 +1031,13 @@ class UIMixin(object):
         self._update_search_ph()
         if getattr(self, "_search_quiet", False):
             return                        # 调用方紧接着会自己 refresh_notes
+        # 列表过滤即时跟手（用户主要反馈），但正文高亮是最重的一环（最多 2000 次
+        # text.search + tag_add），每敲一个字都重跑没必要：去抖到停下 120ms 再做。
+        # 用 self._after 登记，关窗会自动取消（不会回调已销毁的 text）。
         self.refresh_notes()
-        self._apply_search_highlight()
+        if getattr(self, "_search_hl_job", None) is not None:
+            self._cancel_after(self._search_hl_job)
+        self._search_hl_job = self._after(120, self._apply_search_highlight)
 
     def _apply_search_highlight(self):
         """把搜索词在**当前打开的这篇**正文里标黄。
@@ -1042,6 +1048,7 @@ class UIMixin(object):
         直接操作 tag、不进撤销栈：Tk 的 undo 只记 insert/delete，tag 增删不入栈
         （已实测），所以这里不必包 `edit_separator`，Ctrl+Z 撤的仍是用户的输入。
         """
+        self._search_hl_job = None        # 这次是去抖到点执行的，清掉旧 job 引用
         try:
             self.text.tag_remove("find", "1.0", tk.END)
         except Exception:
@@ -1694,12 +1701,22 @@ class UIMixin(object):
     def _gutter_fold_mark(self, g, ln, y, unit, p, digit_right=0, slot_w=18):
         """折叠头行的指示符：数字右侧槽里一枚 ▶ 实心三角（指向右＝这块已折叠，
         点击展开）。与 gmark 重合时折叠优先，同一槽位只画这一枚（见重绘循环）。
-        走 widgets._draw_chevron 的整数顶点画法 —— 小图标不抗锯齿，别用 oval/线。"""
+        走 widgets._draw_chevron 的整数顶点画法 —— 小图标不抗锯齿，别用 oval/线。
+
+        箭头下方再画一条竖线连到下一格：被折叠的行不占刻度格，下一格就是折叠
+        块之后的可见行，这条线把两头的行号串起来，暗示「中间这段被收起了」。
+        颜色比箭头淡一档，不抢三角；只画在折叠头格，随 gutter 重绘自动重建。
+        """
         # 槽中心放箭头；size 取 9px 与文件夹扭转子的墨迹同款
         try:
             size = 9
             cx = digit_right + max(size, slot_w) / 2.0
             cy = y + unit / 2.0
+            # 竖线：从箭头下缘到下一格中线，x 与箭头同轴。淡 accent，1px。
+            line_col = _mix_hex(p.get("editor", "#ffffff"),
+                                p.get("accent", "#2f7cf6"), 0.5)
+            g.create_line(cx, cy + size / 2.0 + dpi.px(1),
+                          cx, cy + unit - dpi.px(2), fill=line_col)
             item = _draw_chevron(g, cx, cy, size, p["accent"], down=False)
             self._gutter_fold_items[ln] = item
         except Exception:
@@ -2130,39 +2147,99 @@ class UIMixin(object):
         except Exception:
             pass
 
+    def _chip_width(self):
+        """占位条宽度：铺满正文可视宽，两侧各留一点。未映射 / stub 给个稳妥回退。"""
+        try:
+            w = int(self.text.winfo_width())
+        except Exception:
+            w = 0
+        if w < dpi.px(120):
+            w = dpi.px(360)
+        # 挂点前的折叠头文字长短不定：宽度取「可视宽 - 边距」与 480px 的较小者，
+        # 既横贯感足够，又保证「点击展开」不会被正文右缘截断。
+        return min(max(dpi.px(200), w - dpi.px(46)), dpi.px(480))
+
     def _fold_chip_make(self, tag, head, hidden):
-        """折叠头行末的「⋯ N 行」提示片。Canvas 嵌进正文（window_create），不占
-        字符；换主题时由 _fold_chips_repaint 重画。"""
+        """折叠头行末的占位条：横贯的淡底虚线条，左侧 ▶ +「N 行已折叠」，
+        右侧「点击展开」。Canvas 嵌进正文（window_create 挂在 head 行末，宽
+        占位条会被 Tk 排到头行下方一格），不占字符；换主题时由
+        _fold_chips_repaint 重画。整条可点展开。
+        """
         self._fold_chip_destroy(tag)
-        label = "⋯ %d 行" % hidden
         cv = tk.Canvas(self.text, highlightthickness=0, bd=0, takefocus=0,
                        bg=self.pal["editor"])
-        try:
-            f = tkfont.Font(font=GFOLD_CHIP_FONT)
-            w = int(f.measure(label)) + dpi.px(10)
-        except Exception:
-            w = dpi.px(46)
-        cv.configure(width=w, height=dpi.px(16))
-        cv._fold_label = label
+        cv._fold_label = "⋯ %d 行已折叠" % hidden
+        cv._fold_tag = tag
+        cv._fold_hover = False
+        # 整条可点展开；hover 只重画底色（不改正文、不碰 modified）。
+        cv.bind("<Button-1>", lambda _e, t=tag: self._fold_chip_click(t))
+        cv.bind("<Enter>", lambda _e, c=cv: self._chip_hover(c, True))
+        cv.bind("<Leave>", lambda _e, c=cv: self._chip_hover(c, False))
         self._fold_chips[tag] = cv
-        self._fold_chip_paint(cv)
         self._fold_quiet = True
         try:
-            self.text.window_create("%d.end" % head, window=cv)
+            self.text.window_create("%d.end" % head, window=cv,
+                                    padx=dpi.px(6), pady=dpi.px(2))
         except Exception:
             self._fold_chips.pop(tag, None)
             cv.destroy()
         finally:
             self.text.edit_modified(False)
             self._fold_quiet = False
+        # 先画一次（宽度可能还是回退值）；布局完成后用真实正文宽重画，
+        # 让占位条铺满整行 —— 宽到塞不进折叠头行末，Tk 会把它排到下一格，
+        # 正好落在被折叠内容的位置。after 用 app 的登记式定时器，随关窗取消。
+        self._fold_chip_paint(cv)
+        try:
+            self._after(0, lambda: self._fold_chip_repaint_size(tag))
+        except Exception:
+            pass
         return cv
 
+    def _fold_chip_repaint_size(self, tag):
+        """布局完成后按真实正文宽重画占位条；tag 已被展开则什么都不做。"""
+        cv = self._fold_chips.get(tag)
+        if cv is not None:
+            self._fold_chip_paint(cv)
+
+    def _fold_chip_click(self, tag):
+        """点占位条整条 → 展开这个折叠块。吞掉事件，别让正文收到这次点击。"""
+        self._fold_unfold(tag)
+        return "break"
+
+    def _chip_hover(self, cv, on):
+        """占位条悬停：只重画底色深浅，不进撤销栈。"""
+        if getattr(cv, "_fold_hover", False) == on:
+            return
+        cv._fold_hover = on
+        self._fold_chip_paint(cv)
+
     def _fold_chip_paint(self, cv):
-        """提示片内容：soft 色「⋯ N 行」，字号比正文小两档，不抢正文注意力。"""
+        """占位条内容：淡底圆角 + 虚线边框 + ▶ +「N 行已折叠」+「点击展开」。
+        配色全部从 pal 派生，跟随主题；hover 时底色加深一档。
+        """
         try:
+            p = self.pal
+            w = max(dpi.px(120), self._chip_width())
+            h = dpi.px(22)
+            cv.configure(width=w, height=h, bg=p["editor"])
             cv.delete("all")
-            cv.create_text(dpi.px(2), dpi.px(8), text=cv._fold_label, anchor="w",
-                           font=GFOLD_CHIP_FONT, fill=self.pal["soft"])
+            ed = p.get("editor", "#ffffff")
+            acc = p.get("accent", "#2f7cf6")
+            soft = p.get("soft", "#76767e")
+            mix = 0.16 if getattr(cv, "_fold_hover", False) else 0.09
+            fill = _mix_hex(ed, acc, mix)
+            border = _mix_hex(ed, acc, 0.45)
+            pts = _round_rect_points(1, 1, w - 2, h - 2, dpi.px(5), 4)
+            cv.create_polygon(pts, fill=fill, outline=border, dash=(4, 3))
+            # 左侧 ▶：紧贴条目左边，用和行号槽同款 _draw_chevron（整数顶点）。
+            ax = dpi.px(9)
+            _draw_chevron(cv, ax, (h - 1) / 2.0, 9, acc, down=False)
+            cy = (h - 1) / 2.0
+            cv.create_text(dpi.px(17), cy, text=cv._fold_label, anchor="w",
+                           font=GFOLD_CHIP_FONT, fill=acc)
+            cv.create_text(w - dpi.px(8), cy, text="点击展开", anchor="e",
+                           font=GFOLD_CHIP_FONT, fill=soft)
         except Exception:
             pass
 
@@ -2184,7 +2261,6 @@ class UIMixin(object):
     def _fold_chips_repaint(self):
         for cv in list(self._fold_chips.values()):
             try:
-                cv.configure(bg=self.pal["editor"])
                 self._fold_chip_paint(cv)
             except Exception:
                 pass
@@ -2270,10 +2346,13 @@ class UIMixin(object):
             else:
                 b.pack(side=tk.LEFT)
             b.bind("<Button-1>", lambda e, f=fn: (f(), "break")[1])
+            # ⚠️ 悬停色必须运行时取 self.pal，不能用闭包里的建窗旧板 p：
+            # set_theme 会换掉整个 pal 对象，_restyle_find_bar 只重配静态色、
+            # 不重绑事件，若这里捕获 p，换肤后一悬停就闪回旧主题色。
             b.bind("<Enter>", lambda e, w=b: w.configure(
-                bg=_hover_bg(p["editor"]), fg=p["text"]))
+                bg=_hover_bg(self.pal["editor"]), fg=self.pal["text"]))
             b.bind("<Leave>", lambda e, w=b: w.configure(
-                bg=p["editor"], fg=p.get("soft", "#76767e")))
+                bg=self.pal["editor"], fg=self.pal.get("soft", "#76767e")))
             self._add_tip(b, tip)
             return b
 
@@ -4334,7 +4413,7 @@ class UIMixin(object):
 
         标签字号改了，已存在于文本里的这些标签会自动跟着变（Tk tag_configure 即时生效）。
         """
-        self.body_size = min(25, max(8, int(size)))
+        self.body_size = min(BODY_SIZE_MAX, max(BODY_SIZE_MIN, int(size)))
         self.text.configure(font=(getattr(self, "ui_font", None) or FONT[0], self.body_size))
         self._config_tags()
         # 字号一换，一个空格多少像素就变了 —— 光标条给虚拟列估位置用的正是它
@@ -4368,6 +4447,11 @@ class UIMixin(object):
         和滚动位置全留在原地，不 destroy 再 create —— 那一下就是用户看到的「闪」。
         """
         state = _state or {}
+        # 「取消」要能回滚主题 / 字体：这两项是点选当下就落库的（见 on_theme /
+        # on_family），不像字号 / 勾选那样等「确定」。进窗先记下原值，cancel 时
+        # 若被改过就恢复回去并重新落库，否则「取消」对这两项形同虚设。
+        _orig_theme = self._current_theme()
+        _orig_font = self.ui_font
         # 本窗当前配色。刻意**拷贝**而不是引用 self.pal：set_theme 会把 app 的 pal
         # 整个换掉，而窗内控件 / 闭包都按 p 取值；换肤时把 p 原地更新，重画图标等
         # 闭包就自动拿到最新的一套，不需要重建窗口。
@@ -4456,9 +4540,10 @@ class UIMixin(object):
         # 宽高按最大字号 25pt 一次性算好并锁死 —— 文字单行、盒高固定，拖动滑杆时
         # 对话框不会跟着变宽变高（不抖动）。
         import tkinter.font as _tf
-        _h1_max = _tf.Font(family=FONT[0], size=self._heading_size(25, self.H1_SCALE),
+        _h1_max = _tf.Font(family=FONT[0],
+                           size=self._heading_size(BODY_SIZE_MAX, self.H1_SCALE),
                            weight="bold")
-        _body_max = _tf.Font(family=FONT[0], size=25)
+        _body_max = _tf.Font(family=FONT[0], size=BODY_SIZE_MAX)
         _h1_text = "一级标题 H1"
         _sample_text = "正文预览：笔记内容 Abc"
         box = tk.Frame(body, bg=p["hover"], bd=dpi.px(1), relief=tk.SOLID,
@@ -4493,7 +4578,8 @@ class UIMixin(object):
         # 字号滑杆：8–25pt 连续步进，拖动时气泡显示当前值
         # 画布本身固定 340 宽，靠 anchor="center" 整体水平居中（轨道、滑钮、
         # 右上角 pt 数值、两端 8/25 标签都跟着居中，不再缩在左侧）
-        slider = FontSizeSlider(body, p, cur, minimum=8, maximum=25,
+        slider = FontSizeSlider(body, p, cur, minimum=BODY_SIZE_MIN,
+                                maximum=BODY_SIZE_MAX,
                                 command=preview, width=dpi.px(340))
         slider.pack(anchor="center", pady=(dpi.px(12), dpi.px(2)))
 
@@ -4691,13 +4777,19 @@ class UIMixin(object):
         for i, (tid, _lb) in enumerate(theme_items):
             cv = tk.Canvas(theme_grid, width=CELL_W, height=CELL_H,
                            bg=p["editor"], bd=0, highlightthickness=0,
-                           takefocus=0, cursor="hand2")
+                           takefocus=1, cursor="hand2")
             cv.grid(row=i // THEME_COLS, column=i % THEME_COLS,
                     padx=dpi.px(3), pady=dpi.px(2))
             cv._theme_tid = tid          # 回归测试按这个标记找色卡，别按尺寸猜
             cv.bind("<Button-1>", lambda _e, t=tid: on_theme(t))
             cv.bind("<Enter>", lambda _e, t=tid: on_theme_hover(t))
             cv.bind("<Leave>", lambda _e: on_theme_hover(None))
+            # 键盘可达：同窗复选框 / 滑杆都能 Tab 聚焦操作，色卡此前只能鼠标点。
+            # 焦点进出复用 hover 高亮当视觉反馈，Return / Space 切换主题。
+            cv.bind("<FocusIn>", lambda _e, t=tid: on_theme_hover(t))
+            cv.bind("<FocusOut>", lambda _e: on_theme_hover(None))
+            for key in ("<Return>", "<space>"):
+                cv.bind(key, lambda _e, t=tid: (on_theme(t), "break")[1])
             theme_cards.append((tid, cv))
         draw_theme_cards()
 
@@ -4873,6 +4965,12 @@ class UIMixin(object):
 
             self._img_async(work, done)
 
+        # 「浏览」按钮接上 pick_exe：原来那函数定义了却没入口，用户只能手输 exe 路径
+        browse_btn = RoundButton(pic_row, p, "浏览", command=pick_exe,
+                                 base=p["editor"], fg=p["soft"], outline=p["line"],
+                                 padx=dpi.px(10), pady=dpi.px(4))
+        browse_btn.pack(side=tk.LEFT, padx=(dpi.px(8), 0))
+        browse_btn.bind_events()
         test_btn = RoundButton(pic_row, p, "测试上传", command=test_pic,
                                base=p["editor"], fg=p["soft"], outline=p["line"],
                                padx=dpi.px(10), pady=dpi.px(4))
@@ -4963,7 +5061,7 @@ class UIMixin(object):
             # 状态徽标的浅绿底是 _mix_hex 派生色，通用重刷认不出来，单独按新板重算
             pic_badge.configure(bg=_mix_hex(new["editor"], new["accent"], 0.12),
                                 fg=new["accent"])
-            for btn in (b_none, b_all, b_ok, b_cancel, test_btn):
+            for btn in (b_none, b_all, b_ok, b_cancel, browse_btn, test_btn):
                 # old_pal 只影响显式传过 fg / outline 的那几枚：那两个值是写死在
                 # 实例上的旧板色，不在 tk option 里，得单独翻译。
                 btn.apply_theme(new, base=new["editor"], old_pal=old)
@@ -4992,6 +5090,21 @@ class UIMixin(object):
             dlg.destroy()
 
         def cancel(_=None):
+            # 主题 / 字体是点选即落库的，取消必须把它们也还原，否则用户点了
+            # 「取消」还留着半路改掉的皮肤和字体，跟同窗其它项的语义相矛盾。
+            changed = False
+            if self._current_theme() != _orig_theme:
+                # set_theme 内部会 save_data + 刷主窗，回滚走同一条正规路径
+                self.set_theme(_orig_theme)
+                changed = True
+            if (self.ui_font or "") != (_orig_font or ""):
+                self.ui_font = _orig_font
+                self.data.setdefault("settings", {})["font_family"] = _orig_font
+                self._config_tags()
+                self.text.configure(font=(_orig_font or FONT[0], self.body_size))
+                changed = True
+            if changed:
+                save_data(self.data)
             dlg.destroy()
 
 
@@ -5776,12 +5889,13 @@ class UIMixin(object):
                  bg=p["top"], fg=p["soft"], font=(FONT[0], 11)).pack(
                      anchor="w", padx=dpi.px(18), pady=(dpi.px(6), dpi.px(2)))
         # 两种方式的差别必须写清：覆盖会连外观一起换回备份的样子，合并只动内容。
-        # 两行各自成句（wraplength 430 大于最长那行的 408px），断行位置由文案决定，
-        # 不靠窗口宽度去折 —— 否则换个字体就折成三行、跟上面的信息行错位。
+        # 两行各自成句（wraplength 500 大于 11 号字下最长那行的 469px），断行位置
+        # 由文案决定，不靠窗口宽度去折 —— 否则换个字体就折成三行、跟上面的信息行
+        # 错位。字号与上面两条说明统一为 11（原来是 10，明显小一号）。
         tk.Label(win, text="覆盖 = 用备份完全替换现有数据，外观设置也按备份恢复；\n"
                            "合并 = 保留现有内容，只追加本机没有的笔记，内容相同的自动跳过。",
-                 bg=p["top"], fg=p["soft"], font=(FONT[0], 10), justify="left",
-                 wraplength=dpi.px(430)).pack(anchor="w", padx=dpi.px(18))
+                 bg=p["top"], fg=p["soft"], font=(FONT[0], 11), justify="left",
+                 wraplength=dpi.px(500)).pack(anchor="w", padx=dpi.px(18))
 
         def choose(v):
             res["v"] = v
@@ -6116,8 +6230,10 @@ class UIMixin(object):
             if keep_off is not None:
                 self._restore_folder_scroll(keep_off)
 
-        self.folder_panel.canvas.after(30, _upd)
-        self.folder_panel.canvas.after(120, _upd)
+        # 用 self._after 登记（不是 canvas.after）：关窗后 _alive=False 会拦住回调，
+        # 不会去碰已销毁的面板；canvas.after 无此保护，30~120ms 内关窗会抛 TclError。
+        self._after(30, _upd)
+        self._after(120, _upd)
         # 行被重建后需重新绑定滚轮（否则指针停在行/图标上滚不动）
         self.folder_panel.bind_wheel()
         # 行重建 = 新控件：指针若正停在某个名字上，收不到 Enter，这里补一次
@@ -6170,14 +6286,49 @@ class UIMixin(object):
         """就地刷新左栏每个文件夹的条数。
 
         新建/删除/移动笔记时调用：文件夹行不重建（避免闪烁），只改计数徽章。
+
+        ⚠️ 别对每个文件夹各调一次 `folder_notes`：后者每次都 subtree_ids + 遍历
+        全库 notes，F 个文件夹 × N 条笔记是 O(F×N)，而这个函数被新建/删除/移动/
+        星标等七八处调用。改为**一次遍历全库按 folder 分桶**，再把子节点计数累加
+        到父节点（父级要含子孙，见 folder_subtree），复杂度降到 O(F+N)。
+        智能分类 / 回收站是固定几枚、筛选口径特殊，单独按原逻辑算。
         """
+        # 1) 一次遍历：每个直接 folder 的笔记数
+        direct = {}
+        for n in (self.data.get("notes") or []):
+            fid = n.get("folder")
+            if isinstance(fid, str):
+                direct[fid] = direct.get(fid, 0) + 1
+
+        # 2) 普通文件夹的「含子孙」计数：自底向上把子节点累加到父节点。
+        #     folders 是 [{id,parent}]，可能有更深层级；按 parent 链累加。
+        total = dict(direct)
+        folders = self.data.get("folders") or []
+        by_id = {f.get("id"): f for f in folders if isinstance(f, dict)}
+        # 迭代累加：每条笔记归属的 leaf folder，沿 parent 链给每个祖先 +1
+        # （一次性分摊；比对每个祖先重扫全库省得多）
+        for fid, cnt in direct.items():
+            seen = set()
+            cur = by_id.get(fid)
+            while isinstance(cur, dict):
+                pid = cur.get("parent")
+                if not pid or pid in seen or pid not in by_id:
+                    break
+                seen.add(pid)
+                total[pid] = total.get(pid, 0) + cnt
+                cur = by_id.get(pid)
+
         for fid, badge in list(self._folder_count_labels.items()):
             if badge is None:
                 continue
             try:
                 if not badge.winfo_exists():
                     continue
-                badge.set_count(len(self.folder_notes(fid)))
+                if fid in SMART_FOLDERS or fid == RECYCLE_FOLDER:
+                    n = len(self.folder_notes(fid))   # 智能分类 / 回收站口径特殊
+                else:
+                    n = total.get(fid, 0)
+                badge.set_count(n)
             except Exception:
                 pass
 
@@ -6571,8 +6722,8 @@ class UIMixin(object):
             self.folder_panel._update()
             self._restore_folder_scroll(off)
 
-        self.folder_panel.canvas.after(30, _upd)
-        self.folder_panel.canvas.after(120, _upd)
+        self._after(30, _upd)             # 经 self._after 登记，关窗后不会回调
+        self._after(120, _upd)
         # 新行是新控件：滚轮要重新绑（指针停在新行上才滚得动）
         self.folder_panel.bind_wheel()
         # 就地插入是 append 进字典的 → 键序要和屏幕顺序对齐（Shift 多选靠它取区间）
@@ -7462,7 +7613,7 @@ class UIMixin(object):
         card._accent = color
         card._draw()
 
-    def _refresh_alarm_index(self):
+    def _refresh_alarm_index(self, rows=None):
         """按全库提醒重建「任务提醒列表」的正文 / 内链（纯内存，不动 updated）。
 
         它是视图不是内容：增删闹钟、时间翻过「已完成」、点过弹窗的「知道了」，
@@ -7474,7 +7625,8 @@ class UIMixin(object):
                   if x.get("id") == ALARM_INDEX_ID), None)
         if n is None:
             return
-        content, links, tips = alarm_index_content(self.data)
+        # rows 由 _alarm_check 刚扫全库时顺带备好，传进去省一次全库扫描
+        content, links, tips = alarm_index_content(self.data, rows=rows)
         n["content"] = content
         n["links"] = links
         # 被截断格子的全文只给悬停提示用：每次重算都换一份，不落库
@@ -7510,6 +7662,21 @@ class UIMixin(object):
             if in_recycle:
                 accents = {n["id"]: p["soft"] for n in notes}
             self._active_title = self._active_preview = self._active_date = None
+            if not notes:
+                # 空列表给一句引导：新建笔记的入口原本只藏在列表空白处右键菜单里，
+                # 纯看界面不知道怎么下手。搜索无果与空文件夹用不同文案。
+                searching = bool((self.search_var.get() if hasattr(self, "search_var")
+                                  else "").strip())
+                hint = ("没有匹配的笔记" if searching else
+                        "这里还没有笔记 · 右键空白处或按 Ctrl+N 新建")
+                hint_lbl = tk.Label(self.note_panel.inner, text=hint, bg=p["list"],
+                         fg=p["soft"], font=(FONT[0], 11), anchor="w",
+                         justify="left", wraplength=_panel_width(self.root) - 60)
+                # 打标记：普通文件夹新建走差量插入(_insert_note_row)，不经整列重建，
+                # 得靠这个标记把引导摘掉，否则新笔记和这句话会同时留在列表里。
+                hint_lbl._empty_hint = True
+                hint_lbl.pack(
+                             anchor="w", padx=dpi.px(18), pady=dpi.px(20))
             for i, n in enumerate(notes):
                 self._make_note_row(n, i, n["id"] == self.data.get("current_note"),
                                     accent=accents.get(n["id"]))
@@ -7522,8 +7689,8 @@ class UIMixin(object):
         # 解冻后必须整幅重画：冻结期间 inner 的 Configure 已经把新滚动区写进
         # 画布，再 _update() 是「设同一个值」，Tk 不重画 → 屏幕上留着旧像素。
         self.note_panel.repaint()
-        self.note_panel.canvas.after(30, self.note_panel._update)
-        self.note_panel.canvas.after(120, self.note_panel._update)
+        self._after(30, self.note_panel._update)    # 经 self._after 登记，关窗安全
+        self._after(120, self.note_panel._update)
         # 行被重建后需重新绑定滚轮（否则指针停在行/文字上滚不动）
         self.note_panel.bind_wheel()
         self._restyle_notes()
@@ -7687,6 +7854,12 @@ class UIMixin(object):
         if n["id"] not in ids:
             self.refresh_notes()
             return
+        # 空文件夹里原本挂着「这里还没有笔记 · 右键…」的引导 Label。新建走的是
+        # 差量插入，不会经过 refresh_notes 的整列重建，得在这里主动摘掉，否则
+        # 新笔记插进来的同时那句引导还在（看起来像没刷新）。
+        for w in list(self.note_panel.inner.children.values()):
+            if getattr(w, "_empty_hint", False):
+                w.destroy()
         idx = ids.index(n["id"])
         # 新笔记是「插进」两行之间：上下两位本来就不同色，只要新这条避开它俩就行。
         # 必须让**新来的**让路 —— 让邻居改色的话，用户会觉得自己点错了笔记。
@@ -7711,7 +7884,7 @@ class UIMixin(object):
         self._after_idle(lambda nid=n["id"]: self._fit_note_title(nid))
         self.note_panel.inner.update_idletasks()
         self.note_panel._update()
-        self.note_panel.canvas.after(30, self.note_panel._update)
+        self._after(30, self.note_panel._update)    # 经 self._after 登记，关窗安全
         self.note_panel.bind_wheel()
 
     def _remove_note_rows(self, ids):
@@ -11085,6 +11258,10 @@ class UIMixin(object):
                      relief=tk.FLAT, highlightthickness=dpi.px(1),
                      highlightbackground=p["line"], highlightcolor=p["accent"], width=30)
         e.pack(fill=tk.X, padx=dpi.px(16), ipady=dpi.px(5))
+        # 空口令点确定时的内联提示（与 _ask_link 的 hint 同一套）：原来这里
+        # 静默 return，用户以为程序卡死，尤其在解锁加密笔记时最明显。
+        pw_hint = tk.Label(win, text="", bg=p["top"], fg=MENU_DANGER,
+                           anchor="w", font=(FONT[0], 10))
         if out is not None:
             def use_recovery(_=None):
                 out["recovery"] = True
@@ -11099,6 +11276,10 @@ class UIMixin(object):
 
         def ok(_=None):
             if not var.get() and not allow_empty:
+                pw_hint.configure(text="口令不能为空。")
+                if not pw_hint.winfo_ismapped():
+                    pw_hint.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(4), 0))
+                e.focus_set()
                 return
             res["v"] = var.get()
             win.destroy()

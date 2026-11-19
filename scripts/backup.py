@@ -70,6 +70,17 @@ CONTAINER_ITERATIONS = 600000
 _MIN_ITER, _MAX_ITER = 100000, 5000000
 _DOMAIN = b"sujian.backup.container.v1"
 _SALT_LEN, _NONCE_LEN = 16, 12
+# 解压后大小上限：gzip 炸弹能在 checksum 校验之前就把内存撑爆。备份含 base64
+# 图片，体积比纯文本大得多，给足 100MB（正常库远达不到）；超限即拒。
+_MAX_UNCOMPRESSED = 100 * 1024 * 1024
+
+
+def _read_capped(fh):
+    """读满上限 + 1 字节；超过上限就拒（连 JSON 解析都不进）。"""
+    data = fh.read(_MAX_UNCOMPRESSED + 1)
+    if len(data) > _MAX_UNCOMPRESSED:
+        raise BackupError("备份文件内容过大，可能已损坏，拒绝导入。")
+    return data
 
 # settings 里的两类键：
 #   prefs —— 外观偏好，跟着人走。覆盖导入时采纳备份里的值。
@@ -383,9 +394,27 @@ def _encode_folder(f):
 # 读到未知键会忽略）。图床 URL 不在本地，自然不在这里。
 
 def pack_media(notes, base=None):
-    """从全库正文收集本地 img src，读文件 → {src: base64 文本}。"""
+    """把本地图片（data/media/ 下的 PNG）读成 {src: base64 文本} 随备份带走。
+
+    ⚠️ 不能只从正文 `content` 收 img 引用：加密笔记锁定时 `content=[]`，
+    图片引用只活在密文 `sec` 里，扫 content 会把这些图静默漏掉，换机导入后
+    即使解锁也是一片断图。所以这里**直接扫 media 目录**——文件在就在，与笔记
+    的锁定状态无关。正文引用仍收进来取并集做兜底（正常图两条路子是同一批文件）。
+
+    只扫 media 根目录、只认白名单文件名（见 imgstore._NAME_RE）：`cache/` 子目录
+    是图床图的临时缓存（src 是 URL，不随备份），绝不能打进去。
+    """
     import imgstore
-    refs = imgstore.collect_refs(notes)
+    refs = set(imgstore.collect_refs(notes))       # 正文引用（含未锁定笔记）
+    d = imgstore.media_dir(base)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        names = []
+    for name in names:
+        # 只认 media/<sha256>.png；跳过 cache/ 等子目录与非白名单文件
+        if imgstore._NAME_RE.match(name):
+            refs.add(imgstore.MEDIA_DIR_NAME + "/" + name)
     out = {}
     for src in sorted(refs):
         raw = imgstore.read_local(src, base)
@@ -647,7 +676,11 @@ def unseal_payload(blob, password=None):
     try:
         ct = _b64d(blob["data"])
         gz = _codec_xor(ct, _codec_stream(enc_key, _b64d(blob["nonce"]), len(ct)))
-        return json.loads(gzip.decompress(gz).decode("utf-8-sig"))
+        with gzip.GzipFile(fileobj=io.BytesIO(gz)) as zf:
+            raw = _read_capped(zf)              # 超限会在验 JSON 前抛 BackupError
+        return json.loads(raw.decode("utf-8-sig"))
+    except BackupError:
+        raise
     except Exception:
         raise BackupError("备份内容已损坏，无法还原。")
 
@@ -672,15 +705,17 @@ def load(path, password=None):
     try:
         if head == b"\x1f\x8b":
             with gzip.open(path, "rb") as f:
-                raw = f.read()
+                raw = _read_capped(f)           # gzip 炸弹：解压时就得设防
         else:
             with open(path, "rb") as f:
-                raw = f.read()
+                raw = _read_capped(f)           # 明文文件也顺手限一下
         obj = json.loads(raw.decode("utf-8-sig"))
     except UnicodeDecodeError:
         raise BackupError("文件不是 UTF-8 文本，可能不是素笺的备份文件。")
     except ValueError as e:
         raise BackupError("不是有效的 JSON：\n%s" % e)
+    except BackupError:
+        raise                                 # _read_capped 的超限提示原样抛出
     except Exception as e:
         raise BackupError("读取失败：\n%s" % e)
     if is_container(obj):
