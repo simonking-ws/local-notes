@@ -10412,6 +10412,11 @@ class UIMixin(object):
             except Exception:
                 return
             self._sync_todo_lines(start, min(last, end + 1))
+            # 复制只带走字符不带 tag：上面补好了 todo_done（绿框），删除线却归
+            # _sync_todo_done 管，它不在撤销栈里、粘贴链也不会自己画。少了这一句，
+            # 粘进来的 ✅ 就是「绿框但没删除线」。顺序不能反：done 是按 todo_done
+            # 范围找行的，必须先让 _sync_todo_lines 把方框标签打上。
+            self._sync_todo_done()
 
         self._after_idle(fix)
         return None

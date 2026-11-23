@@ -1975,6 +1975,79 @@ class TestSettingsDialog(unittest.TestCase):
         finally:
             restore()
 
+    # ---------- 粘贴后的待办样式 ----------
+    def _paste_bare_todo_line(self, checked):
+        """放一行「剪贴板形态」的裸待办字符并清空撤销栈，返回 (Text, restore)。
+
+        Tk 的 <<Copy>> 只带走字符、不带 tag，所以粘进来的 ✅/⬜ 是裸字符：
+        没有 todo / todo_done / todo_gap / done 任何一个标签。这里不挂 tag，
+        精确复现刚粘完的那一瞬。
+        """
+        import store
+        from md_conv import TODO_OFF, TODO_ON, TODO_GAP
+        app, text = self.app, self.app.text
+        state = str(text.cget("state"))
+        body = text.get("1.0", "end-1c")
+        loading = getattr(app, "_loading", False)
+        old_note = app.data.get("current_note")
+        target = next((x for x in app.data["notes"]
+                       if not x.get("sample") and x["id"] != store.ALARM_INDEX_ID),
+                      None)
+        self.assertIsNotNone(target, "临时库里没有可编辑的普通笔记")
+        app.data["current_note"] = target["id"]
+        app._loading = True
+        text.config(state=tk.NORMAL)
+        text.delete("1.0", "end")
+        text.insert("1.0", "标题\n")
+        text.insert("2.0", (TODO_ON if checked else TODO_OFF) + TODO_GAP + "买牛奶")
+        text.edit_reset()
+        self.root.update_idletasks()
+        self.root.update()
+
+        def restore():
+            text.delete("1.0", "end")
+            text.insert("1.0", body)
+            text.config(state=state)
+            app._loading = loading
+            app.data["current_note"] = old_note
+            text.edit_reset()
+            self.root.update()
+
+        return text, restore
+
+    def _run_paste_fix(self):
+        """模拟 <<Paste>> 的修复钩子并跑完 idle 回调（withdraw 下无法 generate 按键）。"""
+        self.app._on_paste_fix_todo()
+        for _ in range(8):
+            self.root.update()
+
+    def test_paste_checked_todo_restores_strike(self):
+        """粘进来的已勾待办：todo_done 标签与 done 删除线都要跟着回来。
+
+        `_on_paste_fix_todo` 只补方框标签，done 由 `_sync_todo_done` 统一刷 ——
+        少了后者，粘进来的 ✅ 就是「绿框但没删除线」。
+        """
+        from md_conv import TODO_ON
+        text, restore = self._paste_bare_todo_line(checked=True)
+        try:
+            self._run_paste_fix()
+            self.assertIn(TODO_ON, text.get("2.0", "2.1"))
+            self.assertIn("todo_done", text.tag_names("2.0"))
+            self.assertTrue(text.tag_ranges("done"), "粘贴后删除线没回来")
+        finally:
+            restore()
+
+    def test_paste_unchecked_todo_has_no_strike(self):
+        """粘进来的未勾待办不能被误加删除线。"""
+        from md_conv import TODO_OFF
+        text, restore = self._paste_bare_todo_line(checked=False)
+        try:
+            self._run_paste_fix()
+            self.assertIn("todo", text.tag_names("2.0"))
+            self.assertFalse(text.tag_ranges("done"), "未勾待办不该有删除线")
+        finally:
+            restore()
+
     # ---------- 图片与图床：B 版文案 ----------
     def _pic_badge(self, dlg):
         """标题右侧那枚状态徽标（按「当前：」前缀认，不按位置猜）。"""
