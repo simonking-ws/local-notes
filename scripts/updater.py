@@ -496,8 +496,8 @@ def launch_apply(src, dst, exe, workdir=None, pid=None):
     """起一个脱离本进程的 cmd 去执行替换脚本，然后调用方应当立刻退出。
 
     为什么要这么绕：Windows 不允许覆盖/删除正在运行的 exe，所以"更新"这件事
-    只能由另一个进程在本进程退出之后做。而 cmd 又必须是**独立**的（不能被我们
-    的进程树带走、不能继承控制台），所以 creationflags 用 DETACHED_PROCESS。
+    只能由另一个进程在本进程退出之后做。而 cmd 又必须是**独立**的：不能被我们
+    的进程树带走，但要保留一个隐藏控制台，否则管道判据会失效（见下方）。
 
     ⚠️ 命令行是手工拼的字符串，不是列表。`cmd /c "带空格的路径" 参数…` 会让
     cmd 按它自己那套历史规则剥引号（"more than 2 quotes" 分支会把首尾引号一起
@@ -509,7 +509,13 @@ def launch_apply(src, dst, exe, workdir=None, pid=None):
     pid = os.getpid() if pid is None else int(pid)
     line = 'cmd /c ""%s" %d "%s" "%s" "%s""' % (
         bat, pid, os.path.abspath(src), os.path.abspath(dst), os.path.abspath(exe))
-    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | \
+    # ⚠️ 用 CREATE_NO_WINDOW，不用 DETACHED_PROCESS。
+    # 两者都能让窗口不显示，但 DETACHED_PROCESS 会让 cmd 没有控制台——
+    # 批处理里 `tasklist | find` 这类管道拿不到正确的 errorlevel（实测：
+    # 目标进程明明已退出，管道却永远判成"还在"，:wait 循环空转到 150 次，
+    # robocopy 一次都没执行，用户只看到一个黑框）。CREATE_NO_WINDOW 则有
+    # 一个隐藏的控制台，管道语义正常，窗口照样不弹。
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | \
         getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     subprocess.Popen(line, cwd=workdir, close_fds=True,
                      stdin=subprocess.DEVNULL,

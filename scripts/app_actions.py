@@ -16,15 +16,17 @@ import dpi
 import win_frame
 
 from store import (APP_NAME, uid, _t, seed, store, save_data,
-                   SMART_FOLDERS, SYSTEM_FOLDER, pick_note_color, _ensure_note_colors,
+                   SMART_FOLDERS, SYSTEM_FOLDER, RECYCLE_FOLDER, RECYCLE_TTL_DAYS,
+                   pick_note_color, _ensure_note_colors,
                    _note_head,
                    ALARM_INDEX_ID, ALARM_CELL_TAG,
                    folder_children, folder_depth, folder_ancestors,
+                   recycle_item_view,
                    set_all_collapsed, subtree_ids, MAX_FOLDER_DEPTH)
 from theme import FONT, on_accent
-from widgets import (CodeBlock, HRule, PopupMenu,
+from widgets import (CodeBlock, HRule, AlarmCard, PopupMenu, MENU_DANGER,
                      DLG_TEXT_W, SAVE_DEBOUNCE_MS, ROW_REFRESH_DEBOUNCE_MS,
-                     _icon_photo, _popover_bg, _popover_border, _mix_hex)
+                     _popover_bg, _popover_border, _mix_hex)
 from md_conv import (detect_prefix, find_urls, find_time_call, is_hr, parse_fence,
                      MD_LINK_RE,
                      LI_INDENT, BULLET_MARK, NUM_MARK, TRI_MARK, split_list_prefix,
@@ -36,6 +38,8 @@ import secret
 import backup
 import calc
 import alarm
+import imgstore
+import piclist
 from mention import find_mention, note_url, note_id_of_url, mention_text, rank
 from mention_ui import MentionPopup
 from doodle import DoodleLayer
@@ -53,6 +57,12 @@ EXPORT_KINDS = (
 # 为什么不在正文里保留 `[文字](url)` 再把它隐藏起来：隐藏要靠 elide，光标会在
 # 隐藏区里跳来跳去，删除/粘贴都会把括号吐回来。tag 跟着字符走，编辑起来才自然。
 LINK_TAG_PREFIX = "lk_"
+
+# 整行图片语法「下载中」的占位文字与标签。**模块级**而不是只挂在类上：
+# serialize() 里 _is_ephemeral_tag 要在测试用的假 app 上也能跑（那些 harness
+# 只混入方法、没有类属性），用 self.XXX 会 AttributeError。
+IMG_LOADING_TAG = "img_loading"
+IMG_LOADING_TEXT = "图片加载中…"
 
 
 
@@ -94,7 +104,10 @@ class ActionsMixin(object):
                 return
             password = pw
         try:
-            payload = backup.encode(self.data)
+            # 图片本体（data/media/）随备份带走：正文只存相对 src，
+            # 换机 / 存档时没有这些文件，图就全空了。
+            payload = backup.encode(self.data, extra={
+                "media": backup.pack_media(self.data.get("notes") or [])})
             nbytes = (backup.dump(path, payload) if plain else
                       backup.dump_container(path, payload, password=password))
         except Exception as e:
@@ -221,6 +234,10 @@ class ActionsMixin(object):
         mode = self._ask_import_mode(content_line, when)
         if not mode:
             return
+        # 图片本体写回 data/media/（在写库前：正文会引用这些相对路径）。
+        # 校验和不符时上面的确认已经问过；这里只管把带回来的资源落地。
+        if isinstance(raw, dict) and isinstance(raw.get("media"), dict):
+            backup.unpack_media(raw["media"])
         before = len(self.data["notes"])
         new = (backup.overwrite(d, self.data) if mode == "overwrite"
                else backup.merge(d, self.data))
@@ -412,6 +429,39 @@ class ActionsMixin(object):
         self._select_after_move(nid)
 
     def _popup(self, event, nid):
+        # getattr 兜底：老的单测用 _Stub 只实现动作层的一部分方法
+        if getattr(self, "_recycle_view", lambda: False)():
+            # 回收站里的 id 是回收记录 id，不是笔记 id —— 绝不能落进下面那条
+            # `data["notes"]` 查找（万一撞上同 id 的真笔记，菜单就全错了）。
+            if nid not in self._note_sel:
+                self._note_sel = {nid}
+                self._note_anchor = nid
+                self._restyle_notes()
+            m = PopupMenu(self.root, self.pal)
+            # 单条口径：只留「对这一条」的两个动作。批量口味（还原全部、清空回收站）
+            # 归左下角那枚回收站入口的右键菜单 —— 在单条上给出「清空回收站」太容易
+            # 点错，一次连带清掉别的项目。
+            if len(self._note_sel) > 1:
+                # 多选后右键（Shift/Ctrl 点出来的）：「清空」必须跟着选中集合走，
+                # 否则一次只能清一条，选了半天等于白选。文案带数量，点下去之前
+                # 就知道会动几项。
+                cnt = len(self._note_sel)
+                m.add("还原选中的 %d 项" % cnt, icon="move",
+                      command=lambda: self.recycle_restore())
+                m.add("清空选中的 %d 项" % cnt, icon="trash", danger=True,
+                      command=lambda: self.recycle_purge_items(
+                          list(self._note_sel)))
+                m.popup(event.x_root, event.y_root)
+                return
+            m.add("还原此项", icon="move",
+                  command=lambda: self.recycle_restore(rid=nid))
+            rec = store().recycle_get(nid)
+            is_folder = (rec or {}).get("kind") == "folder"
+            m.add("清空当前文件夹" if is_folder else "清空当前笔记",
+                  icon="trash", danger=True,
+                  command=lambda: self.recycle_purge_item(nid))
+            m.popup(event.x_root, event.y_root)
+            return
         n = next((x for x in self.data["notes"] if x["id"] == nid), None)
         if not n:
             return
@@ -488,9 +538,10 @@ class ActionsMixin(object):
         self.data["current_note"] = nid
         self.toggle_pin()
 
-    def _popup_delete(self, nid):
-        self.data["current_note"] = nid
-        self.delete_note()
+    def _popup_delete(self, nid, forever=False):
+        # ⚠️ 只把 nid 传下去，**不写** current_note：右键点的那一行未必是编辑器里
+        # 正打开的那篇，写进去等于「删一篇、顺手把另一篇也关了」。
+        self.delete_note(nid, forever=forever)
 
     # ---------- 跳到所属文件夹（智能分类 / 多级文件夹的父视图） ----------
 
@@ -922,6 +973,9 @@ class ActionsMixin(object):
             self._sync_line_tags()
             self.mark_modified()
             self.text.edit_modified(False)
+            # 折叠体检：光标落进隐藏区→先展开；被删空的折叠清理；chip 挪回头行末。
+            # 放在 mark_modified 之后：护栏自己展开折叠不写库，不抢保存链路。
+            self._fold_sync_after_edit()
             # 行号 / 查找高亮都依赖「正文现在的样子」：行数变了要重画，命中位置
             # 变了要重找。两个方法自己会判开关，没开行号 / 没开查找框时是空操作。
             self._gutter_schedule()
@@ -1120,7 +1174,13 @@ class ActionsMixin(object):
         if self._save_job is not None:
             self._cancel_after(self._save_job)
             self._save_job = None
-        save_data(self.data)
+        if save_data(self.data) is False:
+            # 保存失败就别动文件：数据在内存里，图也得留着做兜底快照/重试的料
+            return
+        # 落库成功后再回收孤儿图片：正文里被删掉的那张图，serialize 已经不再
+        # 引用它，这里把它在 data/media/ 下的文件一起删掉。放在 debounce 落库
+        # 之后而不是按键当场 —— 给「删了立刻撤销」留出把引用加回来的窗口。
+        self._img_gc(resave=False)
 
     def _schedule_active_row(self):
         """列表行的标题/预览刷新也去抖：不与输入抢主线程，但依然跟手。"""
@@ -1379,12 +1439,18 @@ class ActionsMixin(object):
         临时叠加，存进库里就是一段永远抹不掉的黄底；后者根本不是正文内容。
         `colsel`（竖向选择的矩形高亮）是最新的一个 —— 它纯粹是「刚才选过哪块」的
         显示状态，落库只会让重开时莫名多出一片蓝底。
+        `gfold*`（正文行折叠）同理：折叠是阅读视图状态，随正文存库等于把「当时
+        折到哪」也当成了内容；重开回到展开态才是合理默认。
         `firstline` 是旧版（2026-11-05 前）挂在首行压 spacing1 的排版标签，
         现已不再挂载；名字留在过滤表里只为兼容旧库可能存在的残留记录。
+        `img_loading`（远程图下载中的占位文字）同理：它是过程态，下载完就消失，
+        万一中途落库，颜色/斜体也不该被当成用户设置过的格式。
         """
         tag = str(tag)
         return (tag.startswith(self.LI_TAG_PREFIX)
-                or tag in ("find", "locked_ph", "colsel", "firstline"))
+                or tag.startswith("gfold")
+                or tag in ("find", "locked_ph", "colsel", "firstline",
+                           IMG_LOADING_TAG))
 
     def serialize(self):
         # 未解锁的加密笔记：编辑器里躺的是「文字已加密」这句占位话，它不是正文，
@@ -1406,16 +1472,23 @@ class ActionsMixin(object):
                 for ch in value:
                     out.append(["t", ch, sorted(active)])
             elif key == "image":
-                # 正文里的小闹钟。dump 只给出图片名，数据在内存表里 —— 名字对不上
-                # （比如历史遗留的图）就跳过，等于断掉那个不明来源的图元
+                # 图片。⚠️ 闹钟在 2026-11-18 改成了 AlarmCard 窗口，不再走这里；
+                # 老版本库里残留的 alarm 图名认领保留一段，保证升级中不丢内容。
                 d = self._alarms_get().get(value)
                 if d:
                     out.append(["alarm", {"id": d.get("id"), "text": d.get("text"),
                                           "at": d.get("at")}])
+                    continue
+                rec = self._imgs_get().get(value)
+                if rec and isinstance(rec.get("block"), list):
+                    out.append(rec["block"])
             elif key == "window":
                 w = self.text.nametowidget(value)
                 if isinstance(w, CodeBlock):
                     out.append(["code", w.lang, w.snapshot()])
+                    continue
+                if isinstance(w, AlarmCard):
+                    out.append(["alarm", w.snapshot()])
                     continue
                 if isinstance(w, HRule):
                     # 分割线是结构项，不占字符；它的样式完全由主题决定，无需存内容
@@ -1942,6 +2015,83 @@ class ActionsMixin(object):
                 pass
         return None
 
+    _INDENT_SPACES = " \u3000\u00a0"
+
+    def _indent_run_len(self, txt):
+        """一段文本里「一档缩进」的字符数：Tab 优先；否则最多 4 个半角/全角空格。
+
+        两格全角空格是列表的 LI_INDENT，四个半角空格是粘贴进来的代码缩进，
+        两者都算一档（正文 Tab 宽 = 2 汉字 ≈ 4 半角）。
+        """
+        if txt.startswith("\t"):
+            return 1
+        n = 0
+        for ch in txt[:4]:
+            if ch not in self._INDENT_SPACES:
+                break
+            n += 1
+        return n
+
+    def _editor_tab_maybe_shift(self, event):
+        """<Tab> 兜底：Shift 位亮着就当反向 Tab 处理，否则放行原本的插 Tab 行为。"""
+        if self._refuse_readonly():
+            return "break"              # <Tab> 顶掉了 <Key> 守卫，这里补上
+        if getattr(event, "state", 0) & 0x1:
+            return self._editor_shift_tab(event)
+        return None
+
+    def _editor_shift_tab(self, event=None):
+        """Shift+Tab：删掉一档缩进（Tab / 4 半角空格 / 2 全角空格，或选中行首）。
+
+        一律真删字符、不是改 tag：Tab 插进正文的是字面 `\\t`，列表用的是两格全角，
+        粘贴的代码又可能是四个半角，三种都按一档处理。撤一次 Ctrl+Z 就能回来。
+        多行选区按行首 outdent，自下而上删，免得前面的行号被带偏。
+        """
+        if self._refuse_readonly():
+            return "break"
+        t = self.text
+        if not self.current_note() or str(t.cget("state")) == tk.DISABLED:
+            return "break"
+
+        def _dedent_line(ln):
+            """删这一行行首的一档缩进，返回删掉的字符数。"""
+            txt = t.get("%d.0" % ln, "%d.end" % ln)
+            n = self._indent_run_len(txt)
+            if n:
+                t.delete("%d.0" % ln, "%d.%d" % (ln, n))
+            return n
+
+        sel = t.tag_ranges("sel")
+        if sel:
+            fl, fc = (int(x) for x in str(sel[0]).split("."))
+            ll, lc = (int(x) for x in str(sel[1]).split("."))
+            # 「选中到第 N+1 行行首」是常见的整行选法，那一行并没有被选到
+            if lc == 0 and ll > fl:
+                ll -= 1
+                lc = len(t.get("%d.0" % ll, "%d.end" % ll))
+            removed = {}
+
+            def _dedent_all():
+                for ln in range(ll, fl - 1, -1):
+                    removed[ln] = _dedent_line(ln)
+
+            self._find_edit_group(_dedent_all)
+            # 选区跟着文字一起收，别让退完缩进后选中的还是原来那几个字符位置
+            t.tag_remove("sel", "1.0", "end")
+            t.tag_add("sel", "%d.%d" % (fl, max(0, fc - removed.get(fl, 0))),
+                      "%d.%d" % (ll, max(0, lc - removed.get(ll, 0))))
+        else:
+            ln, col = (int(x) for x in t.index("insert").split("."))
+            before = t.get("%d.0" % ln, "%d.%d" % (ln, col))
+            n = self._indent_run_len(before[::-1])   # 倒过来查光标前的那一段
+            if n:
+                t.delete("%d.%d" % (ln, col - n), "insert")
+            else:
+                # 光标不在缩进尾巴上（含行首）：按常规 outdent 删行首一档
+                _dedent_line(ln)
+        self._sync_list_indent()
+        return "break"
+
     def _editor_return(self, event):
         """回车：若当前行是列表/待办，自动续接同格式；空列表项回车则结束列表。"""
         # 候选面板开着时，回车是「选中」而不是换行（面板没开就照原样走下去）
@@ -1954,6 +2104,13 @@ class ActionsMixin(object):
             return "break"
         self.text.config(state=tk.NORMAL)
         ln = self.text.index("insert").split(".")[0]
+        # ⚠️ 整行图片语法必须**最先**判：`![alt](src)` 里的 `[alt](src)` 会被
+        # 后面的 _convert_md_links 当成 markdown 链接拆掉（MD_LINK_RE 不认前面
+        # 那个 `!`），等轮到图片判断时行已经变了，永远是「回车没反应」。
+        img_line = self.text.get(ln + ".0", ln + ".end")
+        md_img = imgstore.parse_md_image(img_line)
+        if md_img is not None:
+            return self._img_line_break(ln, md_img[1], md_img[0])
         # 行尾刚敲完 date() / datetime() / [文字](url)：回车同样要展开，
         # 否则"敲空格才生效"会显得功能时灵时不灵
         if self._expand_time_token(ln):
@@ -2084,6 +2241,55 @@ class ActionsMixin(object):
         self._md_job = self._after_idle(lambda: self._md_convert_prefix(ln, idx))
         return None
 
+    def _md_after_paren(self, event=None):
+        """敲完 `)`：整行 `![alt](url)` 就地渲染，不必再按回车。
+
+        和「空格触发」共用同一条 idle 链（`_md_convert_prefix` 第一件事就是判
+        整行图片），两个入口必须同一口径。**不能 return "break"**：`)` 还得先
+        插进正文，转换在 idle 里做 —— 那会儿插入已经落定。
+        """
+        if not self.current_note() or self.is_readonly():
+            return None
+        try:
+            idx = self.text.index("insert")
+            ln = str(idx).split(".")[0]
+        except Exception:
+            return None
+        self._md_job = self._after_idle(lambda: self._md_convert_prefix(ln, idx))
+        return None
+
+    def _md_after_paste(self, event=None):
+        """粘贴后补一次整行图片识别：贴进来的 `![](url)` 直接变图。
+
+        默认粘贴发生在 class binding 里（本函数跑在它**之前**），所以只能等
+        idle 再看正文。**不能 return "break"**，否则粘贴本身就被吞掉。
+        """
+        if not self.current_note() or self.is_readonly():
+            return None
+        self._after_idle(self._md_image_after_paste_check)
+        return None
+
+    def _md_image_after_paste_check(self):
+        """粘贴落定后：当前行（含剪贴板带换行时的上一行）是不是整行图片语法。"""
+        if not self.current_note() or self.is_readonly():
+            return
+        try:
+            ln, col = self.text.index("insert").split(".")
+        except Exception:
+            return
+        cands = [ln]
+        if col == "0" and int(ln) > 1:
+            # 剪贴板里带结尾换行（复制一整行时很常见）：语法落在上一行
+            cands.insert(0, str(int(ln) - 1))
+        for n in cands:
+            try:
+                line = self.text.get(n + ".0", n + ".end")
+            except Exception:
+                continue
+            if imgstore.parse_md_image(line) is not None:
+                self._md_convert_prefix(n)
+                return
+
     def _md_convert_prefix(self, ln=None, idx=None):
         """idle 回调：真正做转换的地方。"""
         self._md_job = None
@@ -2097,6 +2303,13 @@ class ActionsMixin(object):
         # 网址识别与块级前缀无关，每行都查一次（打完半角空格即变蓝）
         # 顺序有讲究：先展开时间函数与富链接（它们会改写行内文字），再重新取一遍
         # 行文本做前缀判断，否则判断用的是改写前的内容。
+        # 整行图片语法优先：![alt](src) 里的 [alt](src) 会被 _convert_md_links
+        # 抢先当成普通链接拆掉（和回车入口同一个坑）。
+        img_line = self.text.get(ln + ".0", ln + ".end")
+        md_img = imgstore.parse_md_image(img_line)
+        if md_img is not None and self.current_note():
+            self._img_line_break(ln, md_img[1], md_img[0])
+            return
         if self._expand_time_token(ln):
             return
         # `$5+6=` 敲完空格 → 删掉 `$` 并补成 `5+6= 11`（见 calc.py）。放在前缀判断之前：
@@ -2236,6 +2449,256 @@ class ActionsMixin(object):
         self.text.edit_separator()
         self.mark_modified()
         return "break"
+
+    # ---------- 图片（Markdown 整行语法 / 粘贴） ----------
+    # 一张图在正文里是结构项 ["img", {id, src, w, h, alt}]，真实文件在
+    # data/media/<hash>.png；src 只存相对路径或图床 URL，绝不存绝对路径。
+    # 数据块的落库认领走 serialize() 的 image 分支（和闹钟同一条 dump 链）。
+
+    def _img_bytes_from_source(self, src):
+        """src → (图片字节, w, h)。本地路径读文件，http(s) 下载。失败抛异常。
+
+        w/h 只对本地位图有意义；网络图拿不到就给 0，渲染时按实际加载到的尺寸走。
+        """
+        src = str(src or "").strip().strip('"')
+        if imgstore.is_remote(src):
+            # 统一走 imgstore.fetch_bytes：https 握手被掐时它会自动降级 http 重试
+            return imgstore.fetch_bytes(src), 0, 0
+        # 本地：**先按 imgstore 的规范路径解释**（media/<hash>.png 这类，和渲染
+        # 用的是同一个函数，两边口径必须一致 —— 否则「正文里能显示的图」在
+        # 重新插入 / 从 Markdown 导入时反而报「找不到图片文件」）。
+        import store as _store
+        p = imgstore.src_path(src)
+        if not p:
+            # 用户手输的任意路径：相对路径按「项目根」解释（不是 cwd —— 双击
+            # exe 启动时 cwd 可能是桌面）
+            p = os.path.expanduser(src)
+            if not os.path.isabs(p):
+                p = os.path.join(os.path.dirname(_store.BASE), p)
+        if not os.path.isfile(p):
+            raise ValueError("找不到图片文件：%s" % src)
+        with open(p, "rb") as f:
+            return f.read(), 0, 0
+
+    def _img_make_block(self, data, alt="", w=0, h=0, ident=None):
+        """图片字节 → img 数据块（落 media/）。缩小上限走 imgstore 默认值。"""
+        return imgstore.make_block(data, alt=alt, base=None,
+                                   width=w, height=h, ident=ident)
+
+    # 整行图片语法「下载中」的占位文字与标签。标签进 _is_ephemeral_tag ——
+    # 占位只是过程态，样式不该跟着正文落库。（真值定义在模块级，见那里的说明）
+    IMG_LOADING_TAG = IMG_LOADING_TAG
+    IMG_LOADING_TEXT = IMG_LOADING_TEXT
+
+    def _img_line_break(self, ln, src, alt):
+        """整行 `![alt](src)` 敲完 `)` / 粘贴 / 回车：换成图片块。
+
+        undo 边界照抄 _hr_line_break：转换前后各一条 edit_separator，Ctrl+Z
+        一步退回原文，而不是一个字符一个字符地退。
+        """
+        # 远程图分两路：缓存里已有就直接读文件（同步是安全的，毫秒级）；
+        # 没有就排后台下载 —— ⚠️ 绝不在主线程上同步下网络图：慢网时整窗假死，
+        # https 被掐时还要白等 20 秒超时（见 imgstore.fetch_bytes 的说明）。
+        if imgstore.is_remote(src):
+            cached = self._img_cache_read(src)
+            if cached:
+                try:
+                    with open(cached, "rb") as f:
+                        block = self._img_block_remote(src, alt, f.read())
+                except Exception as e:
+                    self._show_error("插入图片失败", "读不到这张图片：\n%s" % e)
+                    return None
+                return self._img_line_place(ln, block, src, alt)
+            return self._img_line_break_remote(ln, src, alt)
+        try:
+            data, w, h = self._img_bytes_from_source(src)
+            block = self._img_make_block(data, alt=alt, w=w, h=h)
+        except imgstore.UnsupportedImage as e:
+            self._show_error("插入图片失败", str(e))
+            return None
+        except Exception as e:
+            self._show_error("插入图片失败", "读不到这张图片：\n%s" % e)
+            return None
+        return self._img_line_place(ln, block, src, alt)
+
+    def _img_block_remote(self, src, alt, png):
+        """远程图字节 → img 数据块。src 保留 URL，**不**在 media/ 里留副本。
+
+        远程图刻意不复制进 media/：用户要的是「改地址就换图」，复制一份本地
+        副本会让点开图片时看到本地路径、换地址还得改两处；缓存目录里已经存了
+        一份归一化 PNG 供渲染用，够离线看了。
+        """
+        png, w, h = imgstore.normalize_image(png)
+        self._img_cache_put(src, png)
+        return ["img", {"id": imgstore.img_id(), "src": src,
+                        "w": w, "h": h, "alt": str(alt or "")}]
+
+    def _img_line_place(self, ln, block, src, alt):
+        """把 ln 整行换成图片块。失败就把原文放回这一行，不让内容凭空消失。"""
+        self.text.edit_separator()
+        self.text.delete(ln + ".0", ln + ".end")
+        self.text.mark_set("insert", ln + ".0")
+        if not self._img_add(ln + ".0", block):
+            self.text.insert(ln + ".0", "![%s](%s)" % (alt, src))
+            self.text.edit_separator()
+            return None
+        # 图元不占字符：如果这一行是笔记最后一行（原来末尾没有换行），换完图光标
+        # 就贴在图元右边、无行可去 —— 用户接着打字会变成「图 + 正文」挤在一行。
+        # 补一个换行，让光标稳稳落到下一行（和回车插入图片的手感一致）。
+        if self.text.compare("%d.end" % int(ln), ">=", "end-1c"):
+            self.text.insert("%d.end" % int(ln), "\n")
+        self.text.mark_set("insert", "%d.0" % (int(ln) + 1))
+        self.text.edit_separator()
+        self.mark_modified()
+        self._img_after_insert(block)      # 图床模式的上传钩子（阶段④接线）
+        return "break"
+
+    def _img_line_break_remote(self, ln, src, alt):
+        """远程图：先把这行换成「图片加载中…」，后台下完再换成真图。
+
+        占位是必要的 —— 下载要好几秒，什么都不变会让用户以为「回车没反应」。
+        占位文字挂 img_loading 标签（ephemeral，不落库），并用一个 mark 记住
+        位置、记下此时是哪条笔记；回调时三样都对上才动手（mark 还在、那一行
+        仍是占位、笔记没切走），否则一律放弃 —— 绝不覆盖用户已经改成的别的内容。
+        """
+        nid = (self.current_note() or {}).get("id")
+        mark = "imgsrc_%s" % imgstore.img_id()
+        try:
+            self.text.edit_separator()
+            self.text.delete(ln + ".0", ln + ".end")
+            self.text.insert(ln + ".0", self.IMG_LOADING_TEXT,
+                             (self.IMG_LOADING_TAG,))
+            self.text.mark_set(mark, ln + ".0")
+            self.text.mark_gravity(mark, "left")
+            self.text.mark_set("insert", "%d.end" % int(ln))
+            self.text.edit_separator()
+        except tk.TclError:
+            return None
+        self._img_remote_async(
+            src, lambda path, err: self._img_line_break_done(
+                mark, path, err, nid, src, alt))
+        return "break"
+
+    def _img_line_break_done(self, mark, path, err, nid, src, alt):
+        """后台下载回来了：占位换真图；失败就把原文放回去并说清原因。"""
+        cur = self.current_note() or {}
+        if nid and cur.get("id") != nid:
+            return                        # 期间切走了笔记，这行已不归我管
+        try:
+            if mark not in self.text.mark_names():
+                return
+            ln = str(self.text.index(mark)).split(".")[0]
+            if self.text.get(ln + ".0", ln + ".end") != self.IMG_LOADING_TEXT:
+                return                    # 用户改了这一行：别覆盖他的内容
+        except tk.TclError:
+            return
+        if not path:
+            self._img_restore_line(ln, mark, src, alt)
+            self._show_error("插入图片失败",
+                             "读不到这张图片：\n%s" % (err or src))
+            return
+        try:
+            with open(path, "rb") as f:
+                block = self._img_block_remote(src, alt, f.read())
+        except Exception as e:
+            self._img_restore_line(ln, mark, src, alt)
+            self._show_error("插入图片失败", "读不到这张图片：\n%s" % e)
+            return
+        try:
+            self.text.mark_unset(mark)
+        except tk.TclError:
+            pass
+        self._img_line_place(ln, block, src, alt)
+
+    def _img_restore_line(self, ln, mark, src, alt):
+        """占位 → 原文 `![alt](src)`（下载失败时不留「图片加载中」这种假状态）。"""
+        try:
+            self.text.edit_separator()
+            self.text.delete(ln + ".0", ln + ".end")
+            self.text.insert(ln + ".0", "![%s](%s)" % (alt, src))
+            self.text.mark_set("insert", "%d.end" % int(ln))
+            self.text.edit_separator()
+        except tk.TclError:
+            return
+        try:
+            self.text.mark_unset(mark)
+        except tk.TclError:
+            pass
+
+
+    def _img_after_insert(self, block):
+        """插入图片后的钩子：配置了 PicList 时后台上传并改用图床 URL。
+
+        插入与上传解耦 —— 图已经嵌进正文、落库正常；上传在后台进行，成功后
+        **就地**把这一枚的 src 换成 URL、删掉本地文件，失败就保持本地图并轻提示。
+        不做同步等待，界面不卡。
+        """
+        settings = (self.data.get("settings") or {}) if getattr(self, "data", None) else {}
+        if not piclist.configured(settings):
+            return
+        try:
+            d = block[1]
+            src = str(d.get("src") or "")
+        except Exception:
+            return
+        path = imgstore.src_path(src)
+        if not path or not os.path.isfile(path):
+            return                      # 网络图 / 文件已不在：不必再传
+        note = self.current_note()
+        nid = note.get("id") if note else None
+        ident = str(d.get("id") or "")
+
+        def work():
+            return piclist.upload(settings, path)
+
+        def done(res):
+            ok, value = res if isinstance(res, tuple) else (True, res)
+            if not ok:
+                # 上传失败不影响本地图：弹一次说明（插图低频，用户需要知道
+                # 图没上图床），失败图仍好好地躺在 data/media/ 里。
+                self._show_info("图片已存本地", "图床上传失败，图片已保存在本地：\n%s" % value)
+                return
+            self._img_switch_to_remote(nid, ident, value, src)
+
+        self._img_async(work, done)
+
+    def _img_switch_to_remote(self, nid, ident, url, old_src):
+        """把某张图从本地切到图床 URL：改数据块 → 重嵌图片 → 删本地文件。"""
+        note = next((n for n in self.data.get("notes") or []
+                     if n.get("id") == nid), None)
+        if note is None:
+            return
+        changed = False
+        for it in note.get("content") or []:
+            if not (isinstance(it, list) and len(it) > 1 and it[0] == "img"):
+                continue
+            d = it[1]
+            if not isinstance(d, dict) or str(d.get("id")) != ident:
+                continue
+            if str(d.get("src")) != old_src:
+                continue                 # 期间被用户改过，别覆盖
+            d["src"] = url
+            changed = True
+            break
+        if not changed:
+            return
+        # 正文里那枚图元也要换成图床图；只在它仍是当前打开笔记时处理
+        cur = self.current_note()
+        if cur and cur.get("id") == nid:
+            name = "img:" + ident
+            try:
+                idxs = [i for i in self.text.image_names() if i == name]
+                if idxs:
+                    # 重新造一张 PhotoImage（用 URL 缓存），原地换图，不挪光标
+                    proxy = ["img", dict(d)]
+                    photo = self._img_photo(proxy)
+                    if photo is not None:
+                        self.text.image_configure(name, image=photo)
+                        self._imgs_get()[name] = {"photo": photo, "block": proxy}
+            except Exception:
+                pass
+        imgstore.remove_local(old_src)
+        store().save(self.data)
 
     def _fence_line_break(self, ln, lang=""):
         """整行只有 ``` 加语言名时按回车：删掉这行原文，就地生成代码块。
@@ -2941,7 +3404,7 @@ class ActionsMixin(object):
         self.text.bind("<MouseWheel>", lambda e: self._hide_cell_tip(), add="+")
 
     # ---------- 悬停看「任务提醒列表」里被截断的格子 ----------
-    # 五列固定宽度（store.ALARM_COLS），超宽的格子在正文里只剩前半截 + …；
+    # 四列固定宽度（store.ALARM_COLS），超宽的格子在正文里只剩前半截 + …；
     # 原样文字由 alarm_index_content 收在 tips 里（app.refresh 时缓存到
     # _alarm_cell_tips），这里只负责「指针压在哪一格 → 把那一格的全文字浮出来」。
 
@@ -3176,88 +3639,665 @@ class ActionsMixin(object):
         self.mark_modified()
         return True
 
-    # ---------- 任务提醒（正文里的小闹钟） ----------
-    # 一条提醒在正文里就是一枚 16px 的位图（icon/notice.png），数据分两处放：
-    #   self._alarms —— "alarm:<id>" → {"id","text","at"}，只在当前笔记打开时有效
-    #   content      —— ["alarm", {...}]，落库的唯一形态（见 serialize）
-    # 「响过没有」两边都不放，记在 settings["alarm_fired"]（理由见 alarm.py 文件头）。
-    #
-    # 为什么用 text.image_create 而不是像待办那样用字面字符：待办的方框是字体里的
-    # 一个字形，而这里是用户给的一张彩色图 —— 造字这条路走不通（Tk 8.6 还只认 BMP）。
-    # 代价是它成了「不占字符的结构项」，序列化必须显式认领（dump 的 image 分支），
-    # 忘了认它就会在重开笔记时凭空消失。
+    # ---------- 任务提醒（正文里的卡片） ----------
+    # 2026-11-18 改版：正文从「一枚 16px 小闹钟」升级成 AlarmCard 卡片。
+    #   self._alarms —— "alarm:<id>" → {"id","text","at"}，当前笔记打开时有效
+    #   self._alarm_cards —— 同键 → AlarmCard 实例（窗口控件），换肤/状态翻转就地重画
+    #   content          —— ["alarm", {...}]，落库的唯一形态（见 serialize）
+    # 卡片是 text.window_create 嵌的窗口，跟代码块/分割线同一条机制：不占字符、
+    # 整块删除，序列化从 dump(window=True) 认领；「响过没有」仍记在
+    # settings["alarm_fired"]（理由见 alarm.py 文件头），确认态记在 alarm_acked。
 
     ALARM_TICK_MS = 20000        # 轮询间隔：20 秒。再密没有意义（提醒的容差是分钟级）
 
     def _alarms_get(self):
-        """当前笔记的闹钟表：图片 name → 数据。切笔记时整体换掉。"""
+        """当前笔记的闹钟表：name → 数据。切笔记时整体换掉。"""
         m = getattr(self, "_alarms", None)
         if not isinstance(m, dict):
             m = self._alarms = {}
         return m
 
-    def _alarm_photo(self):
-        """正文里那枚小闹钟。尺寸固定，全程序共用一张。
+    def _alarm_cards_get(self):
+        """当前笔记的卡片表：name → AlarmCard；与 _alarms 同键。"""
+        m = getattr(self, "_alarm_cards", None)
+        if not isinstance(m, dict):
+            m = self._alarm_cards = {}
+        return m
 
-        颜色取调色板的 star（琥珀）：既保留「提醒/警示」语义，又随主题走
-        （深色主题下 star 自动提亮，不会像原色黑图标那样糊进深色稿纸）。
+    def _alarm_card_state(self, data):
+        """卡片/汇总表共用的四态判定：查 ack 后交给 alarm.state_of。"""
+        return alarm.state_of(data, acked=self._alarm_is_acked(data))
 
-        ⚠️ 必须挂在实例上保活：PhotoImage 一旦被 GC，Tk 里那个位置就变成空白，
-        而且不会当场报错 —— 要等下一次重绘才显形，极难查。
-        """
-        if not hasattr(self, "_alarm_img"):
-            try:
-                color = (self.pal or {}).get("star", "#f5a623")
-                self._alarm_img = _icon_photo(self.root, "notice.png",
-                                             dpi.px(16), color)
-            except Exception:
-                self._alarm_img = None
-        return self._alarm_img
+    def _alarm_is_acked(self, data):
+        return bool(self._alarm_acked_map().get(self._alarm_state_key(data)))
+
+    def _alarm_state_key(self, data):
+        """当前周期的 acked/fired 键：once 用旧键，重复提醒带 @日期槽位。"""
+        return alarm.state_key(self._alarm_key(data), data)
 
     def _alarm_add(self, idx, data, move=True):
-        """在 idx 处放一枚闹钟并登记数据；图缺失时返回 False（正文不动）。
+        """在 idx 处放一张提醒卡片并登记数据；失败返回 False（正文不动）。
 
         渲染旧笔记时 move=False —— 那时候光标该由载入流程自己摆，不能被这里挪走。
         """
-        img = self._alarm_photo()
-        if img is None:
-            return False
         d = {"id": data.get("id") or alarm.new_id(),
              "text": alarm.normalize_text(data.get("text")),
              "at": float(data.get("at") or 0)}
+        # 重复规则整块带上；once 不写额外字段（没有 repeat 键 = 老数据，天然兼容）
+        if alarm.repeat_kind(data) != alarm.REPEAT_ONCE:
+            d.update(alarm.normalize_rule(alarm.repeat_kind(data),
+                                          alarm.hm_of(data), data.get("days")))
         name = "alarm:" + d["id"]
         try:
-            self.text.image_create(idx, image=img, name=name)
+            src = _note_head(self.current_note() or {}) or "本笔记"
+            card = AlarmCard(self.text, self, d, source=src)
+            self.text.window_create(idx, window=card, padx=0, pady=dpi.px(3))
+            card.set_width(self._code_width())
+            # 卡片是块级结构项，必须独占一行：正文中它占位 1 字符，紧随其后若不是
+            # 换行就补一个。⚠️ 用 `at +1c`（窗口占位符**之后**）取字符 —— 早期版本
+            # 取 `at` 本身，读到的是窗口占位符的空串，判断永远成立、把已有换行也
+            # 重复插一遍。这个换行会被 serialize() 当普通文本落库，往返稳定。
+            at = self.text.index(card)
+            nxt = self.text.get("%s +1c" % at, "%s +1c lineend" % at)
+            if nxt.strip("\n") or not nxt:
+                self.text.insert("%s +1c" % at, "\n")
+                at = self.text.index(card)
             if move:
-                self.text.mark_set("insert", "%s +1c" % idx)
+                self.text.mark_set("insert", "%s +2c" % at)
         except Exception:
             return False
         self._alarms_get()[name] = d
+        self._alarm_cards_get()[name] = card
+        return True
+
+    def _on_paste_image(self, event=None):
+        """剪贴板里是位图时：存 media、嵌进正文，并吞掉默认文本粘贴。
+
+        放在 <<Paste>> 链的**最后**（见 app_ui 的绑定顺序）：前面的 todo 修复
+        只记行号、不 return break；这里若发现不是图片就放行，Tk 默认插入照常。
+        """
+        if not self.current_note() or self.is_readonly():
+            return None
+        try:
+            from PIL import ImageGrab
+            im = ImageGrab.grabclipboard()
+        except Exception:
+            return None
+        if im is None or not hasattr(im, "save"):
+            return None                 # 剪贴板是文字 / 文件路径，交给默认粘贴
+        try:
+            import io
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+            block = self._img_make_block(buf.getvalue(), alt="粘贴的图片")
+        except Exception as e:
+            self._show_error("插入图片失败", "剪贴板图片读不出来：\n%s" % e)
+            return "break"
+        self.text.config(state=tk.NORMAL)
+        self.text.edit_separator()
+        if self._img_add(tk.INSERT, block, move=True):
+            self.text.edit_separator()
+            self.mark_modified()
+            self._img_after_insert(block)
+            return "break"
+        self.text.edit_separator()
+        return None
+
+    def _img_gc(self, resave=True):
+        """清理 data/media/ 下没人引用的图片。
+
+        引用方 = 当前全库 + 回收站快照里的笔记（删了还能还原，图不能先没）。
+        图床模式上传成功后已即时删了本地文件，这里只兜底「删笔记 / 空块」留下的。
+        `resave=False` 用于落库链路（_flush_save 已存过）避免二次写库。
+        """
+        notes = list(self.data.get("notes") or [])
+        try:
+            # 回收站快照也算引用方：单条笔记 / 文件夹子树两种形状由纯函数统一处理
+            notes.extend(imgstore.notes_from_recycle(store().recycle_all()))
+        except Exception:
+            pass
+        try:
+            removed = imgstore.gc_orphans(notes)
+        except Exception:
+            return
+        if removed and resave:
+            save_data(self.data)
+
+    def _imgs_get(self):
+        """当前笔记的图片对象表：name → PhotoImage。切笔记时整体换掉。"""
+        m = getattr(self, "_imgs", None)
+        if not isinstance(m, dict):
+            m = self._imgs = {}
+        return m
+
+    def _img_photo(self, block):
+        """img 数据块 → PhotoImage。失败返回 None（正文里就不放图，不留空位）。
+
+        ⚠️ PhotoImage 必须挂在实例上保活，和闹钟同一个坑：对象被 GC 后 Tk 里
+        那块位置变空白且不报错，要等下一次重绘才显形。
+
+        ⚠️ 这里**只读本地 / 缓存，绝不联网**。以前图床 URL 是就地同步下载的，
+        打开一条带远程图的笔记＝主线程上串行下 N 张图，网络一慢整窗假死；
+        https 被掐时还要白等 20 秒超时。取不到的交给 _img_add 排后台任务。
+        """
+        try:
+            d = block[1] if len(block) > 1 and isinstance(block[1], dict) else {}
+        except Exception:
+            return None
+        src = str(d.get("src") or "")
+        if not src:
+            return None
+        path = imgstore.src_path(src)
+        if path is None and imgstore.is_remote(src):
+            path = self._img_cache_read(src)
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            return tk.PhotoImage(file=path)
+        except tk.TclError:
+            return None
+
+    def _img_cache_path(self, url):
+        """图床 URL → 本地缓存文件路径（按 URL 的 hash 命名，同一地址只存一份）。"""
+        import hashlib
+        import store as _store
+        cache = os.path.join(_store.BASE, imgstore.MEDIA_DIR_NAME, "cache")
+        try:
+            os.makedirs(cache, exist_ok=True)
+        except OSError:
+            return None
+        return os.path.join(cache,
+                            hashlib.sha256(url.encode("utf-8")).hexdigest()[:20] + ".png")
+
+    def _img_cache_put(self, url, png):
+        """把已经拿到的图浏览器缓存写盘 —— 免得渲染时按 URL 再下一次。"""
+        path = self._img_cache_path(url)
+        if not path:
+            return False
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(png)
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            return False
+
+    def _img_cache_read(self, url):
+        """缓存里**已有**这张图 → 返回路径；没有返回 None。只碰文件，绝不联网。"""
+        path = self._img_cache_path(url)
+        if path and os.path.isfile(path):
+            return path
+        return None
+
+    def _img_cache_fetch(self, url):
+        """确保缓存里有这张图 → (路径|None, 失败原因|None)。
+
+        ⚠️ 只许在后台线程里调（会联网 + 写盘）。主线程调它就是把它同步下载
+        的老问题原样搬回来。下载统一走 imgstore.fetch_bytes（自带 https→http
+        降级 +「是不是真图片」的魔数校验）。
+        """
+        path = self._img_cache_read(url)
+        if path:
+            return path, None
+        path = self._img_cache_path(url)
+        if not path:
+            return None, "缓存目录不可用"
+        try:
+            raw = imgstore.fetch_bytes(url)
+            png, _w, _h = imgstore.normalize_image(raw)
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(png)
+            os.replace(tmp, path)
+            return path, None
+        except Exception as e:
+            try:
+                if os.path.exists(path + ".tmp"):
+                    os.remove(path + ".tmp")
+            except OSError:
+                pass
+            return None, (str(e) or type(e).__name__)
+
+    def _img_remote_async(self, url, cb):
+        """图床图后台取：缓存命中立刻回调；否则线程里下、回主线程调 cb(path, err)。
+
+        同一 URL 的并发请求合并成一次下载 —— 一条笔记里同一张图可能出现好几次
+        （引用同一地址 / 重开后重渲染），没必要发 N 个请求。
+        回调里的异常要吞掉：那是别的图元的事，不能让它打断整条回传链。
+        """
+        cached = self._img_cache_read(url)
+        if cached:
+            cb(cached, None)
+            return
+        waiters = getattr(self, "_img_waiters", None)
+        if not isinstance(waiters, dict):
+            waiters = self._img_waiters = {}
+        if url in waiters:
+            waiters[url].append(cb)      # 已经在下了：挂上去等同一份结果
+            return
+        waiters[url] = [cb]
+
+        def work():
+            return self._img_cache_fetch(url)
+
+        def done(res):
+            path, err = None, None
+            if isinstance(res, tuple) and len(res) == 2:
+                path, err = res
+                if path is False:        # _img_async 的异常回传协议 (False, msg)
+                    path, err = None, (err or "下载失败")
+            for f in waiters.pop(url, []):
+                try:
+                    f(path, err)
+                except Exception:
+                    pass
+
+        self._img_async(work, done)
+
+    def _img_loading_photo(self):
+        """远程图未就绪时的灰色占位块（全程序共用一张，尺寸固定）。
+
+        作用只有一个：先占住图元的位置，让 image_configure 能在原位换图；
+        没有它就得等下载完再把图插进正文，用户会看到「文字突然消失又出现」。
+        """
+        ph = getattr(self, "_img_loading_ph", None)
+        if ph is None:
+            w, h = dpi.px(180), dpi.px(56)
+            ph = tk.PhotoImage(width=w, height=h)
+            ph.put(self.pal.get("line") or "#dcdce0", to=(0, 0, w, h))
+            self._img_loading_ph = ph
+        return ph
+
+    def _img_broken_photo(self):
+        """下载失败的占位块：灰底 + 一个 ✕（按主题色画，换肤后重建）。"""
+        key = (self.pal.get("line"), self.pal.get("soft"))
+        ph = getattr(self, "_img_broken_ph", None)
+        if ph is not None and getattr(self, "_img_broken_key", None) == key:
+            return ph
+        w, h = dpi.px(180), dpi.px(56)
+        bg = key[0] or "#dcdce0"
+        fg = key[1] or "#76767e"
+        cx, cy = w // 2, h // 2
+        arm = max(4, dpi.px(7))
+        grid = [[bg] * w for _ in range(h)]
+        # 两笔 2px 粗的对角线拼成 ✕（Canvas 走 GDI 不抗锯齿，整数像素最干净）
+        for i in range(-arm, arm + 1):
+            for t in (0, 1):
+                for (x, y) in ((cx + i, cy + i + t), (cx + i, cy - i + t)):
+                    if 0 <= x < w and 0 <= y < h:
+                        grid[y][x] = fg
+        ph = tk.PhotoImage(width=w, height=h)
+        ph.put(" ".join("{" + " ".join(row) + "}" for row in grid))
+        self._img_broken_ph, self._img_broken_key = ph, key
+        return ph
+
+    def _img_swap(self, name, path, err=None):
+        """占位块 → 真图（主线程回调）。下载失败就换成「✕」占位块。"""
+        rec = self._imgs_get().get(name)
+        if not isinstance(rec, dict):
+            return                       # 已切笔记 / 图已删：这枚图元不归我管了
+        if not path:
+            # ⚠️ **绝不能删这枚图元**：图元是数据块在 serialize() 里的唯一凭据，
+            # 删掉它下一次落库就把这块图从正文里抹掉 —— 一次临时断网 = 永久丢图。
+            # 换成 ✕ 占位块：图还在、块还在，点一下就是现成的重试入口
+            # （图片地址对话框里改回这个 URL，确定即可重新下载）。
+            try:
+                photo = self._img_broken_photo()
+                self.text.image_configure(name, image=photo)
+            except tk.TclError:
+                return
+            rec["photo"] = photo
+            return
+        try:
+            photo = tk.PhotoImage(file=path)
+        except tk.TclError:
+            return
+        try:
+            self.text.image_configure(name, image=photo)
+        except tk.TclError:
+            return
+        rec["photo"] = photo             # 保活：换掉的那张可以被回收了
+
+    def _img_add(self, idx, block, move=False):
+        """在 idx 处嵌一张图并登记数据；返回是否成功。
+
+        ⚠️ name 用 "img:<id>" 而不是图片路径：serialize 靠 name 前缀认领，
+        重开笔记时同一张图的 src 可能已从本地换成图床 URL，name 必须稳定。
+        """
+        try:
+            d = block[1] if len(block) > 1 and isinstance(block[1], dict) else {}
+        except Exception:
+            return False
+        ident = str(d.get("id") or imgstore.img_id())
+        name = "img:" + ident
+        photo = self._img_photo(block)
+        remote = ""
+        if photo is None:
+            # 远程图还没缓存：先塞灰块占位 + 排后台下载，下载完原地换图。
+            # 本地图取不到就是真坏了（文件被删 / 格式 Tk 不认），照旧判失败。
+            src = str(d.get("src") or "")
+            if not imgstore.is_remote(src):
+                return False
+            photo = self._img_loading_photo()
+            remote = src
+        try:
+            self.text.image_create(idx, image=photo, name=name, padx=2, pady=2)
+            if move:
+                self.text.mark_set("insert", "%s +1c" % idx)
+        except tk.TclError:
+            return False
+        # 同时存 block：serialize 靠 name 反查原数据（src/w/h/alt 全在这里）
+        self._imgs_get()[name] = {"photo": photo, "block": block}
+        if remote:
+            self._img_remote_async(remote,
+                                   lambda path, err, n=name: self._img_swap(n, path, err))
+        return True
+
+    # ---------- 点击图片 → 看 / 改它的 Markdown 源 ----------
+    # 为什么是弹窗而不是「把图就地换成一行 ![](url)」：正文里的图是 image_create
+    # 图元，换成文字之后 Tk 的 undo 只记字符、**不记图元** —— 用户随手一下 Ctrl+Z，
+    # 那枚图就再也回不来；而此刻数据块已经不在 serialize() 里，本地文件会被
+    # _img_gc 当成孤儿清掉，等于「撤销一步 = 删图」。弹窗只改数据块的 src，
+    # 图元原地 image_configure 换图，撤销 / 落库 / 孤儿回收还是原来那条链。
+
+    # ---------- 图片右键菜单：改地址 / 上传图床 ----------
+
+    def _img_popup(self, e, name):
+        """右键某张图：远程图给「复制地址 / 更换地址」，本地图再加「上传到图床」。
+
+        点击已经不再弹窗了（用户定的：悬停看 Markdown 源），改地址、上传都收到
+        这里来。只读笔记只给复制类动作；「更换地址」置灰时**把原因写进 label** ——
+        一项点不动的菜单，用户会以为程序坏了。
+        """
+        rec = self._imgs_get().get(name)
+        block = rec.get("block") if isinstance(rec, dict) else None
+        if not (isinstance(block, list) and len(block) > 1
+                and isinstance(block[1], dict)):
+            return
+        src = str(block[1].get("src") or "")
+        local = imgstore.is_local(src)
+        ro = self.is_readonly()
+        settings = (self.data.get("settings") or {}) if getattr(self, "data", None) else {}
+        bed = piclist.configured(settings)
+
+        m = PopupMenu(self.root, self.pal)
+        if local:
+            if ro:
+                up_label, up_ok = "上传到图床（只读笔记）", False
+            elif not bed:
+                up_label, up_ok = "上传到图床（需先在设置里填 PicList路径）", False
+            else:
+                up_label, up_ok = "上传到图床", True
+            m.add(up_label, icon="export", enabled=up_ok,
+                  command=lambda: self._img_upload_local(name))
+            m.add("复制本地路径", icon="folder",
+                  command=lambda: self._img_copy_src(name, True))
+        else:
+            m.add("复制图片地址", icon="link",
+                  command=lambda: self._img_copy_src(name, False))
+        m.add_separator()
+        m.add("更换图片地址（只读笔记）" if ro else "更换图片地址…", icon="pencil",
+              enabled=not ro, command=lambda: self._img_source_dialog(name))
+        try:
+            m.popup(e.x_root, e.y_root)
+        except Exception:
+            pass
+
+    def _img_copy_src(self, name, local=False):
+        """复制图片地址：本地图给**绝对路径**（拿去别处能直接用），远程给 URL。"""
+        rec = self._imgs_get().get(name)
+        block = rec.get("block") if isinstance(rec, dict) else None
+        if not (isinstance(block, list) and len(block) > 1
+                and isinstance(block[1], dict)):
+            return
+        src = str(block[1].get("src") or "")
+        text = (imgstore.src_path(src) or src) if local else src
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+        except tk.TclError:
+            pass
+
+    def _img_upload_local(self, name):
+        """本地图 → 图床：后台上传，成功后把这一枚的 src 换成 URL 并删本地文件。
+
+        与插入时自动上传（`_img_after_insert`）走同一个落点 `_img_switch_to_remote`：
+        两条路径的行为必须一致，否则「插入时传」和「右键再传」会出现两种数据形状。
+        """
+        rec = self._imgs_get().get(name)
+        block = rec.get("block") if isinstance(rec, dict) else None
+        if not (isinstance(block, list) and len(block) > 1
+                and isinstance(block[1], dict)):
+            return
+        d = block[1]
+        src = str(d.get("src") or "")
+        ident = str(d.get("id") or "")
+        path = imgstore.src_path(src)
+        if not path or not os.path.isfile(path):
+            self._show_alert("上传失败",
+                             "这张图的本地文件不在了：\n%s" % (path or src), "error")
+            return
+        settings = (self.data.get("settings") or {}) if getattr(self, "data", None) else {}
+        if not piclist.configured(settings):
+            self._show_alert("上传失败",
+                             "还没有配置 PicList：\n设置 → 图片与图床 → PicList路径")
+            return
+        note = self.current_note()
+        nid = note.get("id") if note else None
+        if not nid:
+            return
+
+        def work():
+            return piclist.upload(settings, path)
+
+        def done(res):
+            ok, value = res if isinstance(res, tuple) else (True, res)
+            if not ok:
+                # 失败不动本地图：文件还在 media/ 里，正文照旧能显示
+                self._show_alert("上传失败", str(value), "error")
+                return
+            self._img_switch_to_remote(nid, ident, value, src)
+            self._show_info("已上传到图床",
+                            "正文里的地址已换成：\n%s" % value)
+
+        self._img_async(work, done)
+
+    def _img_source_dialog(self, name):
+        """弹出某张图的 Markdown 源：改地址 → 换图；只读笔记只看不改。"""
+        rec = self._imgs_get().get(name)
+        block = rec.get("block") if isinstance(rec, dict) else None
+        if not (isinstance(block, list) and len(block) > 1
+                and isinstance(block[1], dict)):
+            return
+        d = block[1]
+        old_src = str(d.get("src") or "")
+        old_alt = str(d.get("alt") or "")
+        p = self.pal
+        ro = self.is_readonly()
+
+        win = self._dlg_body("图片地址")
+        tk.Label(win, text="Markdown", bg=p["top"], fg=p["soft"], anchor="w",
+                 font=(FONT[0], 11)).pack(fill=tk.X, padx=dpi.px(16),
+                                          pady=(dpi.px(14), dpi.px(4)))
+        var = tk.StringVar(value=imgstore.format_md_image(block))
+        entry = tk.Entry(win, textvariable=var, font=(FONT[0], 11), bg=p["editor"],
+                         fg=p["text"], insertbackground=p["accent"], relief=tk.FLAT,
+                         bd=0, highlightthickness=dpi.px(1),
+                         highlightbackground=p["line"], highlightcolor=p["accent"],
+                         readonlybackground=p["editor"], width=52,
+                         state=("readonly" if ro else tk.NORMAL))
+        entry.pack(fill=tk.X, padx=dpi.px(16), ipady=dpi.px(5))
+        tip = tk.Label(win,
+                       text=("只读笔记，地址只能看不能改。" if ro else
+                             "改方括号后面的地址（本地路径或图床 URL），确定后按新地址重新加载。"),
+                       bg=p["top"], fg=p["soft"], anchor="w", justify="left",
+                       font=(FONT[0], 10), wraplength=dpi.px(398))
+        tip.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(6), 0))
+        err = tk.Label(win, text="", bg=p["top"], fg=MENU_DANGER, anchor="w",
+                       justify="left", font=(FONT[0], 10), wraplength=dpi.px(398))
+        err.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(4), 0))
+
+        state = {"busy": False}
+
+        def close(_=None):
+            win.destroy()
+            return "break"
+
+        def copy_md():
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(var.get())
+            except tk.TclError:
+                pass
+
+        def apply(_=None):
+            if ro or state["busy"]:
+                return "break"
+            got = imgstore.parse_md_image_input(var.get(), old_alt)
+            if got is None:
+                err.configure(text="请填图片地址：本地路径或 http(s) 链接。")
+                return "break"
+            alt, src = got
+            if src == old_src and alt == old_alt:
+                close()
+                return "break"
+            if src == old_src:
+                # 只改了 alt：不用重新加载，直接写回去
+                d["alt"] = alt
+                self.mark_modified()
+                close()
+                return "break"
+            state["busy"] = True
+            err.configure(text="正在加载图片…", fg=p["soft"])
+
+            def work():
+                return (True, self._img_fetch(src))
+
+            def done(res):
+                if not win.winfo_exists():
+                    return                      # 加载期间用户把窗关了
+                state["busy"] = False
+                ok, value = res if isinstance(res, tuple) else (True, res)
+                if not ok:
+                    err.configure(text=str(value), fg=MENU_DANGER)
+                    return
+                png, w, h, final_src = value
+                if not self._img_apply_source(name, block, alt, final_src,
+                                              png, w, h):
+                    err.configure(text="这张图片显示不出来（格式不支持或文件已损坏）。",
+                                  fg=MENU_DANGER)
+                    return
+                win.destroy()
+
+            self._img_async(work, done)
+            return "break"
+
+        def focus_url():
+            """选中地址那一段：粘个新地址就是直接替换，不必先手工删掉。"""
+            md = var.get()
+            i = md.rfind("](")
+            if i >= 0 and md.endswith(")"):
+                try:
+                    entry.selection_range(i + 2, len(md) - 1)
+                    entry.icursor(len(md) - 1)
+                except tk.TclError:
+                    pass
+            entry.focus_set()
+
+        if ro:
+            self._dlg_buttons(win, close, None, ok_text="关闭")
+        else:
+            btns = self._dlg_buttons(win, apply, close)
+            tk.Button(btns, text="复制", width=6, bd=0, relief=tk.FLAT,
+                      bg=p["editor"], fg=p["soft"], font=(FONT[0], 11),
+                      cursor="hand2", activebackground=p["hover"],
+                      activeforeground=p["selfg"],
+                      command=copy_md).pack(side=tk.LEFT)
+
+        win.bind("<Return>", close if ro else apply)
+        win.bind("<Escape>", close)
+        win.protocol("WM_DELETE_WINDOW", close)
+        self._center_dialog(win, min_w=430)
+        win.grab_set()
+        focus_url()
+        win.wait_window()
+
+    def _img_fetch(self, src):
+        """src → (png 字节, w, h, 可落库的 src)。后台线程里跑，只读文件 / 网络。
+
+        ⚠️ 本地图片一律收进 media/ 再返回相对路径：用户的输入可能是
+        `C:\\图片\\a.png`，直接存进笔记就是绝对路径 —— 换台机器断链，也正是
+        imgstore「src 只存 media/ 或 URL」这条红线要挡的东西。
+        图床 URL 原样保留，顺带把字节带回去落缓存，渲染时不必再下一次。
+        """
+        if imgstore.is_remote(src):
+            raw, _w, _h = self._img_bytes_from_source(src)
+            png, w, h = imgstore.normalize_image(raw)
+            return png, w, h, src
+        if imgstore.src_path(src) is not None:
+            p = imgstore.src_path(src)
+            if not os.path.isfile(p):
+                raise ValueError("找不到本地图片：%s" % src)
+            # media/ 里已有的：字节不用重写，但**宽度高度要读出来** —— 换地址后
+            # 沿用旧尺寸的话，导出 / 占位会按错的比例走（media 里一律是归一化 PNG，
+            # 读 IHDR 就够，不必过 Pillow）。
+            with open(p, "rb") as f:
+                w, h = imgstore.png_size(f.read(24))
+            return b"", w, h, src
+        raw, _w, _h = self._img_bytes_from_source(src)
+        saved = imgstore.save_image(raw)    # 归一化 + 落 media/ + 去重
+        return b"", saved.get("w", 0), saved.get("h", 0), saved["src"]
+
+    def _img_apply_source(self, name, block, alt, src, png, w, h):
+        """把新地址写进数据块并当场换图；显示不出来就整块回滚，返回 False。"""
+        try:
+            d = block[1]
+        except Exception:
+            return False
+        backup = dict(d)
+        if imgstore.is_remote(src) and png:
+            # 字节已经在手上，先落缓存：否则 _img_photo 会立刻按 URL 再下一次
+            self._img_cache_put(src, png)
+        d["src"] = src
+        d["alt"] = str(alt or "")
+        if w and h:
+            d["w"], d["h"] = int(w), int(h)
+        photo = self._img_photo(block)
+        ok = photo is not None
+        if ok:
+            try:
+                self.text.image_configure(name, image=photo)
+            except tk.TclError:
+                ok = False
+        if not ok:
+            d.clear()
+            d.update(backup)                # 回滚：正文里不能留一块空白
+            return False
+        self._imgs_get()[name] = {"photo": photo, "block": block}
+        # 旧本地文件不在这里删：同一张图可能被别的笔记共用（hash 去重），
+        # 交给落库后的 _img_gc 按全库引用统一回收。
+        self.mark_modified()
         return True
 
     def _refresh_alarm_images(self):
-        """换肤后刷新正文里已嵌入的闹钟图标（按 star 染色）。
+        """换肤 / 确认态翻转后，就地重画正文里的每张提醒卡片。
 
-        闹钟位图嵌在 Text 内、全程序共用一张缓存的 PhotoImage；只把缓存置空，
-        那些已经嵌入正文的实例不会自动跟着变 —— Tk 是按引用持有旧图对象。这里重新
-        取一张新色图，再把每个已嵌入位置 image_configure 到新图。名字（name）不变，
-        所以序列化落库不受影响。
-
-        切笔记时 self._alarms 已被置空，遍历的键就只是当前笔记里真实存在的闹钟。
+        名字沿用旧入口（app_ui.set_theme 调它），语义已换成卡片：逐张 apply_theme
+        （配色重算 + 清图标缓存）再 refresh（状态文字重算）。绝不重建正文 —— 那会
+        动光标和 undo 栈。切笔记时卡片表已清空，遍历到的就是当前笔记真实存在的。
         """
-        # 先清缓存，让 _alarm_photo 按新主题 star 重新染色
-        self._alarm_img = None
-        new_img = self._alarm_photo()
-        if new_img is None:
-            return
-        text = getattr(self, "text", None)
-        if text is None or not hasattr(text, "image_configure"):
-            return
-        for name in list(self._alarms_get().keys()):
+        for name, card in list(self._alarm_cards_get().items()):
             try:
-                text.image_configure(name, image=new_img)
+                if card.winfo_exists():
+                    card.apply_theme(self.pal)
+                    card.refresh()
             except Exception:
-                # 名字已不在正文（例如刚切了笔记但 _alarms 还没清）就跳过
                 pass
 
     def insert_alarm(self):
@@ -3269,23 +4309,31 @@ class ActionsMixin(object):
         got = self._alarm_dialog()
         if not got:
             return
-        txt, at = got
-        if self._alarm_add("insert", {"id": alarm.new_id(), "text": txt, "at": at}):
+        got["id"] = alarm.new_id()
+        if self._alarm_add("insert", got):
             self.mark_modified()
 
     def _alarm_dialog(self, data=None):
-        """填「提醒内容 + 日期 + 时间」。返回 `(内容, 时间戳)` 或 None。
+        """填「内容 + 提醒类型 + 时刻」。返回一条完整规则 dict 或 None：
+        `{"text","at","repeat","hm","days"}`。
 
+        三种类型（2026-11-18 用户定）：
+          - 按时间提醒 once：日历选一天 + 时/分，响一次即止（原来的行为）；
+          - 按天 daily：只要时/分，每天这时候响；
+          - 按周 weekly：时/分 + 周一到周日**多选**（没有「工作日」快捷键，用户拍板去掉）。
         日期用**日历**、时间用**时/分两个 Spinbox**，都不是手打输入框：中文输入法
         下 `2026-10-30 18:00` 里的连字符和冒号十有八九会敲成全角，手打还容易写出
         `25:00`、`2月30日`；控件把范围锁死，点一下就选定。
-        「只做标记不提醒」由上面的开关表达（`at` 为 0）。
+        「只做标记不提醒」由开关表达（`at` 为 0）。
         编辑和新建共用这一个框，编辑时把原值填进去。
         """
         p = self.pal
         is_new = data is None
         data = data or {}
         at0 = data.get("at") or 0
+        kind0 = alarm.repeat_kind(data)
+        hm0 = alarm.hm_of(data)
+        days0 = [int(x) for x in (data.get("days") or []) if str(x).isdigit()]
         if at0:
             dt = datetime.datetime.fromtimestamp(at0)
             day0 = dt.date()
@@ -3309,9 +4357,13 @@ class ActionsMixin(object):
         body = tk.Frame(win, bg=bg)
         body.pack(fill=tk.BOTH, expand=True, padx=dpi.px(1), pady=dpi.px(1))
 
-        def label(t):
-            tk.Label(body, text=t, bg=bg, fg=soft,
-                     font=(FONT[0], 9)).pack(anchor="w", padx=dpi.px(14), pady=(dpi.px(9), 0))
+        def label(t, top=9):
+            """小标题。`top` 是距上一块的上边距 —— 「提醒时间」上面压着日历 /
+            星期多选，要留得比默认更开，否则时刻框像贴在前一块的底边上。"""
+            lb = tk.Label(body, text=t, bg=bg, fg=soft,
+                          font=(FONT[0], 9))
+            lb.pack(anchor="w", padx=dpi.px(14), pady=(dpi.px(top), 0))
+            return lb
 
         def entry(value):
             e = tk.Entry(body, bg=ed, fg=text_fg, insertbackground=accent,
@@ -3326,12 +4378,38 @@ class ActionsMixin(object):
         label("提醒什么（必填）")
         e_text = entry(data.get("text") or "")
 
+        # ---- 提醒类型：三个并排胶囊，切换时下方区域显隐 ----
+        # 用 Label 不用 Radiobutton：跟日历头部的 ‹ › 同一套扁平语言，选中态
+        # 实心 accent + on_accent 文字，绝不烤死颜色（换肤跟着走）。
+        label("提醒类型")
+        kind_row = tk.Frame(body, bg=bg)
+        kind_row.pack(fill=tk.X, padx=dpi.px(14), pady=(dpi.px(3), 0))
+        kind_var = tk.StringVar(value=kind0)
+        kind_labs = {}
+        built = [False]                      # 弹框组件搭完前 toggle 直接跳过
+
+        def paint_kinds():
+            for k, lb in kind_labs.items():
+                on = (kind_var.get() == k)
+                lb.configure(bg=accent if on else _mix_hex(bg, text_fg, 0.06),
+                             fg=on_accent(accent) if on else soft)
+
+        for k in alarm.REPEATS:
+            lb = tk.Label(kind_row, text=alarm.REPEAT_LABELS[k], bg=bg, fg=soft,
+                          font=(FONT[0], 9), bd=0, padx=dpi.px(9),
+                          pady=dpi.px(3), cursor="hand2")
+            lb.pack(side=tk.LEFT, padx=(0, dpi.px(5)))
+            lb.bind("<Button-1>", lambda _e, v=k: (kind_var.set(v), paint_kinds(),
+                                                   toggle()))
+            kind_labs[k] = lb
+        paint_kinds()
+
         # ---- 日期：日历控件 ----
         # 不再用文本框手打。中文输入法下 `2026-10-30` 里的连字符常被敲成全角，
         # 而「10-30」到底是今年还是明年全靠猜；日历点一下就锁定，还顺带能看见
         # 今天/明天在星期的哪个位置。固定 6 行（见 alarm.month_grid），翻月时
         # 高度不跳，‹ › 不会上下窜。
-        label("提醒日期")
+        date_lab = label("提醒日期")
         chosen = [day0]                      # 选中的那一天
         shown = [day0.year, day0.month]      # 当前显示的月份（翻月后与 chosen 不同）
         nums = [alarm.month_grid(shown[0], shown[1])]
@@ -3438,9 +4516,43 @@ class ActionsMixin(object):
 
         paint()
 
-        label("提醒时间")
+        # ---- 按周：周一到周日多选（用户拍板：不做「工作日」快捷键）----
+        days_row = tk.Frame(body, bg=bg)
+        days_lab = tk.Label(days_row, text="每周哪几天（可多选）", bg=bg, fg=soft,
+                            font=(FONT[0], 9), bd=0, anchor="w")
+        days_lab.pack(anchor="w")
+        day_grid = tk.Frame(days_row, bg=bg)
+        day_grid.pack(fill=tk.X, pady=(dpi.px(3), 0))
+        for c in range(7):
+            day_grid.columnconfigure(c, weight=1, uniform="wd")
+        days_sel = set(days0) if days0 else {0}   # 默认周一，避免空选
+        day_labs = {}
+
+        def paint_days():
+            for i, lb in day_labs.items():
+                on = i in days_sel
+                lb.configure(bg=accent if on else _mix_hex(bg, text_fg, 0.06),
+                             fg=on_accent(accent) if on else soft)
+
+        for i, wtxt in enumerate(alarm.WEEKDAYS):
+            lb = tk.Label(day_grid, text=wtxt, bg=bg, fg=soft, font=(FONT[0], 10),
+                          bd=0, width=2, cursor="hand2")
+            lb.grid(row=0, column=i, padx=(0, dpi.px(3)), ipady=dpi.px(2))
+
+            def toggle_day(_e=None, k=i):
+                if k in days_sel:
+                    days_sel.discard(k)
+                else:
+                    days_sel.add(k)
+                paint_days()
+            lb.bind("<Button-1>", toggle_day)
+            day_labs[i] = lb
+        paint_days()
+
+        # 时间行与上方日历 / 星期多选之间留出明显的呼吸区（用户 2026-11-18 要求）
+        time_lab = label("提醒时间", top=18)
         trow = tk.Frame(body, bg=bg)
-        trow.pack(fill=tk.X, padx=dpi.px(14), pady=(dpi.px(2), 0))
+        trow.pack(fill=tk.X, padx=dpi.px(14), pady=(dpi.px(5), 0))
 
         def spin(lo, hi, value):
             """时/分选择框。format 两位补零，防止显示出 `8` 这种不齐的数字。"""
@@ -3487,14 +4599,42 @@ class ActionsMixin(object):
         chk.pack(side=tk.LEFT, padx=(dpi.px(14), 0))
 
         def toggle(*_a):
-            # 不提醒时连日期一起灰掉：留着能编辑却不生效，比直接禁用更让人困惑
+            # 类型决定显示哪块：once 才要日历；weekly 才要星期多选。
+            # pack 顺序必须让这两块都排在 trow 之前，否则时间行会跳到最上面。
+            # 弹框构建期间（trow 还没建）被类型按钮点到时直接跳过，等构建末尾
+            # 统一 toggle 一次 —— 否则这里会引用尚未赋值的局部变量。
+            if not built[0]:
+                return
+            kind = kind_var.get()
+            for w in (date_lab, cal, days_row):
+                if w is not None:
+                    w.pack_forget()
+            if kind == alarm.REPEAT_ONCE:
+                # ⚠️ date_lab 也要 before=trow：不写就追加到 pack 队列末尾，
+                # 标题会跑到「取消 / 确定」下面去（2026-11-18 探针发现）
+                date_lab.pack(anchor="w", padx=dpi.px(14), pady=(dpi.px(9), 0),
+                              before=trow)
+                cal.pack(fill=tk.X, padx=dpi.px(10), pady=(dpi.px(2), 0),
+                         before=trow)
+            elif kind == alarm.REPEAT_WEEKLY:
+                days_row.pack(fill=tk.X, padx=dpi.px(14), pady=(dpi.px(9), 0),
+                              before=trow)
+            # ⚠️ 时间标题必须**重新** pack 到 trow 之前：它建得比这两块早，
+            # 而 before=trow 只会插到它后面 —— 不重排就会出现「提醒时间」悬在
+            # 星期 / 日历上方、和时刻框被拆成两处的错位。
+            time_lab.pack(anchor="w", padx=dpi.px(14), pady=(dpi.px(18), 0),
+                          before=trow)
+            # 「到点提醒」关掉后日期 / 星期一起灰掉，免得能编辑却不生效
             cal_on[0] = bool(var_on.get())
             st = tk.NORMAL if cal_on[0] else tk.DISABLED
             for w in (sp_h, sp_m, btn_now):
                 w.configure(state=st)
+            for lb in day_labs.values():
+                lb.configure(cursor="hand2" if cal_on[0] else "")
             paint()
 
         chk.configure(command=toggle)
+        built[0] = True
         toggle()
 
         err = tk.Label(body, text="", bg=bg, fg=p.get("danger", "#c0392b"),
@@ -3511,6 +4651,11 @@ class ActionsMixin(object):
                 err.configure(text="请填写提醒内容")
                 e_text.focus_set()
                 return "break"
+            kind = kind_var.get()
+            if kind == alarm.REPEAT_WEEKLY and var_on.get() and not days_sel:
+                err.configure(text="请至少选一天（周一到周日）")
+                return "break"
+            hm = ""
             if var_on.get():
                 # Spinbox 是可编辑的：上限只约束箭头，手输 `99` 仍可能进得来
                 try:
@@ -3521,14 +4666,24 @@ class ActionsMixin(object):
                 if not (0 <= hh <= 23 and 0 <= mm <= 59):
                     err.configure(text="时间超出范围了（00:00 - 23:59）")
                     return "break"
-                ts, msg = alarm.parse_when(chosen[0].strftime("%Y-%m-%d"),
-                                           "%02d:%02d" % (hh, mm))
+                hm = "%02d:%02d" % (hh, mm)
+                if kind == alarm.REPEAT_ONCE:
+                    ts, msg = alarm.parse_when(chosen[0].strftime("%Y-%m-%d"),
+                                               "%02d:%02d" % (hh, mm))
+                else:
+                    # 重复提醒的 at 只是「从哪天起」的锚点（今天 0 点），
+                    # 真正的触发时刻由 hm + 周期算出，见 alarm.slot_date
+                    today = datetime.date.today()
+                    ts, msg = datetime.datetime(today.year, today.month,
+                                                today.day).timestamp(), ""
             else:
                 ts, msg = 0.0, ""
             if msg:
                 err.configure(text=msg)
                 return "break"
-            out[0] = (txt, ts)
+            got = {"text": txt, "at": ts}
+            got.update(alarm.normalize_rule(kind, hm, sorted(days_sel)))
+            out[0] = got
             win.destroy()
             return "break"
 
@@ -3574,50 +4729,106 @@ class ActionsMixin(object):
         return out[0]
 
     def _alarm_edit(self, name):
+        if self._refuse_readonly():
+            return
         data = self._alarms_get().get(name)
         if not data:
             return
         got = self._alarm_dialog(data)
         if not got:
             return
-        data["text"], data["at"] = got
+        # 整条规则一起换：改类型 / 改星期都得落库，不能只写 text/at
+        keep = {"id": data.get("id")}
+        data.clear()
+        data.update(keep)
+        data.update(got)
+        # 规则改了 → 旧槽位的 fired/acked 不再对应，清掉免得新周期被旧键挡住
+        for m in (self._alarm_fired_map(), self._alarm_acked_map()):
+            for k in [k for k in m if k.startswith(self._alarm_key(data) + "@")]:
+                m.pop(k, None)
+        card = self._alarm_cards_get().get(name)
+        if card is not None:
+            try:
+                card.refresh()
+            except Exception:
+                pass
         self.mark_modified()
 
     def _alarm_pos(self, name):
-        """这枚闹钟在正文里的索引；找不到返回 None。"""
+        """这张卡片在正文里的索引；找不到返回 None。"""
+        card = self._alarm_cards_get().get(name)
+        if card is None:
+            return None
         try:
-            for key, value, index in self.text.dump("1.0", tk.END, image=True):
-                if key == "image" and value == name:
-                    return index
+            return self.text.index(card)
         except Exception:
-            pass
-        return None
+            return None
 
     def _alarm_remove(self, name):
-        """删掉闹钟图 = 取消这条提醒（数据随图一起进垃圾桶）。"""
+        """删掉卡片 = 取消这条提醒（数据随卡片一起走）。"""
+        if self._refuse_readonly():
+            return
         pos = self._alarm_pos(name)
         if not pos:
             return
         self._alarm_tip_hide()
+        self.text.config(state=tk.NORMAL)
         self.text.edit_separator()
         try:
             self.text.delete(pos)
+            # 连同卡片后那条独占行的换行一起删（和代码块同一套），否则每删一张
+            # 提醒就留一个空行。换行本身是 serialize 记录的普通文本。
+            if self.text.get(pos, "%s +1c" % pos) == "\n":
+                self.text.delete(pos)
         except Exception:
             return
         finally:
             self.text.edit_separator()
         self._alarms_get().pop(name, None)
+        self._alarm_cards_get().pop(name, None)
         self.mark_modified()
+
+    def _alarm_ack_card(self, name):
+        """卡片上点「完成」＝ 写 alarm_acked（与弹窗的 _ack 同一条确认路径）。"""
+        if self._refuse_readonly():
+            return
+        data = self._alarms_get().get(name)
+        if not data:
+            return
+        # 重复提醒只确认「当前周期」那一格，下个周期自然回到待提醒
+        self._alarm_acked_map()[self._alarm_state_key(data)] = time.time()
+        try:
+            save_data(self.data)
+        except Exception:
+            pass
+        self._refresh_alarm_index()
+        card = self._alarm_cards_get().get(name)
+        if card is not None:
+            try:
+                card.refresh()
+            except Exception:
+                pass
+        if self.data.get("current_note") == ALARM_INDEX_ID:
+            self.load_editor()
 
     # ----- 悬浮提示与右键 -----
 
     def _alarm_at(self, x, y):
-        """(x, y) 落在一枚闹钟上时返回它的 name，否则 None。"""
+        """(x, y) 落在一张提醒卡片上时返回它的 name，否则 None。
+
+        卡片本身已经把任务/时间/状态写在脸上，悬浮提示这里只补「响过没有」这类
+        运行时状态。命中仍走正文坐标（卡片是 window，dump 里按 window 分支找）。
+        """
         try:
             pos = self.text.index("@%d,%d" % (int(x), int(y)))
-            for key, value, _i in self.text.dump(pos, "%s +1c" % pos, image=True):
-                if key == "image" and value in self._alarms_get():
-                    return value
+            for key, value, _i in self.text.dump(pos, "%s +1c" % pos, window=True):
+                if key == "window":
+                    try:
+                        w = self.text.nametowidget(value)
+                    except Exception:
+                        continue
+                    if isinstance(w, AlarmCard) and w.name in self._alarms_get():
+                        return w.name
         except Exception:
             pass
         return None
@@ -3694,8 +4905,16 @@ class ActionsMixin(object):
         # 菜单关掉后指针往往还压在同一枚上：重置它，回来时提示才会重新浮出
         self._alarm_hover = None
         m = PopupMenu(self.root, self.pal)
-        m.add("编辑提醒", lambda: self._alarm_edit(name))
-        m.add("删除闹钟", lambda: self._alarm_remove(name), danger=True)
+        ro = self.is_readonly()
+        m.add("编辑提醒", enabled=not ro, command=lambda: self._alarm_edit(name))
+        data = self._alarms_get().get(name) or {}
+        if self._alarm_card_state(data) == alarm.STATE_PENDING:
+            m.add("完成（记为已确认）", enabled=not ro,
+                  command=lambda: self._alarm_ack_card(name))
+        # 危险项前加分隔线，跟笔记 / 文件夹 / 回收站菜单的分组保持一致
+        m.add_separator()
+        m.add("删除提醒", danger=True, enabled=not ro,
+              command=lambda: self._alarm_remove(name))
         m.popup(event.x_root, event.y_root)
         return "break"
 
@@ -3714,7 +4933,7 @@ class ActionsMixin(object):
         return "%s|%s" % (nid, data.get("id") or "")
 
     def _alarm_is_fired(self, data):
-        return bool(self._alarm_fired_map().get(self._alarm_key(data)))
+        return bool(self._alarm_fired_map().get(self._alarm_state_key(data)))
 
     def _alarm_acked_map(self):
         """`{"<note_id>|<alarm_id>": 时间戳}`：用户**真点过弹窗「知道了」**才算已确认。
@@ -3745,8 +4964,46 @@ class ActionsMixin(object):
             self.text.bind("<Leave>", lambda _e: self._alarm_tip_hide(), add="+")
         except Exception:
             pass
+        self._alarm_prune_keys()
         self._alarm_job = None
         self._alarm_start_tick()
+
+    def _alarm_prune_keys(self):
+        """清掉过期 / 悬空槽位键：重复提醒每天都生一个 @2026-11-18，
+        不清的话 settings 会无限长（一年 365 条 × 提醒数）。只保留近 30 天。
+        同时清掉指向已不存在笔记的键（删笔记时没即时清，这里统一兜底）。"""
+        try:
+            cutoff = (datetime.date.today() - datetime.timedelta(days=30)).isoformat()
+            live_ids = {n.get("id") for n in (self.data.get("notes") or [])
+                        if isinstance(n, dict)}
+            # 回收站里的笔记还能还原：它们的提醒状态必须留着，不能当悬空键清掉
+            try:
+                import imgstore
+                live_ids |= {n.get("id") for n in
+                             imgstore.notes_from_recycle(store().recycle_all())
+                             if isinstance(n, dict)}
+            except Exception:
+                pass
+            for m in (self._alarm_fired_map(), self._alarm_acked_map()):
+                # once 的旧键没有 @，保留；带 @ 的只留日期 >= cutoff
+                gone = []
+                for k in m:
+                    if not isinstance(k, str):
+                        continue
+                    # "<note_id>|<alarm_id>[@slot]"：note_id 已不在全库 → 悬空键
+                    owner = k.split("|", 1)[0]
+                    if owner and owner not in live_ids:
+                        gone.append(k)
+                        continue
+                    if "@" not in k:
+                        continue
+                    tail = k.rsplit("@", 1)[1]
+                    if tail != "start" and tail < cutoff:
+                        gone.append(k)
+                for k in gone:
+                    m.pop(k, None)
+        except Exception:
+            pass
 
     def _alarm_start_tick(self):
         if getattr(self, "_alarm_job", None) is None:
@@ -3775,29 +5032,48 @@ class ActionsMixin(object):
         now = time.time()
         fired = self._alarm_fired_map()
         items = []
+        rows = []          # 顺带备好汇总表要的三元组，省得下面再全库扫一遍
         for n in self.data.get("notes") or []:
             nid = n.get("id")
+            if nid == ALARM_INDEX_ID:       # 汇总笔记自己不算（与 alarm_index_content 同口径）
+                continue
             for it in n.get("content") or []:
                 if it[0] != "alarm" or len(it) < 2 or not isinstance(it[1], dict):
                     continue
                 d = it[1]
-                if not d.get("at") or fired.get("%s|%s" % (nid, d.get("id") or "")):
-                    continue
-                items.append((nid, d))
-        fire, stale = alarm.due(items, now)
+                rows.append((nid or "", d, _note_head(n)))
+                if d.get("at"):
+                    items.append((nid, d))
+        # 过滤「当前周期已响过」交给 due_all：重复提醒的键带 @日期，
+        # 今天响过不会挡住明天（一次性提醒仍是旧键，行为完全一致）。
+        # acked 也一起传进去：在正文卡片上点过「完成」的，到点就不再弹窗。
+        fire, stale = alarm.due_all(items, fired,
+                                    lambda nid, d: self._alarm_key(d, nid), now,
+                                    acked=self._alarm_acked_map())
         changed = False
-        for nid, d in stale:
-            fired["%s|%s" % (nid, d.get("id") or "")] = now
+        for nid, d, key in stale:
+            fired[key] = now
             changed = True
         if fire:
-            nid, d = fire[0]            # 一轮只弹一条，剩下的下一轮排队
-            fired["%s|%s" % (nid, d.get("id") or "")] = now
+            nid, d, key = fire[0]       # 一轮只弹一条，剩下的下一轮排队
+            fired[key] = now
             changed = True
             self._alarm_popup(nid, d)
             self._alarm_hover = None    # 状态变了，下次悬停要重算文案
         if changed:
             try:
                 save_data(self.data)
+            except Exception:
+                pass
+        # 当前笔记的卡片要跟着时钟翻面（待提醒 → 已过期）：只就地 refresh 那几张
+        # 状态真变了的，绝不重建正文（会动光标和 undo 栈）。20 秒一轮，代价可忽略。
+        for name, card in list(self._alarm_cards_get().items()):
+            try:
+                if not card.winfo_exists():
+                    continue
+                fresh = self._alarm_card_state(card.data)
+                if fresh != card._state:
+                    card.refresh(fresh)
             except Exception:
                 pass
         # 「已完成」跟着时钟走：汇总表常开时，提醒时刻翻过去的那一分钟也要
@@ -3807,7 +5083,7 @@ class ActionsMixin(object):
                         if x.get("id") == ALARM_INDEX_ID), None)
             if idx is not None:
                 old = idx.get("content")
-                self._refresh_alarm_index()
+                self._refresh_alarm_index(rows=rows)   # 复用本轮扫描，少扫一遍全库
                 if idx.get("content") != old:
                     self.load_editor()
 
@@ -3842,14 +5118,20 @@ class ActionsMixin(object):
         def _ack():
             # ⚠️ 只在这里写 alarm_acked：_alarm_check 里那些「过期自动补记」的
             # stale 只进 alarm_fired，绝不能顺手算成用户确认过
-            self._alarm_acked_map()["%s|%s" % (
-                note_id, data.get("id") or "")] = time.time()
+            key = alarm.state_key("%s|%s" % (note_id, data.get("id") or ""), data)
+            self._alarm_acked_map()[key] = time.time()
             try:
                 save_data(self.data)
             except Exception:
                 pass
             self._refresh_alarm_index()
-            # 汇总表正开着就立刻重刷，别等下一次切笔记才看到「已确认：是」
+            # 卡片正开着就就地翻到「已确认」；汇总表正开着就立刻重刷
+            for name, card in list(self._alarm_cards_get().items()):
+                if self._alarm_state_key(card.data) == key:
+                    try:
+                        card.refresh(alarm.STATE_ACKED)
+                    except Exception:
+                        pass
             if self.data.get("current_note") == ALARM_INDEX_ID:
                 self.load_editor()
             try:
@@ -4234,8 +5516,8 @@ class ActionsMixin(object):
         # 智能分类不能当真实归属：在「星标笔记 / 加密笔记」下新建时若记成 f_star，
         # 这条笔记会不属于任何真实文件夹（只在「全部」里出现），所以一律落到「工作」。
         # 系统区同理：那一格只装内置说明，新笔记进去就再也拖不出来。
-        switched = f in SMART_FOLDERS or f == SYSTEM_FOLDER
-        folder = "f_work" if switched else f
+        switched = f in SMART_FOLDERS or f == SYSTEM_FOLDER or f == RECYCLE_FOLDER
+        folder = self._real_folder_fallback() if switched else f
         import time
         now = time.strftime("%Y-%m-%d", time.localtime())
         n = {"id": uid(), "folder": folder,
@@ -4308,32 +5590,310 @@ class ActionsMixin(object):
                         "它里面列出了全部快捷键，随时可以回来看。\n"
                         "想写笔记请点右上角「新建笔记」。" % ("欢迎使用" + APP_NAME))
 
-    def delete_note(self):
-        n = self.current_note()
+    def delete_note(self, nid=None, forever=False):
+        """删除一条笔记（默认进回收站，`forever=True` 则直接销毁）。
+
+        `nid` 给定时删那一条，不给就删编辑器里正打开的那篇 —— 列表右键必须走前者：
+        右键点的行**不等于**当前打开的行，早先靠先写 `current_note` 再删，删完编辑器
+        会跟着空掉（用户明明在看另一篇，正文却没了）。
+        """
+        n = self.current_note() if nid is None else next(
+            (x for x in self.data["notes"] if x["id"] == nid), None)
         if not n:
             self._show_info("提示", "请先在中间列表选择一条笔记。")
             return
         if self.is_protected_note(n):
             self._refuse_sample_delete(n)
             return
-        if not self._ask_confirm("删除", "确定删除这条笔记？", ok_text="删除", danger=True):
+        if forever:
+            ok = self._ask_confirm(
+                "彻底删除",
+                "确定彻底删除这条笔记？\n\n不会进入回收站，删除后无法还原。",
+                ok_text="彻底删除", danger=True)
+        else:
+            ok = self._ask_confirm(
+                "删除", "确定删除这条笔记？\n\n删除后先移入左下角的回收站，%d 天后自动清除。"
+                % RECYCLE_TTL_DAYS, ok_text="删除", danger=True)
+        if not ok:
             return
         nid = n["id"]
+        prev = self.data.get("current_note")
+        # 删之前记一份列表顺序：删的是正在看的那篇时，编辑器要顺到「顶替它位置」
+        # 的那一条（标签条里没有它就退回列表里的下一条，与文件管理器同款手感）。
+        order = [x["id"] for x in self.visible_notes()]
+        # 快照先落回收站，再从正式列表移除：顺序反了就再也捞不回来了。
+        # 彻底删除相反 —— 连快照都不留，直接跳过这一步。
+        if not forever:
+            store().recycle_put("note", dict(n), origin=n.get("folder"))
         self.data["notes"] = [x for x in self.data["notes"] if x["id"] != nid]
-        # 标签一并收掉，并把编辑器顺到邻居上（右邻 → 左邻）；没有其它标签才空着。
-        # （_render_tabs 也会剪掉库里已经没有的 id，这里先剪是为了算出「下一个是谁」）
-        self.data["current_note"] = self._tab_drop(nid)
+        # 标签一并收掉（_render_tabs 也会剪掉库里已经没有的 id，这里先剪是为了
+        # 算出「下一个是谁」）
+        nxt = self._tab_drop(nid)
+        if prev == nid:
+            if not nxt and nid in order:
+                rest = [i for i in order if i != nid]
+                i = order.index(nid)
+                nxt = rest[i] if i < len(rest) else (rest[-1] if rest else None)
+            self.data["current_note"] = nxt
         self._note_sel.discard(nid)
+        if self._note_anchor == nid:
+            self._note_anchor = None
+        # 删的是别的篇时，列表高亮跟着编辑器走：否则正文还开着这一篇，行上却是空的
+        keep = self.data.get("current_note")
+        if prev != nid and keep and any(x["id"] == keep for x in self.visible_notes()):
+            self._note_sel = {keep}
+            self._note_anchor = keep
         save_data(self.data)
         # 只移除这一行 + 就地刷新计数：文件夹行与其余笔记都不重建 → 不闪烁
         if nid in self._rows:
             self._remove_note_rows([nid])
         else:
             self.refresh_notes()
-        self._active_title = self._active_preview = self._active_date = None
         self._refresh_folder_counts()
-        self._restyle_notes()
+        # 删除是「只移除行、不重建整列」，走不到 refresh_notes 里那条回收站刷新，
+        # 徽标必须在这里补刷 —— 否则要等用户点一下回收站（recycle_open）才变。
+        self._restyle_recycle_bar()
+        if prev == nid:
+            self._active_title = self._active_preview = self._active_date = None
+            self._restyle_notes()
+            self.load_editor()
+        else:
+            # 正文没换人：只重画样式 + 标签条，别整篇重装（那会把光标与滚动位置
+            # 一起弹回开头，看着像「删了别篇、自己这页也跳了一下」）。
+            self._restyle_notes()
+            self._render_tabs()
+
+    # ---------- 回收站（左下角入口） ----------
+    def _recycle_view(self):
+        return self.data.get("current_folder") == RECYCLE_FOLDER
+
+    def _real_folder_fallback(self):
+        """还原笔记时的归属退路：优先「工作」，没有就取第一格普通文件夹。"""
+        real = [f["id"] for f in self.data["folders"]
+                if f["id"] not in SMART_FOLDERS and f["id"] != SYSTEM_FOLDER]
+        return "f_work" if "f_work" in real else (real[0] if real else "f_work")
+
+    def recycle_open(self):
+        """切到回收站视图：只展示快照，任何笔记都不许打开（见 _load_editor_body）。"""
+        purged = store().recycle_purge()
+        if purged:
+            # 过期快照对应的图片没人引用了，回收掉（启动时那条无条件 GC 覆盖不到
+            # 运行中到期的项）
+            self._img_gc(resave=False)
+        self.data["current_folder"] = RECYCLE_FOLDER
+        self.data["current_note"] = None
+        self._note_sel = set()
+        self._note_anchor = None
+        # 左栏多选/高亮必须跟着收掉：`_restyle_folders` 除了认 current_folder，
+        # 还会把 `_folder_sel` 里的格子点亮，所以只改 current_folder 会留下一格
+        # 绿底 —— 看着像「文件夹和回收站同时选中」。视图已经换了，多选也没意义。
+        self._folder_sel = set()
+        self._folder_anchor = None
+        self._restyle_folders()
+        # 搜索走的是 notes 表的 SQL，回收站里的假笔记不在表里 —— 清空搜索框，
+        # 免得用户搜了半天一条都不出来、以为是回收站坏了。
+        # ⚠️ 必须静默清：StringVar 的 write trace 不管值变没变都会触发，
+        # 空搜索框 set("") 也会跑一次 refresh_notes —— 加上下面自己那次，
+        # 列表就整列重建两遍（用户看到闪两次）。
+        try:
+            self._search_quiet = True
+            try:
+                self.search_var.set("")
+            finally:
+                self._search_quiet = False
+        except Exception:
+            pass
+        self.refresh_notes()
         self.load_editor()
+        self._restyle_recycle_bar()
+        if purged:
+            self._after(0, lambda: self._show_info(
+                "回收站", "已自动清除 %d 条超过 %d 天的项目。" % (purged, RECYCLE_TTL_DAYS)))
+
+    def recycle_refresh_if_open(self):
+        """定时 / 数据变化后刷新：徽标总是跟上条数，回收站视图开着才整列重画。
+
+        徽标那一下不区分视图 —— 过期项被 `recycle_purge` 清掉时用户多半正看着
+        别处，只刷「打开的回收站」会让左下角那个数字一直挂着旧值（与删除后
+        不刷是同一类毛病）。
+        """
+        self._restyle_recycle_bar()
+        if self._recycle_view():
+            self.recycle_open()
+
+    def _restore_note_snapshot(self, snap):
+        n = dict(snap or {})
+        if not n.get("id"):
+            return
+        have = {x["id"] for x in self.data["notes"]}
+        if n["id"] in have:                     # id 撞车（极少见）→ 给个新 id
+            n["id"] = uid()
+        fids = {f["id"] for f in self.data["folders"]}
+        if n.get("folder") not in fids or n.get("folder") in SMART_FOLDERS:
+            n["folder"] = self._real_folder_fallback()
+        n["order"] = self.top_note_order(n, n["folder"])
+        self.data["notes"].append(n)
+        return n
+
+    def _restore_folder_snapshot(self, snap):
+        fols = [dict(f) for f in (snap or {}).get("folders") or [] if isinstance(f, dict)]
+        if not fols:
+            return
+        have_f = {f["id"] for f in self.data["folders"]}
+        idmap = {}
+        added = []
+        for f in fols:
+            nf = dict(f)
+            if nf.get("id") in have_f:
+                new = uid()
+                idmap[nf["id"]] = new
+                nf["id"] = new
+            have_f.add(nf["id"])
+            added.append(nf)
+        self.data["folders"].extend(added)
+        real_f = {f["id"] for f in self.data["folders"]}
+        for f in added:
+            pid = f.get("parent")
+            if pid in idmap:
+                f["parent"] = idmap[pid]
+            elif pid not in real_f or pid == f["id"]:
+                f.pop("parent", None)            # 父级已不存在 → 提到根层
+        have_n = {n["id"] for n in self.data["notes"]}
+        for old in (snap or {}).get("notes") or []:
+            if not isinstance(old, dict):
+                continue
+            n = dict(old)
+            if n.get("id") in have_n:
+                n["id"] = uid()
+            have_n.add(n["id"])
+            if n.get("folder") in idmap:
+                n["folder"] = idmap[n["folder"]]
+            if n.get("folder") not in real_f:
+                n["folder"] = self._real_folder_fallback()
+            n["order"] = self.top_note_order(n, n["folder"])
+            self.data["notes"].append(n)
+
+    def recycle_restore(self, rid=None, restore_all=False):
+        """还原：单个 / 当前选中的 / 全部。文件夹先还原，笔记后还原（找回归属）。"""
+        recs = store().recycle_all()
+        if rid:
+            targets = [r for r in recs if r["id"] == rid]
+        elif restore_all:
+            targets = recs
+        else:
+            sel = set(self._note_sel)
+            targets = [r for r in recs if r["id"] in sel]
+        if not targets:
+            self._show_info("提示", "没有可还原的项目。")
+            return
+        targets.sort(key=lambda r: 0 if r.get("kind") == "folder" else 1)
+        restored = []
+        for rec in targets:
+            snap = rec.get("payload") or {}
+            if rec.get("kind") == "folder":
+                self._restore_folder_snapshot(snap)
+            else:
+                self._restore_note_snapshot(snap)
+            store().recycle_remove(rec["id"])
+            restored.append(rec)
+        save_data(self.data)
+        self._note_sel = set()
+        self._note_anchor = None
+        self.refresh_all()
+        self._restyle_recycle_bar()
+        self._show_info("已还原", "已还原 %d 项。" % len(restored))
+
+    def recycle_clear(self):
+        if not store().recycle_count():
+            self._show_info("提示", "回收站已经是空的。")
+            return
+        cnt = store().recycle_count()
+        if not self._ask_confirm(
+                "清空回收站",
+                "回收站里有 %d 项，清空后将无法恢复，是否继续？" % cnt,
+                ok_text="清空", danger=True):
+            return
+        store().recycle_clear()
+        # 快照没了，只被回收站笔记引用的图片就成了孤儿：顺手回收 media 文件。
+        # resave=False —— 回收站是独立表，没动 self.data，不必再写一次库。
+        self._img_gc(resave=False)
+        self._note_sel = set()
+        self._note_anchor = None
+        self.refresh_notes()
+        self.load_editor()
+        self._restyle_recycle_bar()
+
+    def recycle_purge_item(self, rid):
+        """清空回收站里的**这一条**（笔记或文件夹），彻底删除、不可还原。
+
+        与 `recycle_clear` 的区别只在范围：那条是整站清空，这条只动右键点中的
+        记录，其余项目原样留着（连同各自的 7 天倒计时）。
+        """
+        rec = store().recycle_get(rid)
+        if not rec:
+            # 并发场景：另一个窗口/定时清理已经把它带走了，安静收尾即可。
+            self._note_sel.discard(rid)
+            self.refresh_notes()
+            self._restyle_recycle_bar()
+            return
+        kind = "文件夹" if rec.get("kind") == "folder" else "笔记"
+        # 标题走 recycle_item_view：文件夹那条是「文件夹 · 名字」，笔记那条是首行，
+        # 与列表里看到的字面一致 —— 确认框里别自己拼一份不一样的。
+        title = self.trunc(self.title_of(recycle_item_view(rec)), 24)
+        if not self._ask_confirm(
+                "清空%s" % kind,
+                "「%s」将被彻底删除，无法还原，是否继续？" % title,
+                ok_text="清空", danger=True):
+            return
+        store().recycle_remove(rid)
+        # 这条快照对应的图片没人引用了，回收它（整站清空的同款收尾）
+        self._img_gc(resave=False)
+        self._note_sel.discard(rid)
+        if self._note_anchor == rid:
+            self._note_anchor = None
+        self.refresh_notes()
+        self.load_editor()
+        self._restyle_recycle_bar()
+
+    def recycle_purge_items(self, rids):
+        """批量清空回收站里的若干条（多选后右键）。文件夹与笔记混选一起处理。
+
+        与 `recycle_purge_item` 同一套收尾：确认 → 逐条 `recycle_remove` →
+        清选中 → 重画列表 / 正文提示 / 徽标。只影响被选中的记录，别的项目
+        （连同各自的 7 天倒计时）原样留着。
+        """
+        ids = list(dict.fromkeys(rids or []))       # 去重且保序，确认框数字才准
+        recs = [r for r in (store().recycle_get(i) for i in ids) if r]
+        if not recs:
+            # 全被定时清理/别的窗口带走了：安静收口，别弹一句「清空 0 项」。
+            self._note_sel = set()
+            self._note_anchor = None
+            self.refresh_notes()
+            self.load_editor()
+            self._restyle_recycle_bar()
+            return
+        folders = sum(1 for r in recs if r.get("kind") == "folder")
+        notes = len(recs) - folders
+        msg = "选中的 %d 项将被彻底删除，无法还原，是否继续？" % len(recs)
+        if folders and notes:
+            # 混选时点明构成：清掉一个文件夹等于连它里面的笔记一起没了，
+            # 只报「3 项」会让人以为只是三条笔记。
+            msg = ("选中的 %d 项（%d 个文件夹、%d 条笔记）将被彻底删除，"
+                   "无法还原，是否继续？" % (len(recs), folders, notes))
+        if not self._ask_confirm(
+                "清空选中的 %d 项" % len(recs), msg,
+                ok_text="清空", danger=True):
+            return
+        for rec in recs:
+            store().recycle_remove(rec["id"])
+            self._note_sel.discard(rec["id"])
+            if self._note_anchor == rec["id"]:
+                self._note_anchor = None
+        # 这批快照引用的图片一并回收（整站 / 单条清空的同款收尾）
+        self._img_gc(resave=False)
+        self.refresh_notes()
+        self.load_editor()
+        self._restyle_recycle_bar()
 
     def toggle_pin(self):
         n = self.current_note()
@@ -4486,7 +6046,8 @@ class ActionsMixin(object):
         if not self._sync_folder_rows():        # 兜底：拿不到行序才退回整列重建
             self.refresh_folders(keep_scroll=True)
 
-    def del_folder(self, fid=None):
+    def del_folder(self, fid=None, forever=False):
+        """删除文件夹（默认连同上 snapshots 进回收站；`forever=True` 直接销毁）。"""
         target = fid or self.data["current_folder"]
         f = next((x for x in self.data["folders"] if x["id"] == target), None)
         if not f or f.get("smart"):
@@ -4524,8 +6085,24 @@ class ActionsMixin(object):
         else:
             head, tail = "确定删除文件夹「", "」？"
             msg = "%s%s%s" % (head, fit(head, tail), tail)
-        if not self._ask_confirm("删除文件夹", msg, ok_text="删除", danger=True):
+        if forever:
+            msg += "\n\n不会进入回收站，删除后无法还原。"
+        else:
+            msg += "\n\n删除后先移入回收站，%d 天后自动清除。" % RECYCLE_TTL_DAYS
+        if not self._ask_confirm("彻底删除文件夹" if forever else "删除文件夹", msg,
+                                 ok_text="彻底删除" if forever else "删除",
+                                 danger=True):
             return
+        # 整棵子树 + 里面的笔记一起快照：还原时要把层级和归属一并带回来，
+        # 只存文件夹名的话还原出来就是一堆空壳（笔记还在回收站里找不到家）。
+        # 彻底删除连快照都不留。
+        if not forever:
+            store().recycle_put(
+                "folder",
+                {"folders": [dict(f) for f in self.data["folders"] if f["id"] in tree],
+                 "notes": [dict(n) for n in self.data["notes"]
+                           if n.get("folder") in tree]},
+                origin=f["id"])
         if cnt:
             dropped = {n["id"] for n in self.data["notes"] if n.get("folder") in tree}
             self.data["notes"] = [x for x in self.data["notes"] if x["id"] not in dropped]
@@ -4576,6 +6153,24 @@ class ActionsMixin(object):
         """
         m = PopupMenu(self.root, self.pal)
         m.add("新建文件夹", icon="folder", command=lambda: self.new_folder())
+        m.popup(event.x_root, event.y_root)
+        return "break"
+
+    def _note_blank_popup(self, event):
+        """笔记列表**空白处**的右键菜单：只给「新建笔记」。
+
+        空白处没有对象可指 —— 置顶 / 星标 / 移动到文件夹 / 加密都得先选中某一条，
+        那些动作留在行菜单里（`_popup`）。这里只放「再写一篇」这个入口，与文件夹列
+        空白菜单（`_folder_blank_popup`）同一套规矩：菜单里凭空多出几项、而用户又
+        没选中任何东西时，最容易误删 / 误移。
+
+        回收站视图不弹：那儿的条目是回收记录，`new_note` 会把归属改到工作文件夹并
+        整体切走视图 —— 右键一块空白却「凭空换页」，比没有菜单更让人意外。
+        """
+        if self._recycle_view():
+            return "break"
+        m = PopupMenu(self.root, self.pal)
+        m.add("新建笔记", icon="pencil", command=self.new_note)
         m.popup(event.x_root, event.y_root)
         return "break"
 

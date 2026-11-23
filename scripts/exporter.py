@@ -82,6 +82,14 @@ def blocks_from_content(content):
             flush()
             blocks.append({"kind": "hr"})
             swallow_nl = True
+        elif kind == "img":
+            flush()
+            d = it[1] if len(it) > 1 and isinstance(it[1], dict) else {}
+            blocks.append({"kind": "img",
+                           "src": (d.get("src") if isinstance(d.get("src"), str) else ""),
+                           "alt": (d.get("alt") if isinstance(d.get("alt"), str) else ""),
+                           "w": d.get("w"), "h": d.get("h")})
+            swallow_nl = True
         elif kind == "w":
             # 历史数据里的待办控件：早已在渲染时变成 ⬜ / ✅ 字符，content 里
             # 可能还留着条目，忽略即可（正文里本来就没有它）。
@@ -153,6 +161,13 @@ def _check_state(runs):
     return any(mark in head for mark in _TODO_ON_MARKS)
 
 
+# Windows 保留设备名：CON/PRN/AUX/NUL、COM1-9、LPT1-9（含带编号的变体）。
+# 标题恰好是这些名字时，导出成 CON.md 会失败或被重定向到设备，必须避开。
+_RESERVED_NAMES = ({"CON", "PRN", "AUX", "NUL"}
+                   | {"COM%d" % i for i in range(1, 10)}
+                   | {"LPT%d" % i for i in range(1, 10)})
+
+
 def safe_filename(title, ext):
     """按笔记标题拼一个安全文件名（Windows 不允许的那几个字符一律抹掉）。"""
     name = _BAD_NAME.sub(" ", (title or "").strip()).strip(" .")
@@ -161,6 +176,10 @@ def safe_filename(title, ext):
         name = "未命名笔记"
     if len(name) > 80:                     # 加上目录后别超 MAX_PATH
         name = name[:80].rstrip(" .")
+    # 保留名加前缀规避（下划线开头，不区分大小写；COM¹ 这类上标变体也会命中白名单外，
+    # 但那不是合法 ASCII 文件名， practical 场景以 ASCII 保留名为准）
+    if name.split(".")[0].upper() in _RESERVED_NAMES:
+        name = "_" + name
     return "%s.%s" % (name, ext.lstrip("."))
 
 
@@ -179,6 +198,12 @@ def plain_text(blocks):
             continue
         if b["kind"] == "hr":
             out.append("-" * 24)
+            continue
+        if b["kind"] == "img":
+            # 纯文本放不下位图，留一行 alt 说明（有 alt 才写，别留空行）
+            alt = (b.get("alt") or "").strip()
+            if alt:
+                out.append("[图片：%s]" % alt)
             continue
         mi = marker_info(b)
         kind, cut, level = mi["kind"], mi["cut"], mi["level"]
@@ -254,6 +279,12 @@ def markdown_text(blocks, links=None):
             continue
         if b["kind"] == "hr":
             out.append("---")
+            prev_list = False
+            continue
+        if b["kind"] == "img":
+            src = b.get("src") or ""
+            alt = b.get("alt") or ""
+            out.append("![%s](%s)" % (alt, src) if src else alt)
             prev_list = False
             continue
         mi = marker_info(b)

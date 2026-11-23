@@ -5,12 +5,14 @@
 
 产物（打包相关的文件全部收拢在 target 目录下）：
     target\\dist\\素笺\\素笺.exe     ← 双击即可打开
+    target\\dist\\素笺_v1.1.1_win64.zip ← 发版用的压缩包（版本号取 version.py）
     target\\build\\                  ← 打包中间产物
     target\\素笺.spec                ← PyInstaller 配置
 """
 import os
 import subprocess
 import sys
+import zipfile
 
 TARGET_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TARGET_DIR)              # 项目根目录
@@ -88,6 +90,26 @@ def make_icon():
         return None
 
 
+def make_zip():
+    """把 dist/素笺/ 整目录压成 zip，供 Release 直接上传。
+
+    Arcname 从 dist 根算起，所以解压出来是「素笺/素笺.exe」而不是散一地文件——
+    用户选「全部解压」后直接得到一个文件夹，拖进任意盘符就能用。
+
+    排除 exe 旁的 data/：那是用户第一次启动时才生成的私人笔记，绝不能随包发出去。
+    版本号只认 version.py，文件名和 exe 属性页、关于弹窗天然同步。
+    """
+    folder = os.path.join(DIST, APP)
+    zip_path = os.path.join(DIST, "%s_v%s_win64.zip" % (APP, __version__))
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if not (d == "data" and root == folder)]
+            for name in files:
+                full = os.path.join(root, name)
+                zf.write(full, os.path.relpath(full, DIST))
+    return zip_path
+
+
 def main():
     ensure("pyinstaller", "PyInstaller")
     ensure("pillow", "PIL")
@@ -121,8 +143,10 @@ def main():
     args.append(ENTRY)
     run(args, cwd=ROOT)
 
+    zp = make_zip()
     print("\n完成！可执行文件：%s（版本 %s）"
           % (os.path.join(DIST, APP, APP + ".exe"), __version__))
+    print("压缩包：%s" % zp)
 
 
 if __name__ == "__main__":

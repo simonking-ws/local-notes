@@ -370,6 +370,30 @@ class TestApplyScript(_Tmp):
         # 三个标准流都断开：否则子进程会攥着我们的管道，进程退不掉
         self.assertIs(captured["kw"]["stdin"], updater.subprocess.DEVNULL)
 
+    def test_launch_uses_no_window_not_detached(self):
+        """DETACHED_PROCESS 会让 bat 里的 `tasklist | find` 管道拿不到正确
+        errorlevel：目标进程退出了还判成"活着"，:wait 循环空转到 150 次，
+        robocopy 一次都不执行 —— 用户只看到黑框，程序永远不重启。
+        CREATE_NO_WINDOW 有隐藏控制台，管道语义正常，窗口照样不弹。
+        """
+        src = os.path.join(self.tmp, "pkg")
+        os.makedirs(src)
+        captured = {}
+
+        def fake_popen(line, **kw):
+            captured["flags"] = kw.get("creationflags", 0)
+            return mock.Mock()
+
+        with mock.patch.object(updater.subprocess, "Popen", fake_popen):
+            updater.launch_apply(src, os.path.join(self.tmp, "dst"),
+                                 os.path.join(src, "素笺.exe"),
+                                 workdir=self.tmp, pid=4321)
+        flags = captured["flags"]
+        no_window = getattr(updater.subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        detached = getattr(updater.subprocess, "DETACHED_PROCESS", 0)
+        self.assertTrue(flags & no_window, "必须用 CREATE_NO_WINDOW")
+        self.assertFalse(flags & detached, "绝不能用 DETACHED_PROCESS：管道会卡死")
+
 
 # ------------------------------ 收尾 ------------------------------
 

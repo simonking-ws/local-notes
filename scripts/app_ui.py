@@ -12,21 +12,24 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import ttk
 
 # 像素常量要跟 DPI 走：SCALE 已在 notes_app.py 顶部定好（导入本模块之前）
 import dpi
+import imgstore
 import secret
+import piclist
 
-from store import (APP_NAME, save_data,
-                   SMART_FOLDERS, SYSTEM_FOLDER, LOCKED_BODY_TEXT, folder_children,
+from store import (APP_NAME, save_data, store,
+                   SMART_FOLDERS, SYSTEM_FOLDER, RECYCLE_FOLDER, RECYCLE_TTL_DAYS,
+                   LOCKED_BODY_TEXT, folder_children,
                    subtree_ids, ensure_note_color, resolve_adjacent_colors,
                    pick_note_color, NOTE_COLORS,
                    ALARM_INDEX_ID, ALARM_ROW_TAG, ALARM_COLS,
-                   alarm_index_content)
+                   ALARM_STATE_TAG_PREFIX, alarm_index_content)
 from theme import (FONT, _RES, build_palette, DEFAULT_THEME, THEMES, list_themes,
-                   theme_label, on_accent)
+                   theme_label, on_accent, BODY_SIZE_MIN, BODY_SIZE_MAX)
 from widgets import (RoundButton, FontSizeSlider, ArrowButton,
+                     ThemedComboBox,
                      SidebarToggle, SettingsButton, DataButton, AboutButton,
                      CreateButton, WindowButton,
                      ExpandAllButton, CollapseAllButton, TwistyButton,
@@ -34,6 +37,7 @@ from widgets import (RoundButton, FontSizeSlider, ArrowButton,
                      ScrollJumpNav, MarqueeLabel, CountBadge, PopupMenu,
                      ScrollPanel, ScrollBody, HRule, Tooltip, TabStrip,
                      gutter_width, gutter_slots, gutter_hit_at,
+                     gutter_paint_cells, _draw_chevron,
                      SMART_ICON_ALL, SMART_ICON_STAR, SMART_ICON_LOCK,
                      SMART_ICON_ALARM,
                      FOLDER_ICON_W, FOLDER_ICON_H, CARD_RADIUS, CARD_PADX, CARD_GAP,
@@ -48,6 +52,7 @@ from widgets import (RoundButton, FontSizeSlider, ArrowButton,
                      READONLY_BAR_H,
                      BTN_PRESS_MIX, CODE_FONTS, CODE_LANGS, MENU_DANGER, _sel_fg,
                      _quote_bg, _sel_bg, _icode_bg, _hover_bg, _search_hit_bg,
+                     _popover_bg, _popover_border,
                      GITHUB_URL, ISSUES_URL,
                      _tinted_png_photo, _icon_photo,
                      _mix_hex, _ink_target, _round_rect_points, _star_points,
@@ -59,12 +64,12 @@ from widgets import (RoundButton, FontSizeSlider, ArrowButton,
                      aa_outline, aa_segment)
 from md_conv import (TODO_OFF, TODO_ON, TODO_LEGACY, TODO_MARKS, TODO_GAP, TODO_GAP_TAG,
                      LI_INDENT, split_list_prefix)
-import secret
 import updater
 from find_replace import replacement_plan
 from version import __version__
-from win_frame import (WindowFrame, work_area, work_area_at,
-                       fit_dialog, dialog_center_y, panel_canvas_height)
+from win_frame import (WindowFrame, work_area, work_area_at, frozen_paint,
+                       fit_dialog, dialog_center_y, panel_canvas_height,
+                       clamp_pos)
 
 
 # 编辑区底部状态条的高度（创建时间 / 修改时间 / 字数）。
@@ -73,11 +78,45 @@ from win_frame import (WindowFrame, work_area, work_area_at,
 # 多出来的 (FOOTER_H - TEXT_PADY) = 8px 由 Text 的 pack 底部外边距补上，于是
 # 「正文最后一行 → 窗口底」仍是 20，状态条浮出来既不裁字、也不遮正文。
 FOOTER_H = dpi.px(20)
+
+# 行号栏「标签」用的文本 tag 名。
+# ⚠️ 锚定在行首字符上而不是存行号：行号是一把等距刻度尺，插删行 / 代码块都会
+# 让「第几行」漂移，打在字符上才跟着文字走（和 todo 勾选同一套思路）。这个 tag
+# 故意不进 _is_ephemeral_tag —— 它会随正文一起序列化，于是隐藏行号再显示、
+# 切换笔记、重启程序，标记都还在；Canvas 每次重绘时从文本 tag 反查行号重新画。
+#
+# ⚠️ 一个标记一个 tag 名（gmark_1、gmark_2 …），**绝不能让多行共用一个 tag**：
+# 空行只有一个换行符，标记区间正好是 [N.0, N+1.0)，两行空行的区间首尾相接，
+# Tk 会把同一 tag 的相邻区间**合并成一段**。合并后 `tag_ranges` 只剩一个起点，
+# 于是点第 3 个空行会连着把整段空白都算作已标记、徽标永远停在段首、取消也删不
+# 干净 —— 用户看到的就是「点一下空白行，一片空白行全被标记」。
+# GMARK_TAG 是早期版本共用的名字，保留只为兼容旧库里的存量数据。
+GMARK_TAG = "gmark"
+GMARK_TAG_PREFIX = "gmark_"
+# 正文下方「虚号」的标记：没有对应正文行，挂在末尾字符上的独立 tag（gpad_号）。
+# 每个虚号一个 tag 名，同样是为了躲开 Tk 的相邻区间合并。
+GPAD_TAG_PREFIX = "gpad_"
+# 标签在数字右侧的间距、垂直微调（向下）：布局与绘制共用，别各自写死。
+GMARK_GAP = 3               # 数字右缘 → 标签左缘
+GMARK_Y_NUDGE = 2           # 标签相对行号格中心的向下偏移（视觉居中）
+# 正文行折叠：每个折叠块一个独立 tag（gfold_1、gfold_2 …），覆盖「折叠头下一行
+# 行首 → 末隐藏行行尾」的整段字符，靠 tag 的 elide 隐藏显示。与 gmark 相反，它
+# **必须**进 _is_ephemeral_tag：折叠是阅读视图状态，不该写进正文——序列化过滤
+# 掉，切笔记 / 重启回到展开态。折叠头行号 = tag 区间起点行 − 1。
+GFOLD_PREFIX = "gfold_"
+# 折叠头行末的占位条（嵌入窗口，window_create 挂在 head 行末，不占正文字符 ——
+# serialize 对非代码块 / 分割线的嵌入窗口一律跳过，不落库）。折叠后那几行被
+# elide 掉，占位条是正文里唯一的可见标识：横贯的淡底虚线条 + ▶ +「N 行已折叠」，
+# 整条可点展开。字号 11 与正文同档（旧版 9 太淡、看不出是导航元素）。
+GFOLD_CHIP_FONT = (FONT[0], 11)
 # Text 的 pack 底部外边距：把被 TEXT_PADY 让出去的那 8px 还给底部留白。
 FOOTER_GAP = FOOTER_H - TEXT_PADY
 # 触发状态条的「底部热区」高度。比状态条本身高一截：只留 20px 的话，
 # 指针得像素级瞄准最下面那一条才碰得到，实际是「怎么移都不出来」。
 FOOTER_HOT_H = FOOTER_H + dpi.px(26)
+# 正文一个 Tab 跨几个汉字宽。按当前正文字体实测，字号 / 字体一变跟着重算；
+# 只设 widget 级 tabs，汇总表行有 tag 级 tabs 覆盖（见 _config_tags）。
+EDITOR_TAB_HANZI = 2
 # 不换行时正文底部那条横向细滚动条的厚度。只在 wrap=NONE 且真有超宽长行时浮出，
 # 与右侧竖向滚动条同宽感；窗口拉宽到放得下、或切回自动换行就自动收起。
 HSCROLL_H = dpi.px(9)
@@ -426,6 +465,12 @@ class UIMixin(object):
         self.search_ent.bind("<FocusIn>", lambda e: self._update_search_ph())
         self.search_ent.bind("<FocusOut>", lambda e: self._update_search_ph())
         # 占位文字的显隐跟着 `_on_search_change` 一起刷新（不必再挂一条 trace）
+        # 左下角常驻的回收站入口：先 pack(side=BOTTOM) 占住底边，再 pack 左栏的
+        # ScrollPanel（否则 expand 那一位会把底条挤没）。右键给「还原全部 / 清空」。
+        self.recycle_bar = tk.Frame(self.side, bg=self.pal["side"])
+        self.recycle_bar.pack(side=tk.BOTTOM, fill=tk.X,
+                              padx=dpi.px(8), pady=(0, dpi.px(10)))
+        self._build_recycle_bar()
         self.folder_panel = ScrollPanel(self.side, self.pal["side"], self.pal)
         self.folder_panel.pack(fill=tk.BOTH, expand=True, padx=dpi.px(8), pady=(dpi.px(2), dpi.px(10)))
         # 文件夹列底部不再摆「新建 / 删除文件夹」按钮：列表的空白处右键就是入口
@@ -447,6 +492,11 @@ class UIMixin(object):
         self.mid_head.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(7), dpi.px(4)))
         self.note_panel = ScrollPanel(self.list_frame, self.pal["list"], self.pal)
         self.note_panel.pack(fill=tk.BOTH, expand=True)
+        # 列表空白处（行缝 / 行下方那片留白）右键 = 新建笔记。行上的置顶 / 星标 /
+        # 移动等动作仍走行自己的 `_popup`。inner 是常驻控件（refresh_notes 只换它
+        # 的子行），所以这里绑一次就长期有效，不必在每次重建后补绑。
+        for _blank in (self.note_panel.canvas, self.note_panel.inner):
+            _blank.bind("<Button-3>", self._note_blank_popup)
 
         # 右：编辑区（列间硬竖线分隔）
         self._vsep2 = self._build_splitter(body, "list")
@@ -569,6 +619,27 @@ class UIMixin(object):
         # ⚠️ 不能用「行号 → 图元」的字典查命中：号是标尺数出来的，和逻辑行号
         # 不再一一对应（代码块那一格占 260px，底下几行的号就差了 9），按号查会错位。
         self._gutter_hit = []
+        # 行号栏标签图标：AAImage 生成的位图必须挂在实例上保活，否则被 GC 回收后
+        # Canvas 上的 create_image 会变空白。缓存键含颜色与尺寸，换肤 / 改字号重画。
+        # 一组「空心环→实心圆」的填充帧依次推进、到头反向（ping-pong）形成呼吸。
+        # 徽标画在数字右侧的固定槽里（栏宽已相应加宽），不压数字、不随位数挤掉。
+        self._gmark_photo = None          # 兼容旧探针；实际用的是下面整组帧
+        self._gmark_photos = None         # tuple(PhotoImage, ...) 填充帧序列
+        self._gmark_icon_key = None
+        self._gmark_blink_job = None      # 闪烁定时器（无标记 / 隐藏行号时停）
+        self._gmark_blink_idx = 0         # 当前填充帧下标
+        self._gmark_blink_dir = 1         # ping-pong 方向：+1 填充 / -1 收空
+        # 正文行折叠（GFOLD_PREFIX）：_folds 只记 tag 名，行区间由 tag 自己跟
+        # 着文字走；chip（折叠头行末「⋯ N 行」提示片）按 tag 存，切笔记销毁。
+        self._folds = []
+        self._fold_chips = {}
+        self._fold_seq = 0
+        # 嵌入窗口的增删会点亮 <<Modified>>，而折叠是纯视图操作不该触发保存 /
+        # 只读回滚 —— 这对旗标把 chip 相关的 window_create / delete 静音掉。
+        self._fold_quiet = False
+        self._gutter_digit_right = 0      # 重绘时登记：数字右缘 x（点击分区用）
+        self._gutter_fold_items = {}      # 行号 → 折叠箭头图元（悬停变色用）
+        self._fold_hover_item = None
         # 查找 / 替换浮条：懒创建（不按 Ctrl+F、Ctrl+H 就永远不占内存），这里只占个位
         self._find_bar = None
         self._find_hits = []
@@ -588,7 +659,23 @@ class UIMixin(object):
         self._config_tags()
         self.text.bind("<<Modified>>", self.on_edit)
         self.text.config(state=tk.DISABLED)
+        # 正文右键：选中了连续多行时给「折叠选中行」入口（工具栏已取消该按钮，
+        # 见 _open_more_menu）。绑在 alarm 的 <Button-3> 之前（alarm 在 load_editor
+        # 里才绑），本处理器只在有折叠选区时 return "break" 拦掉后续；否则放行，
+        # 闹钟上的右键编辑/删除照常工作。
+        self.text.bind("<Button-3>", self._on_text_context_menu, add="+")
         self.text.bind("<Return>", self._editor_return)
+        # Shift+Tab 在编辑器里当「退格」：删光标前 / 选中行首的一档缩进。
+        # ⚠️ 必须实例绑定 + break，否则 Tk 类绑定会先把焦点挪到上一个控件。
+        self.text.bind("<Shift-Tab>", self._editor_shift_tab)
+        try:                            # X11 下 Shift+Tab 报 ISO_Left_Tab（Windows 不认这个 keysym）
+            self.text.bind("<ISO_Left_Tab>", self._editor_shift_tab)
+        except tk.TclError:
+            pass
+        # 兜底：个别键盘/输入法把 Shift+Tab 报成 keysym=Tab + Shift 位，
+        # 这时更具体的 <Shift-Tab> 匹配不上，只能在 <Tab> 里按状态位再判一次。
+        # ⚠️ <Tab> 比 <Key> 更具体，会顶掉只读守卫，所以这里得自己挡一次。
+        self.text.bind("<Tab>", self._editor_tab_maybe_shift, add="+")
         # 常用文字样式快捷键。工具栏提示里写了 Ctrl+B/I/U，这里必须真的绑上——
         # 而且要让工具栏敢精简，高频操作得能离手完成。实例绑定优先于 Text 的
         # 类绑定（Ctrl+B 原本是 emacs 风格的「光标左移」），返回 "break" 阻止继续传播。
@@ -622,9 +709,16 @@ class UIMixin(object):
         # 覆盖（Tk 每个 bindtag 只执行最具体的那条），所以格式化入口必须在各自方法里
         # 再挡一次；这里挡住的是普通输入、删除、粘贴这一大片。
         self.text.bind("<Key>", self._readonly_key_guard, add="+")
+        # 折叠护栏：贴着隐藏区边界按 BackSpace / Delete 前先展开（见 _fold_key_guard）
+        self.text.bind("<Key>", self._fold_key_guard, add="+")
         for _seq in ("<<Paste>>", "<<Cut>>", "<<Clear>>", "<<Undo>>", "<<Redo>>",
                      "<<PasteSelection>>"):
             self.text.bind(_seq, self._readonly_clip_guard, add="+")
+        # Ctrl+Y 删掉一整行待办再 Ctrl+Z：Tk 的撤销栈只记字符增删、不记 tag
+        # （实测），⬜ 回来了但 todo 字号标签与点击绑定没回来，方框看着「变大」
+        # 还点不动。撤销 / 重做后推到 idle 全文归一（见 _on_undo_fix_todo）。
+        for _seq in ("<<Undo>>", "<<Redo>>"):
+            self.text.bind(_seq, self._on_undo_fix_todo, add="+")
         # Ctrl+F：本篇内查找（浮出查找框，不动左栏列表）。
         # 必须绑在**实例**上并 return "break" —— Text 的类绑定把 Ctrl+F 接成了
         # emacs 的「光标右移」，类绑定在 toplevel/all 之前跑，不在这里拦下来，
@@ -641,6 +735,12 @@ class UIMixin(object):
         # `@ 关联笔记`：同一个 <space> 上再挂一路 —— 光标前是 `@` 就浮出笔记候选。
         # 两路互不干扰：上面那条只看行首的 markdown 前缀，这条只看光标前的 `@`。
         self.text.bind("<space>", self._mention_after_space, add="+")
+        # 整行 `![alt](url)` 不按回车也要成图：敲完 `)`、粘贴完之后各补一次识别。
+        # 两条都复用空格那条 idle 链（见 _md_convert_prefix），所以口径一致；
+        # 回车那条路仍在（_editor_return），老用户手感不变。
+        self.text.bind("<KeyRelease-parenright>", self._md_after_paren, add="+")
+        self.text.bind("<<Paste>>", self._md_after_paste, add="+")
+        self.text.bind("<<PasteSelection>>", self._md_after_paste, add="+")
         # 候选面板开着时 ↑ ↓ Esc 归它（不开时这些绑定直接放行，不影响光标移动）；
         # 点正文别处、滚轮、光标移出触发词时收起 —— 见 _mention_refilter
         for _seq in ("<Up>", "<Down>", "<Escape>"):
@@ -719,6 +819,18 @@ class UIMixin(object):
         self._hover_cursor = "xterm"
         self.text.bind("<Enter>", self._on_todo_hover, add="+")
         self.text.bind("<Motion>", self._on_todo_hover, add="+")
+        # 悬停在图片上 → 浮出它的 Markdown 源（点击已经不再弹窗了）。与待办换
+        # 光标挂同一条 Motion：判断成本只是几张图的 bbox，图少时可忽略。
+        self._img_hover_name = None
+        self._img_hover_job = None
+        self._img_hover_win = None
+        self.text.bind("<Motion>", self._img_hover, add="+")
+        self.text.bind("<Leave>", self._img_hover_leave, add="+")
+        # 滚轮一滚，指针没动、图已经换了位置：浮层会停在旧坐标上，得收掉。
+        # 点击 / 按键同理 —— 那之后用户要动的是正文，不是继续看图注。
+        self.text.bind("<MouseWheel>", lambda e: self._img_hover_leave(), add="+")
+        self.text.bind("<Button-1>", lambda e: self._img_hover_leave(), add="+")
+        self.text.bind("<Key>", lambda e: self._img_hover_leave(), add="+")
         # ---------- 拖选守卫 ----------
         # Text 的类绑定把 <B1-Motion> 直接接在 tk::TextSelectTo 上，而它**不检查**
         # 「这次拖拽有没有在正文里按下过」：只要内部那份拖选锚点 mark 存在、当前点
@@ -733,6 +845,8 @@ class UIMixin(object):
         # 兜底：点到「有方框字符、却没有 todo 标签」的位置也要能打钩（粘贴 / 撤销 /
         # 早期数据留下的裸方框）。排在 _on_text_press 之后：先记按下标志，再判方框。
         self.text.bind("<Button-1>", self._on_click_untagged_todo, add="+")
+        # 图片：**点击不再弹窗**（用户定的）——悬停浮出 Markdown 源，改地址/上传图床
+        # 走右键菜单（见 _img_popup）。图元上没有 todo 标签，上面那条会直接放行。
         self.text.bind("<ButtonRelease-1>", self._on_text_release, add="+")
         self.text.bind("<B1-Motion>", self._on_text_drag)
         # 同一条链上还挂着 <B1-Leave> → tk::TextAutoScan：按住鼠标拖出正文时它每 50ms
@@ -760,6 +874,11 @@ class UIMixin(object):
         # 又点不动（点击切换的 tag_bind 挂在 todo 上）。粘完补一遍标签。
         self.text.bind("<<Paste>>", self._on_paste_fix_todo, add="+")
         self.text.bind("<<PasteSelection>>", self._on_paste_fix_todo, add="+")
+        # 剪贴板里是位图（截图工具拷的那种）：直接存 media 并嵌进正文。
+        # 排在 todo 之后：只有真拿到图片才 return "break" 吞掉默认文本粘贴；
+        # 纯文本粘贴时这条什么都不做，照常走 Tk 默认插入。
+        self.text.bind("<<Paste>>", self._on_paste_image, add="+")
+        self.text.bind("<<PasteSelection>>", self._on_paste_image, add="+")
         self.text.bind("<<Cut>>", self._col_cut, add="+")
         # 键盘：可打印字符 = 列插入，Backspace / Delete = 列删除，其余键退出列模式。
         # ⚠️ 通用 <Key> 收不到「有更具体绑定」的那些键（见 _on_escape 的注释），
@@ -904,10 +1023,21 @@ class UIMixin(object):
 
         清空搜索（退格删光）同样走这条路径 —— 关键词没了，高亮自然
         整片撤掉，不需要额外的「取消搜索」入口。
+
+        `_search_quiet` 是给「程序化清空」用的（切回收站时先清搜索再自己刷）：
+        Tk 的 StringVar 不管值有没有变都通知一次，白白多重建一整列列表 ——
+        切视图时那一次重建就是用户看到的**第二次白闪**。
         """
         self._update_search_ph()
+        if getattr(self, "_search_quiet", False):
+            return                        # 调用方紧接着会自己 refresh_notes
+        # 列表过滤即时跟手（用户主要反馈），但正文高亮是最重的一环（最多 2000 次
+        # text.search + tag_add），每敲一个字都重跑没必要：去抖到停下 120ms 再做。
+        # 用 self._after 登记，关窗会自动取消（不会回调已销毁的 text）。
         self.refresh_notes()
-        self._apply_search_highlight()
+        if getattr(self, "_search_hl_job", None) is not None:
+            self._cancel_after(self._search_hl_job)
+        self._search_hl_job = self._after(120, self._apply_search_highlight)
 
     def _apply_search_highlight(self):
         """把搜索词在**当前打开的这篇**正文里标黄。
@@ -918,6 +1048,7 @@ class UIMixin(object):
         直接操作 tag、不进撤销栈：Tk 的 undo 只记 insert/delete，tag 增删不入栈
         （已实测），所以这里不必包 `edit_separator`，Ctrl+Z 撤的仍是用户的输入。
         """
+        self._search_hl_job = None        # 这次是去抖到点执行的，清掉旧 job 引用
         try:
             self.text.tag_remove("find", "1.0", tk.END)
         except Exception:
@@ -1103,6 +1234,8 @@ class UIMixin(object):
         self._gutter_lines = {}
         self._gutter_hit = []
         self._gutter_hover = None
+        self._gutter_base_fill = {}     # 图元 → 基础色（标记行是 accent，其余 soft）
+        self._fold_hover_item = None    # 折叠箭头的悬停态随重绘一起作废
         if not self._line_numbers_on() or not g.winfo_ismapped():
             return
         p = self.pal
@@ -1155,9 +1288,16 @@ class UIMixin(object):
             self._gutter_phase = self._measure_gutter_phase(v0, unit)
         v0 += int(getattr(self, "_gutter_phase", 0) or 0)
         k0, k1 = gutter_slots(v0, unit, h)
-        # 栏宽**不跟内容走**：固定预留 GUTTER_DIGITS 位（见 widgets.gutter_width）
+        # 栏宽**不跟内容走**：固定预留 GUTTER_DIGITS 位（见 widgets.gutter_width），
+        # 再加一条固定宽度的标签槽。标签画在数字**右侧**的槽里，所以数字要整体左移、
+        # 栏要加宽；两者都是常量，列宽依旧不随内容跳动。右侧留白压到 2px，让行号
+        # 和标签尽量贴近分隔线（用户反馈原来离右边框太远）。
         unit_w = self._gutter_font.measure("0") if self._gutter_font else dpi.px(8)
-        w = gutter_width(unit_w, max(total, k1 + 1))
+        icon_size = self._gmark_size()
+        slot = icon_size + GMARK_GAP + dpi.px(2)   # 图标 + 左间隙 + 右留白(到分隔线)
+        w = gutter_width(unit_w, max(total, k1 + 1), extra=slot)
+        # 数字右缘 = 分隔线左侧让出整个标签槽；标记再往右 GMARK_GAP 即为槽左缘。
+        digit_right = w - dpi.px(1) - slot
         try:
             if int(float(g.cget("width"))) != int(w):   # cget 可能回来是 "30.0"
                 g.configure(width=w)
@@ -1168,14 +1308,79 @@ class UIMixin(object):
         g.create_line(w - dpi.px(1), 0, w - dpi.px(1), h,
                       fill=_mix_hex(p.get("editor", "#ffffff"),
                                     p.get("text", "#222222"), 0.12))
+        # 这一屏哪些**逻辑行**打了标签：从正文的 gmark tag 反查（不是存行号，
+        # 插删行后标签跟着文字走，见 GMARK_TAG 的说明）。标记画在数字右侧的槽里。
+        marked = self._gmark_lines()
+        gpad = self._gpad_marks()
+        fold_heads = self._fold_head_lines()
+        self._gutter_digit_right = digit_right
+        self._gutter_fold_items = {}
+        # 号 = **格序号 + 1**（用户定的 B 方案）：一格一个号，1、2、3… 严格连续。
+        # 好处是整列永远等距、没有空号 —— 首行标题 44px 占两格就显示 1、2，正文
+        # 第一行接着是 3，不会再出现「标题旁边白空一格」。
+        # 代价（用户拍板接受）：号是刻度尺的格数，**不是逻辑行号**。文档里只要有
+        # 比普通行高的行（首行标题、内嵌代码块），从那一行起号就比真实行号快
+        # 一两格；点「190」实际标的是 189 行 —— 想让号与行严格对应，只能按真实
+        # 行号编（旧方案），两者不可兼得。
+        #   · 一行占多格（标题 / 代码块这类高块）：**每格都有号**，但标记徽标和
+        #     折叠箭头只挂在**这一行在本屏的第一格**（见 gutter_paint_cells），
+        #     否则一个标记会在整块旁边亮成一片；
+        #   · 文档末尾的空白区（@0 恒返回最后一行）：格序号照样往下数，一直填满
+        #     画面；那里不画徽标、点击只跳末行（见下面 pad 分支）；
+        #   · 折叠藏掉的行不占格，所以号也不再为它们留位置。
+        # 「正文到哪儿结束」直接用最后一行自己的 dlineinfo 底边判：它比 count
+        # 全文像素更准 —— 新建笔记的最后一行是空行，count 到 end-1c 只量到上一行，
+        # 那行就会被误判成「正文下方空白」而不能打标签。最后一行不可见（长文档
+        # 滚在中间）时不会有空白区，一律按正文算。
+        try:
+            info_last = self.text.dlineinfo("%d.0" % total)
+        except Exception:
+            info_last = None
+        if info_last:
+            pad_bottom = int(info_last[1]) + int(info_last[3])
+        else:
+            pad_bottom = None
+        # 先把这一屏每一格「盖住哪一行 / 是不是正文下方的空白」全查出来，再决定
+        # 每一格画不画号：一行占多格时号要落在最后一格（见 gutter_paint_cells），
+        # 必须知道下一格的情况，单遍循环看不出「这行还有没有下一格」。
+        cells = []
         for k in range(k0, k1 + 1):
             y = v0 + k * unit
+            mid = int(y + unit // 2)          # 这一格的中点（视口坐标）
             # 点这个号跳到「这个高度上的那一行」；空白段跳到最后一行
             try:
-                ln = int(str(self.text.index("@0,%d" % int(max(0, y + unit // 2)))).split(".")[0])
+                ln = int(str(self.text.index("@0,%d" % int(max(0, mid)))).split(".")[0])
             except Exception:
                 ln = total
-            self._gutter_number(g, w, y + base + desc, k + 1, y, y + unit, ln, p)
+            pad = pad_bottom is not None and mid >= pad_bottom
+            cells.append((y, mid, ln, pad))
+        head = gutter_paint_cells([(c[2], c[3]) for c in cells])
+        for i, (y, mid, ln, pad) in enumerate(cells):
+            # 号就是格序号（从 1 起）：一格一个，不跳号、不重号 —— 用户选的 B 方案。
+            num = k0 + i + 1
+            item = self._gutter_number(g, digit_right, y + base + desc,
+                                       num, y, y + unit, ln, p, pad=pad)
+            if pad:
+                # 虚号没有正文行可挂，但可以有自己的标记（gpad_N，一个号一个
+                # tag）。只画在被点的那一格，不像以前那样靠末行标记连坐整片。
+                if num in gpad:
+                    self._gutter_mark(g, digit_right, y, unit, item, p, num,
+                                      icon_size=icon_size)
+                continue
+            if not head[i]:
+                # 这一格是同一逻辑行的延续（标题 / 代码块占的第二格起）：号照画，
+                # 但徽标与折叠箭头只挂行首那一格，否则一个标记会亮成一片。
+                continue
+
+            if ln in fold_heads:
+                # 折叠头与标签重合时折叠优先（用户定的规则）：同一槽位只画箭头
+                self._gutter_fold_mark(g, ln, y, unit, p,
+                                       digit_right=digit_right, slot_w=slot)
+            elif ln in marked:
+                self._gutter_mark(g, digit_right, y, unit, item, p, num,
+                                  icon_size=icon_size)
+        # 标记增删 / 滚动后图元全换了，重挂闪烁定时器（有标记才转）。
+        self._gmark_blink_sync()
 
     def _measure_gutter_phase(self, v0, unit):
         """刻度相对「文档第一行顶端」的相位修正（像素，±unit/2）。
@@ -1259,30 +1464,389 @@ class UIMixin(object):
         unit = max(unit, dpi.px(12))
         return unit, int(round(unit * 0.72))
 
-    def _gutter_number(self, g, w, ty, num, top, bottom, line, p):
-        """画一个行号，并登记它占的纵向区间（悬停 / 点击都按区间查，不按号查）。"""
-        item = g.create_text(w - dpi.px(7), ty, text=str(num), anchor="se",
+    def _gutter_number(self, g, right, ty, num, top, bottom, line, p, pad=False):
+        """画一个行号，并登记它占的纵向区间（悬停 / 点击都按区间查，不按号查）。
+
+        `right` 是数字的右缘 x（已为右侧标签槽让位），不再是栏宽。
+        `pad=True` 表示这一格在正文最后一行下方：号是往下续数的虚号，点击时
+        不能当成「这一行」去挂标签（见 `gutter_hit_at` 的第三项）。
+        """
+        fill = p.get("soft", "#76767e")
+        item = g.create_text(right, ty, text=str(num), anchor="se",
                              font=self._gutter_font,
-                             fill=p.get("soft", "#76767e"),
+                             fill=fill,
                              tags=("gnum", "gnum_%d" % num))
+        self._gutter_base_fill[item] = fill
         self._gutter_lines[num] = item
         if bottom <= top:
             bottom = top + 1
-        self._gutter_hit.append((int(top), int(bottom), line, item))
+        self._gutter_hit.append((int(top), int(bottom), line, item, bool(pad)))
         return item
 
-    def _gutter_line_at(self, y):
-        """行号栏 y 处对应的 (目标行号, 图元 id)；落在数字区间外就给 (None, None)。
+    # ---------- 行号栏标签 ----------
+    # 标签挂正文行首字符的独立 tag 上（gmark_1、gmark_2 …，见 GMARK_TAG 的说明），
+    # 不存行号。这样插删行、折叠代码块、换笔记、隐藏再显示行号，标签都跟着那一
+    # 行文字走；落库靠正文 serialize 的 tag 一起存，不需要给 store 加列 / 给备份
+    # 加字段。**一行一个 tag 名是硬要求** —— 共用会在连续空行上被 Tk 合并成一段。
 
-        区间是画的时候一并登记的（见 `_gutter_number`），不按数字反查 —— 号是
-        标尺数出来的，一个号未必等于一个逻辑行。
+    def _gmark_tag_names(self):
+        """正文里所有「标记」tag 名（含旧版共用的 GMARK_TAG）。"""
+        try:
+            names = self.text.tag_names()
+        except Exception:
+            return []
+        return [n for n in names
+                if n == GMARK_TAG or str(n).startswith(GMARK_TAG_PREFIX)]
+
+    def _new_gmark_tag(self):
+        """取一个没被占用的标记 tag 名（一行一个，避免相邻区间被 Tk 合并）。"""
+        used = set()
+        for name in self._gmark_tag_names():
+            if name == GMARK_TAG:
+                continue
+            try:
+                used.add(int(str(name)[len(GMARK_TAG_PREFIX):]))
+            except Exception:
+                pass
+        i = 1
+        while i in used:
+            i += 1
+        return GMARK_TAG_PREFIX + str(i)
+
+    def _gmark_lines(self):
+        """当前正文里打了标签的逻辑行号集合（取每个 tag 区间的起点行）。"""
+        out = set()
+        for tag in self._gmark_tag_names():
+            try:
+                ranges = self.text.tag_ranges(tag)
+            except Exception:
+                continue
+            for i in range(0, len(ranges) - 1, 2):
+                try:
+                    out.add(int(str(ranges[i]).split(".")[0]))
+                except Exception:
+                    pass
+        return out
+
+    def _gpad_tag_names(self):
+        """正文里所有「虚号标记」tag 名（gpad_号，见 _toggle_gpad）。"""
+        try:
+            names = self.text.tag_names()
+        except Exception:
+            return []
+        return [n for n in names if str(n).startswith(GPAD_TAG_PREFIX)]
+
+    def _gpad_marks(self):
+        """当前打了标记的虚号集合（tag 名里的号就是行号栏显示的那个号）。"""
+        out = set()
+        for name in self._gpad_tag_names():
+            if not self.text.tag_ranges(name):
+                continue
+            try:
+                out.add(int(str(name)[len(GPAD_TAG_PREFIX):]))
+            except Exception:
+                pass
+        return out
+
+    def _toggle_gpad(self, num):
+        """切换正文下方虚号 `num` 的标记（点一个只亮一个，不牵连其他虚号）。
+
+        虚号在正文里**没有对应的行**，`@0,y` 反查一律返回最后一行 —— 早期直接
+        toggle 末行的结果是「点一个虚号，整片虚号同时亮」（用户报的 bug）。现在
+        标记挂在正文最后一个字符上，**一个虚号一个 tag 名**（gpad_4、gpad_5…）：
+        不同 tag 名的区间 Tk 不合并，所以彼此独立；tag 随正文 serialize 落库，
+        切笔记 / 重启都还在。正文继续往下长、那一格变成真实行之后，虚号标记就
+        不再被画（它本来就属于「不存在的行」）。
+        """
+        if self._refuse_readonly():
+            return
+        if getattr(self, "_locked_view", False):
+            self._flash_readonly_hint()
+            return
+        tag = GPAD_TAG_PREFIX + str(int(num))
+        try:
+            # ⚠️ 判「有没有实际区间」，不能判 tag 名在不在：换笔记后旧笔记的
+            # gpad_N 名字可能还注册在 Text 上（区间已空），按名字判会误走进取消
+            # 分支 —— 表现就是刚切过来的那几个虚号点一下没反应。
+            if self.text.tag_ranges(tag):
+                self.text.tag_delete(tag)
+            else:
+                self.text.tag_add(tag, "end-1c", "end")
+        except Exception:
+            return
+        self.mark_modified()            # serialize 把 tag 存进正文 → 落库
+        self._gutter_schedule(0)
+
+    def _gmark_normalize(self):
+        """把旧库留下的「多行共用一个 gmark」拆成一行一个 tag。
+
+        旧版所有标记共用一个 tag 名，连续空行（每行只有一个换行符）的区间首尾
+        相接，Tk 会合并成一段，于是点其中任一行都在动整段。这里按行拆开：
+        区间覆盖到的每一行都重新锚一个独立 tag，顺序不变。
+
+        只拆空行（整行就是一个换行符）—— 那正是会产生合并的唯一情形；带文字的
+        相邻行不会连续，正常不会进这里。非空行的区间原样保留，不丢标记。
+        """
+        for tag in self._gmark_tag_names():
+            try:
+                ranges = self.text.tag_ranges(tag)
+            except Exception:
+                continue
+            spans = [(str(ranges[i]), str(ranges[i + 1]))
+                     for i in range(0, len(ranges) - 1, 2)]
+            if not spans:
+                continue
+            pieces, need = [], False
+            for a, b in spans:
+                la, lb = self._idx_key(a), self._idx_key(b)
+                rows_n = (lb[0] - la[0]) if lb[1] == 0 else (lb[0] - la[0] + 1)
+                if rows_n <= 1:
+                    pieces.append((a, b))       # 正常态：一个区间只锚一行
+                    continue
+                need = True
+                for ln in range(la[0], lb[0] + 1):
+                    start = "%d.0" % ln
+                    if self.text.compare(start, ">=", b):
+                        break
+                    end = "%d.0 +1c" % ln
+                    try:
+                        one = self.text.get(start, end)
+                    except Exception:
+                        continue
+                    if one == "\n":
+                        pieces.append((start, end))
+            if not need:
+                continue
+            try:
+                self.text.tag_delete(tag)
+            except Exception:
+                pass
+            for a, b in pieces:
+                self.text.tag_add(self._new_gmark_tag(), a, b)
+
+    def _gmark_size(self):
+        """标签图标边长（像素）。布局（留槽宽）和绘制共用，别各自写死。"""
+        return max(11, int(dpi.px(13)))
+
+    def _gmark_icon(self, p):
+        """标签图标：一串**空心环 → 实心圆**的填充帧（抗锯齿），按主题缓存。
+
+        标记已挪到数字右侧、不再压字，所以可以放心填成实心。帧序列是
+        「空心环 → 内圈逐渐长大 → 填满成实心圆」，闪烁定时器逐帧推进、到头再
+        反向（ping-pong），形成"填充 / 收空"的呼吸动画。AAImage 出的位图必须挂
+        在实例上保活（_gmark_photos），否则被 GC 收掉后 Canvas 上那张图就变空白。
+        缓存键含颜色与尺寸：换肤 / 改字号自动重画。
+        """
+        GMARK_FILL_FRAMES = 7               # 空心→实心共 7 帧（含两端）
+        size = self._gmark_size()
+        acc = p.get("accent", "#4f8")
+        ed = p.get("editor", "#ffffff")
+        key = (size, acc, ed)
+        if self._gmark_icon_key == key and self._gmark_photos:
+            return self._gmark_photos
+
+        c = size / 2.0
+        # 环固定不动，只有内圈半径随帧长大：0 → 环外缘，最后一帧成为实心圆。
+        ring_r, ring_w = size * 0.44, size * 0.14
+        outer = size * 0.44                  # 填充圆最终半径（≈环外缘）
+        frames = []
+        try:
+            for i in range(GMARK_FILL_FRAMES):
+                t = i / float(GMARK_FILL_FRAMES - 1)
+                pic = AAImage(size, size, ed)
+                halo, bb = aa_disc(c, c, size * 0.46)
+                pic.fill(_mix_hex(ed, acc, 0.20), halo, bb)
+                ring, bb2 = aa_ring(c, c, ring_r, ring_w)
+                pic.fill(acc, ring, bb2)
+                rr = outer * t
+                if rr > 0.5:
+                    dot, bb3 = aa_disc(c, c, rr)
+                    pic.fill(acc, dot, bb3)
+                frames.append(pic.to_photo(self.root))
+        except Exception:
+            return None
+        self._gmark_photos = tuple(frames)
+        self._gmark_photo = frames[0]        # 兼容旧探针
+        self._gmark_icon_key = key
+        return self._gmark_photos
+
+    def _gutter_mark(self, g, digit_right, y, unit, item, p, num, icon_size=None):
+        """在数字右侧的标签槽里画徽标，并把该行号染成 accent。
+
+        徽标画在 `digit_right`（数字右缘）右侧、分隔线左侧的固定槽里，垂直方向
+        和这一格行号居中对齐。数字与徽标互不遮挡 —— 所以徽标可以放心从空心环
+        填到实心圆（见 _gmark_icon），不用再镂空让字。槽宽由 _gutter_redraw 按
+        `_gmark_size()` 算好，栏也已同步加宽，3、4 位数都挤不掉它。
+        """
+        try:
+            self._gutter_base_fill[item] = p["accent"]
+            g.itemconfigure(item, fill=p["accent"])
+        except Exception:
+            pass
+        photos = self._gmark_icon(p)
+        if not photos:
+            return
+        iw, ih = photos[0].width(), photos[0].height()
+        # 水平：紧挨数字右缘 + GMARK_GAP；垂直：行号格居中后再下移 GMARK_Y_NUDGE
+        # —— 数字用 "se" 锚点带 descender，视觉重心偏下，纯几何居中看着会偏高。
+        x = int(digit_right + GMARK_GAP)
+        iy = int(y + (unit - ih) / 2 + GMARK_Y_NUDGE)
+        mark = g.create_image(x, iy, anchor="nw", image=photos[0], tags=("gmark",))
+        # 初始帧统一从第 0 帧（空心）开始，闪烁 tick 再逐帧推进。
+        try:
+            g.itemconfigure(mark, image=photos[0])
+        except Exception:
+            pass
+
+    def _gutter_fold_mark(self, g, ln, y, unit, p, digit_right=0, slot_w=18):
+        """折叠头行的指示符：数字右侧槽里一枚 ▶ 实心三角（指向右＝这块已折叠，
+        点击展开）。与 gmark 重合时折叠优先，同一槽位只画这一枚（见重绘循环）。
+        走 widgets._draw_chevron 的整数顶点画法 —— 小图标不抗锯齿，别用 oval/线。
+
+        箭头下方再画一条竖线连到下一格：被折叠的行不占刻度格，下一格就是折叠
+        块之后的可见行，这条线把两头的行号串起来，暗示「中间这段被收起了」。
+        颜色比箭头淡一档，不抢三角；只画在折叠头格，随 gutter 重绘自动重建。
+        """
+        # 槽中心放箭头；size 取 9px 与文件夹扭转子的墨迹同款
+        try:
+            size = 9
+            cx = digit_right + max(size, slot_w) / 2.0
+            cy = y + unit / 2.0
+            # 竖线：从箭头下缘到下一格中线，x 与箭头同轴。淡 accent，1px。
+            line_col = _mix_hex(p.get("editor", "#ffffff"),
+                                p.get("accent", "#2f7cf6"), 0.5)
+            g.create_line(cx, cy + size / 2.0 + dpi.px(1),
+                          cx, cy + unit - dpi.px(2), fill=line_col)
+            item = _draw_chevron(g, cx, cy, size, p["accent"], down=False)
+            self._gutter_fold_items[ln] = item
+        except Exception:
+            pass
+
+    def _fold_toggle_head(self, ln):
+        """点击折叠头的箭头：展开这个折叠块（折叠态的箭头只有一个动作）。"""
+        for tag, _s, _e, head, _tail in self._fold_ranges():
+            if head == ln:
+                self._fold_unfold(tag)
+                return "break"
+        return "break"
+
+    def _gmark_blink_sync(self):
+        """有可见标记时开填充定时器，没有时立刻停（别让空转耗一个 after/帧）。"""
+        g = getattr(self, "gutter", None)
+        marks = ()
+        if g is not None:
+            try:
+                if g.winfo_exists() and self._line_numbers_on():
+                    marks = g.find_withtag("gmark")
+            except Exception:
+                marks = ()
+        if marks:
+            if getattr(self, "_gmark_blink_job", None) is None:
+                self._gmark_blink_idx = 0
+                self._gmark_blink_dir = 1
+                self._gmark_blink_tick()
+        elif getattr(self, "_gmark_blink_job", None) is not None:
+            self._cancel_after(self._gmark_blink_job)
+            self._gmark_blink_job = None
+
+    def _gmark_blink_tick(self):
+        """逐帧推进「空心→实心」填充，到头 ping-pong 反向；窗口没了 / 行号隐藏 /
+        标记清空就自动熄掉。
+        """
+        g = getattr(self, "gutter", None)
+        try:
+            alive = g is not None and g.winfo_exists() and self._line_numbers_on()
+        except Exception:
+            alive = False
+        photos = getattr(self, "_gmark_photos", None)
+        if not alive or not photos:
+            self._gmark_blink_job = None
+            return
+        # ping-pong：0→last→0，避免到实心后瞬间跳回空心（突兀）。
+        i = int(getattr(self, "_gmark_blink_idx", 0))
+        step = int(getattr(self, "_gmark_blink_dir", 1))
+        n = len(photos)
+        if n > 1:
+            i += step
+            if i >= n - 1:
+                i, step = n - 1, -1
+            elif i <= 0:
+                i, step = 0, 1
+            self._gmark_blink_idx = i
+            self._gmark_blink_dir = step
+        frame = photos[i]
+        for item in g.find_withtag("gmark"):
+            try:
+                g.itemconfigure(item, image=frame)
+            except Exception:
+                pass
+        self._gmark_blink_job = self._after(110, self._gmark_blink_tick)
+
+    def _toggle_gmark(self, ln):
+        """切换逻辑行 ln 的标签。只读笔记拦下；标签锚在行首字符上，落库走正文。
+
+        一个标记一个独立 tag 名（见 GMARK_TAG 的说明）：空行只有一个换行符，
+        共用 tag 时相邻两行的区间会被 Tk 合并，点一行就连累整段空白。
+        """
+        if self._refuse_readonly():
+            return
+        if getattr(self, "_locked_view", False):
+            self._flash_readonly_hint()
+            return
+        try:
+            total = int(str(self.text.index("end-1c")).split(".")[0])
+        except Exception:
+            return
+        if ln < 1 or ln > total:
+            return                      # 末尾空白区的号没有对应文字，不打
+        a = "%d.0" % ln
+        b = "%d.0 +1c" % ln             # 行首一个字符（空行则是那个换行符）
+        try:
+            on = [t for t in self._gmark_tag_names()
+                  if t in (self.text.tag_names(a) or ())]
+            if on:
+                # 只摘这一行的那个字符；tag 摘空后连名字一起删，不留空 tag 占着
+                # 号段（_new_gmark_tag 按名字序号取新号）。
+                for tag in on:
+                    self.text.tag_remove(tag, a, b)
+                    if not self.text.tag_ranges(tag):
+                        self.text.tag_delete(tag)
+            else:
+                self.text.tag_add(self._new_gmark_tag(), a, b)
+        except Exception:
+            return
+        self.mark_modified()            # serialize 把 tag 存进正文 → 落库
+        self._gutter_schedule(0)
+
+    def _gutter_line_at(self, y):
+        """行号栏 y 处对应的 (目标行号, 图元 id, 是否正文下方空白)。
+
+        落在数字区间外给 (None, None, False)。区间是画的时候一并登记的
+        （见 `_gutter_number`），不按数字反查 —— 号是标尺数出来的，一个号
+        未必等于一个逻辑行。
         """
         return gutter_hit_at(self._gutter_hit, y)
 
     def _on_gutter_motion(self, e):
-        _ln, item = self._gutter_line_at(e.y)
+        ln, item, _pad = self._gutter_line_at(e.y)
         if item is not None:
             self._gutter_hover_set(item)
+        # 折叠箭头跟着这一行一起亮 / 熄：悬停加深一档（accent → text），离开恢复
+        fh = getattr(self, "_gutter_fold_items", {})
+        ch = fh.get(ln) if ln is not None else None
+        prev = self._fold_hover_item
+        if ch != prev:
+            if prev is not None:
+                try:
+                    self.gutter.itemconfigure(prev, fill=self.pal["accent"])
+                except Exception:
+                    pass
+            if ch is not None:
+                try:
+                    self.gutter.itemconfigure(ch, fill=self.pal["text"])
+                except Exception:
+                    pass
+            self._fold_hover_item = ch
 
     def _gutter_hover_set(self, item):
         """悬停的那个行号变主题色 —— 点之前就知道「会跳到哪一行」。
@@ -1297,7 +1861,9 @@ class UIMixin(object):
         acc = self.pal["accent"]
         if old is not None:
             try:
-                self.gutter.itemconfigure(old, fill=soft)
+                # 恢复到这格的基础色：打了标签的行是 accent，不是一律 soft
+                base = self._gutter_base_fill.get(old, soft)
+                self.gutter.itemconfigure(old, fill=base)
             except Exception:
                 pass
         if item is not None:
@@ -1307,7 +1873,7 @@ class UIMixin(object):
                 pass
 
     def _on_gutter_click(self, e):
-        ln, _item = self._gutter_line_at(e.y)
+        ln, item, pad = self._gutter_line_at(e.y)
         if ln is None:
             # 语言条左侧、块与块之间的留白没有数字，也没有区间 —— 按正文行兜底，
             # 别让「点到行号栏空白」变成没反应。
@@ -1315,13 +1881,39 @@ class UIMixin(object):
                 ln = int(str(self.text.index("@0,%d" % int(e.y))).split(".")[0])
             except Exception:
                 return "break"
+            pad = False
+        if pad:
+            # 正文下方那几格是虚号：底下没有文字，但每个号可以有自己的标记。
+            # 号从图元上读（= 格序号），一个号一个 gpad_N tag，点一个只亮一个。
+            try:
+                num = int(str(self.gutter.itemcget(item, "text")))
+            except Exception:
+                num = None
+            if num is not None:
+                self._toggle_gpad(num)
+            self._gutter_jump(ln)
+            return "break"
+        # 点击分区：折叠头那一行的**右侧槽**是折叠箭头的地盘（重合时折叠优先，
+        # 标签给折叠让位）—— 点槽切折叠、点数字维持原有行为（标签 / 跳转）。
+        if ln in self._fold_head_lines() and e.x >= self._gutter_digit_right:
+            return self._fold_toggle_head(ln)
+        # 点行号 toggle 这一行的标签（只读笔记由 _toggle_gmark 自己拦）。
+        self._toggle_gmark(ln)
+        self._gutter_jump(ln)
+        return "break"
+
+    def _gutter_jump(self, ln):
+        """点行号时「跳转」的那一半：光标放到这一行行首、滚进视口、抢焦点。
+
+        单独抽出来是因为正文下方的虚号也要跳（但没有行可打标签，见
+        `_on_gutter_click`）—— 两条路径的跳转手感必须一致。
+        """
         try:
             self.text.mark_set("insert", "%d.0" % ln)
             self.text.see("%d.0" % ln)
             self.text.focus_set()
         except Exception:
             pass
-        return "break"
 
     def _on_gutter_wheel(self, e):
         """滚轮落在行号栏上也要滚正文 —— 那里不是「别的控件」，是同一条正文的边。"""
@@ -1333,12 +1925,385 @@ class UIMixin(object):
 
     def _gutter_menu(self, e):
         m = PopupMenu(self.root, self.pal)
-        m.add("隐藏行号", command=lambda: self.set_line_numbers(False))
+        if not self.is_readonly() and (self._gmark_lines() or self._gpad_marks()):
+            m.add("清除本篇所有标签", icon="mark_clear", command=self._gmark_clear)
+        if self._folds:
+            # panel 是现成的「折叠面板」图标；图标要么整张菜单配齐、要么全不给
+            # （见 PopupMenu.add），这里三项都给，避免某一行左边空一块。
+            m.add("展开所有折叠", icon="panel", command=self._fold_unfold_all)
+        m.add("隐藏行号", icon="gutter_hide", command=lambda: self.set_line_numbers(False))
         try:
             m.popup(e.x_root, e.y_root)
         except Exception:
             pass
         return "break"
+
+    def _on_text_context_menu(self, e):
+        """正文右键：点在图上 → 图片菜单；选中了连续多行 → 「折叠选中行」；否则放行。
+
+        折叠入口从工具栏挪到这里（用户定的：工具栏取消折叠按钮，选中行右键给）。
+        ⚠️ 绑在 alarm 的 <Button-3> 之前：图菜单 / 折叠选区都要 return "break" 吃掉
+        事件，让 alarm 那条收不到；两者都不成立就返回 None，alarm 右键照常弹。
+        """
+        # 桩窗口（折叠单测的假 harness）给的 event 可能既没有 x/y，也没有图元 ——
+        # 两种都按「没点在图上」处理，不能让它把折叠入口打挂。
+        name = None
+        if e is not None and getattr(e, "x", None) is not None \
+                and getattr(e, "y", None) is not None:
+            try:
+                name = self._img_at_point(e.x, e.y)
+            except Exception:
+                name = None
+        if name:
+            self._img_popup(e, name)
+            return "break"
+        if self._fold_sel_span() is None:
+            return None
+        m = PopupMenu(self.root, self.pal)
+        m.add("折叠选中行", icon="chevron", command=self._fold_selection)
+        try:
+            m.popup(e.x_root, e.y_root)
+        except Exception:
+            pass
+        return "break"
+
+    def _gmark_clear(self):
+        """清掉当前笔记正文里所有标记 tag（含虚号标记，走正文保存链路）。"""
+        if self._refuse_readonly():
+            return
+        try:
+            tags = self._gmark_tag_names() + self._gpad_tag_names()
+            if not tags:
+                return
+            for tag in tags:
+                self.text.tag_delete(tag)
+        except Exception:
+            return
+        self.mark_modified()
+        self._gutter_schedule(0)
+
+    # ---------- 正文行折叠 ----------
+    # 选中连续行 → 首行保留作「折叠头」，其后到末行整段 elide 隐藏。每块一个
+    # gfold_N tag（区间跟着文字走），折叠头行末挂一枚「⋯ N 行」嵌入窗口提示片。
+    # 纯视图操作：不 mark_modified、不进序列化（gfold* 在 _is_ephemeral_tag），
+    # 只读笔记也允许折叠。
+    #
+    # 为什么折叠敢用 elide（当年超链接明确不用）：链接怕的是**行内**隐藏片段 ——
+    # 光标在看不见的括号间跳、删除粘贴把语法弄坏。折叠的边界永远落在行首 / 行尾
+    # 的整行级区间，配合 on_edit 里的后置护栏（光标落进隐藏区→先展开），这一类
+    # 问题被整体关死。
+
+    def _idx_key(self, idx):
+        """"line.col" → (line, col)：Tk 索引的字符串比较跨行会错（"10.0"<"9.1"）。"""
+        line, col = str(idx).split(".")
+        return (int(line), int(col))
+
+    def _fold_ranges(self):
+        """[(tag, start, end, head, tail)]：head/tail 是折叠头行 / 末隐藏行行号。"""
+        out = []
+        for tag in list(self._folds):
+            try:
+                rng = self.text.tag_ranges(tag)
+            except Exception:
+                rng = ()
+            if not rng or len(rng) < 2:
+                continue
+            s, e = str(rng[0]), str(rng[1])
+            # tag 区间 = 头行行尾+1c → 末行行尾+1c，起点行 −1 就是折叠头
+            sl = int(s.split(".")[0])
+            el = int(e.split(".")[0])
+            out.append((tag, s, e, sl - 1, el - 1))
+        return out
+
+    def _fold_head_lines(self):
+        """{折叠头行号: tag}，gutter 重绘与点击分区共用，别在行循环里反复算。"""
+        return {_head: _tag for _tag, _s, _e, _head, _t in self._fold_ranges()}
+
+    def _fold_tag_at(self, index):
+        """index 落进的折叠 tag（**半开区间 [start, end)**）。end 是折叠块后面
+        第一条可见行的行首 —— 那里能放光标、能有搜索命中，不算在隐藏区里；真正
+        「贴着隐藏边界按 BackSpace / Delete」由 _fold_key_guard 在按键前拦。"""
+        key = self._idx_key(self.text.index(index))
+        for tag, s, e, _head, _tail in self._fold_ranges():
+            if self._idx_key(s) <= key < self._idx_key(e):
+                return tag
+        return None
+
+    def _fold_key_guard(self, event):
+        """按键前的折叠护栏：BackSpace / Delete 贴着隐藏区边界时先展开。
+
+        光标停在折叠块末尾（下一条可见行行首）按 BackSpace、或停在折叠块起点
+        按 Delete，都会吃到看不见的字符 —— 事后护栏发现不了（位置没变），必须
+        在按键前就展开。其余按键不动：插入类修改由 on_edit 的后置护栏兜住。
+        """
+        if self._fold_quiet or not self._folds:
+            return None
+        ks = getattr(event, "keysym", "")
+        if ks not in ("BackSpace", "Delete"):
+            return None
+        ins = self._idx_key(self.text.index("insert"))
+        for tag, s, e, _head, _tail in self._fold_ranges():
+            if (ks == "Delete" and ins == self._idx_key(s)) or \
+                    (ks == "BackSpace" and ins == self._idx_key(e)):
+                self._fold_unfold(tag)
+        return None
+
+    def _fold_hint(self, msg):
+        """折叠入口的轻提示：只读笔记借提示条闪一下，其余暂时静默（菜单可再点）。"""
+        if self.is_readonly():
+            self._flash_readonly_hint()
+
+    def _fold_sel_span(self):
+        """选区覆盖的 (折叠头行, 末隐藏行)，无选区 / 跨度不足一格时给 None。
+
+        选区终点是排他边界：bcol>0 = 选进了那一行（算）；bcol==0 = 停在行首
+        （不算，包括停在文档 end "N.0" 时 tail=N-1 恰好是真实最后一行）。
+        """
+        sel = self.text.tag_ranges("sel")
+        if not sel:
+            return None
+        a = self.text.index(str(sel[0]))
+        b = self.text.index(str(sel[1]))
+        h = int(a.split(".")[0])
+        bl, bcol = b.split(".")
+        bl, bcol = int(bl), int(bcol)
+        tail = bl if bcol > 0 else bl - 1
+        return (h, tail) if tail > h else None
+
+    def _fold_selection(self):
+        """折叠当前选区覆盖的连续行（吸附整行；至少要有一行可藏）。"""
+        if not self.current_note():
+            return
+        span = self._fold_sel_span()
+        if span is None:
+            self._fold_hint("先选中要折叠的行" if not self.text.tag_ranges("sel")
+                            else "至少选中两行才能折叠")
+            return
+        h, tail = span
+        # 与已有折叠相交就拒绝：elide 区间叠加后「哪块归哪块」说不清，第一期不做嵌套
+        for _tag, _s, _e, fh, ft in self._fold_ranges():
+            if h <= ft and fh <= tail:
+                self._fold_hint("折叠区间与已有折叠相交")
+                return
+        self._fold_seq += 1
+        tag = "%s%d" % (GFOLD_PREFIX, self._fold_seq)
+        self.text.tag_add(tag, "%d.end+1c" % h, "%d.end+1c" % tail)
+        self.text.tag_configure(tag, elide=True)
+        self._folds.append(tag)
+        # 选区横跨隐藏区，留着会一片蓝；光标若落在里面也一起请出来
+        self.text.tag_remove("sel", "1.0", tk.END)
+        if self._fold_tag_at("insert") == tag:
+            self.text.mark_set("insert", "%d.end" % h)
+        self._fold_chip_make(tag, h, tail - h)
+        self._fold_geometry_changed()
+
+    def _fold_unfold(self, tag):
+        """展开一个折叠块：摘 chip、删 tag（隐藏随之解除），不动任何正文文字。"""
+        chip = self._fold_chips.pop(tag, None)
+        if chip is not None:
+            self._fold_quiet = True
+            try:
+                # 嵌入窗口的路径名可以直接当索引用（Tk 手册 window 一节）
+                self.text.delete(str(chip))
+            except Exception:
+                pass
+            self.text.edit_modified(False)
+            self._fold_quiet = False
+            try:
+                chip.destroy()
+            except Exception:
+                pass
+        if tag in self._folds:
+            self._folds.remove(tag)
+        try:
+            self.text.tag_delete(tag)
+        except Exception:
+            pass
+        self._fold_geometry_changed()
+
+    def _fold_unfold_all(self):
+        for tag in list(self._folds):
+            self._fold_unfold(tag)
+
+    def _fold_cleanup(self):
+        """切笔记 / 重载前清场：chip 是 text 的子控件，必须显式销毁（tag 随
+        text.delete 自然消失，这里只兜底）。"""
+        for tag in list(self._folds):
+            chip = self._fold_chips.pop(tag, None)
+            if chip is not None:
+                try:
+                    chip.destroy()
+                except Exception:
+                    pass
+        self._folds = []
+        self._fold_chips = {}
+
+    def _fold_geometry_changed(self):
+        """折叠 / 展开改变文档几何：刻度相位按文档顶端重测，行号栏立刻重画。"""
+        self._gutter_phase = 0
+        self._gutter_schedule(0)
+        try:
+            self.text.yview_scroll(0, "units")     # 拉一次 yscroll 联动（滚动条长度）
+        except Exception:
+            pass
+
+    def _chip_width(self):
+        """占位条宽度：铺满正文可视宽，两侧各留一点。未映射 / stub 给个稳妥回退。"""
+        try:
+            w = int(self.text.winfo_width())
+        except Exception:
+            w = 0
+        if w < dpi.px(120):
+            w = dpi.px(360)
+        # 挂点前的折叠头文字长短不定：宽度取「可视宽 - 边距」与 480px 的较小者，
+        # 既横贯感足够，又保证「点击展开」不会被正文右缘截断。
+        return min(max(dpi.px(200), w - dpi.px(46)), dpi.px(480))
+
+    def _fold_chip_make(self, tag, head, hidden):
+        """折叠头行末的占位条：横贯的淡底虚线条，左侧 ▶ +「N 行已折叠」，
+        右侧「点击展开」。Canvas 嵌进正文（window_create 挂在 head 行末，宽
+        占位条会被 Tk 排到头行下方一格），不占字符；换主题时由
+        _fold_chips_repaint 重画。整条可点展开。
+        """
+        self._fold_chip_destroy(tag)
+        cv = tk.Canvas(self.text, highlightthickness=0, bd=0, takefocus=0,
+                       bg=self.pal["editor"])
+        cv._fold_label = "⋯ %d 行已折叠" % hidden
+        cv._fold_tag = tag
+        cv._fold_hover = False
+        # 整条可点展开；hover 只重画底色（不改正文、不碰 modified）。
+        cv.bind("<Button-1>", lambda _e, t=tag: self._fold_chip_click(t))
+        cv.bind("<Enter>", lambda _e, c=cv: self._chip_hover(c, True))
+        cv.bind("<Leave>", lambda _e, c=cv: self._chip_hover(c, False))
+        self._fold_chips[tag] = cv
+        self._fold_quiet = True
+        try:
+            self.text.window_create("%d.end" % head, window=cv,
+                                    padx=dpi.px(6), pady=dpi.px(2))
+        except Exception:
+            self._fold_chips.pop(tag, None)
+            cv.destroy()
+        finally:
+            self.text.edit_modified(False)
+            self._fold_quiet = False
+        # 先画一次（宽度可能还是回退值）；布局完成后用真实正文宽重画，
+        # 让占位条铺满整行 —— 宽到塞不进折叠头行末，Tk 会把它排到下一格，
+        # 正好落在被折叠内容的位置。after 用 app 的登记式定时器，随关窗取消。
+        self._fold_chip_paint(cv)
+        try:
+            self._after(0, lambda: self._fold_chip_repaint_size(tag))
+        except Exception:
+            pass
+        return cv
+
+    def _fold_chip_repaint_size(self, tag):
+        """布局完成后按真实正文宽重画占位条；tag 已被展开则什么都不做。"""
+        cv = self._fold_chips.get(tag)
+        if cv is not None:
+            self._fold_chip_paint(cv)
+
+    def _fold_chip_click(self, tag):
+        """点占位条整条 → 展开这个折叠块。吞掉事件，别让正文收到这次点击。"""
+        self._fold_unfold(tag)
+        return "break"
+
+    def _chip_hover(self, cv, on):
+        """占位条悬停：只重画底色深浅，不进撤销栈。"""
+        if getattr(cv, "_fold_hover", False) == on:
+            return
+        cv._fold_hover = on
+        self._fold_chip_paint(cv)
+
+    def _fold_chip_paint(self, cv):
+        """占位条内容：淡底圆角 + 虚线边框 + ▶ +「N 行已折叠」+「点击展开」。
+        配色全部从 pal 派生，跟随主题；hover 时底色加深一档。
+        """
+        try:
+            p = self.pal
+            w = max(dpi.px(120), self._chip_width())
+            h = dpi.px(22)
+            cv.configure(width=w, height=h, bg=p["editor"])
+            cv.delete("all")
+            ed = p.get("editor", "#ffffff")
+            acc = p.get("accent", "#2f7cf6")
+            soft = p.get("soft", "#76767e")
+            mix = 0.16 if getattr(cv, "_fold_hover", False) else 0.09
+            fill = _mix_hex(ed, acc, mix)
+            border = _mix_hex(ed, acc, 0.45)
+            pts = _round_rect_points(1, 1, w - 2, h - 2, dpi.px(5), 4)
+            cv.create_polygon(pts, fill=fill, outline=border, dash=(4, 3))
+            # 左侧 ▶：紧贴条目左边，用和行号槽同款 _draw_chevron（整数顶点）。
+            ax = dpi.px(9)
+            _draw_chevron(cv, ax, (h - 1) / 2.0, 9, acc, down=False)
+            cy = (h - 1) / 2.0
+            cv.create_text(dpi.px(17), cy, text=cv._fold_label, anchor="w",
+                           font=GFOLD_CHIP_FONT, fill=acc)
+            cv.create_text(w - dpi.px(8), cy, text="点击展开", anchor="e",
+                           font=GFOLD_CHIP_FONT, fill=soft)
+        except Exception:
+            pass
+
+    def _fold_chip_destroy(self, tag):
+        chip = self._fold_chips.pop(tag, None)
+        if chip is not None:
+            self._fold_quiet = True
+            try:
+                self.text.delete(str(chip))
+            except Exception:
+                pass
+            self.text.edit_modified(False)
+            self._fold_quiet = False
+            try:
+                chip.destroy()
+            except Exception:
+                pass
+
+    def _fold_chips_repaint(self):
+        for cv in list(self._fold_chips.values()):
+            try:
+                self._fold_chip_paint(cv)
+            except Exception:
+                pass
+
+    def _fold_chip_expected(self, head):
+        """chip 的应有位置。嵌入窗口的 index 报的是「它前面那个字符的位置」
+        （实测：挂 1.end 报 1.3），行首在空行上时没有前一个字符，就是 head.0。
+        """
+        end_col = self._idx_key(self.text.index("%d.end" % head))[1]
+        return self.text.index("%d.end-1c" % head) if end_col > 0 else "%d.0" % head
+
+    def _fold_sync_after_edit(self):
+        """on_edit 的后置护栏：用户改动之后跑一遍折叠体检。
+
+        1) 被删空的折叠块清理掉；2) 光标落进隐藏区（插入在折叠里）→ 先展开，
+        杜绝「盲打不可见文字」（贴边删除走按键前的 _fold_key_guard）；3) chip
+        挪回头行末（在折叠头上补字会把 chip 顶到文字中间）。
+        """
+        if not self._folds:
+            return
+        # 先清尸：区间被删空的 tag 在 _fold_ranges 里查不到，得按名主动验一遍
+        for tag in list(self._folds):
+            try:
+                alive = self.text.tag_ranges(tag)
+            except Exception:
+                alive = ()
+            if not alive or len(alive) < 2:
+                self._fold_unfold(tag)
+        ins = self._idx_key(self.text.index("insert"))
+        for tag, s, e, head, _tail in self._fold_ranges():
+            if self._idx_key(s) <= ins < self._idx_key(e):
+                self._fold_unfold(tag)
+                continue
+            chip = self._fold_chips.get(tag)
+            if chip is not None:
+                try:
+                    if self.text.index(str(chip)) != self.text.index(
+                            self._fold_chip_expected(head)):
+                        self._fold_chip_destroy(tag)
+                        self._fold_chip_make(
+                            tag, head, max(1, int(e.split(".")[0]) - head - 1))
+                except Exception:
+                    pass
 
     # ---------- Ctrl+F 查找 / Ctrl+H 替换（只看当前打开的这篇） ----------
     # 与顶栏搜索是两件事：顶栏那个会**过滤左栏列表**、跨全部笔记搜；这个只在
@@ -1381,10 +2346,13 @@ class UIMixin(object):
             else:
                 b.pack(side=tk.LEFT)
             b.bind("<Button-1>", lambda e, f=fn: (f(), "break")[1])
+            # ⚠️ 悬停色必须运行时取 self.pal，不能用闭包里的建窗旧板 p：
+            # set_theme 会换掉整个 pal 对象，_restyle_find_bar 只重配静态色、
+            # 不重绑事件，若这里捕获 p，换肤后一悬停就闪回旧主题色。
             b.bind("<Enter>", lambda e, w=b: w.configure(
-                bg=_hover_bg(p["editor"]), fg=p["text"]))
+                bg=_hover_bg(self.pal["editor"]), fg=self.pal["text"]))
             b.bind("<Leave>", lambda e, w=b: w.configure(
-                bg=p["editor"], fg=p.get("soft", "#76767e")))
+                bg=self.pal["editor"], fg=self.pal.get("soft", "#76767e")))
             self._add_tip(b, tip)
             return b
 
@@ -1619,6 +2587,10 @@ class UIMixin(object):
         if not self._find_hits:
             return
         pos, end = self._find_hits[self._find_idx]
+        # 命中点落在折叠区里就先展开，别让用户「跳过去却什么都看不见」
+        ftag = self._fold_tag_at(pos)
+        if ftag:
+            self._fold_unfold(ftag)
         try:
             self.text.tag_remove(FIND_CUR_TAG, "1.0", tk.END)
             self.text.tag_add(FIND_CUR_TAG, pos, end)
@@ -2591,11 +3563,12 @@ class UIMixin(object):
         ("numbered", "有序列表（右键：转换 / 重新编号）",   2),
         ("todo",     "待办事项（右键：转换 / 清除）",       2),
         ("code",     "代码块（选择语言）",                  2),
-        ("alarm",    "任务提醒：在正文里插一个小闹钟",        2),
+        ("alarm",    "任务提醒：在正文里插一张提醒卡片",      2),
+        ("hr",       "插入分割线",                          2),
         # 第 15 枚（2026-11-09 用户指定）：自动换行是视图开关，不改正文，所以
         # 只读笔记里也照常可点；与 ⋯ 同组，中间不再插分隔线。
         ("wrap",     "自动换行：一行占满后自动折行",          3),
-        ("more",     "更多：导出笔记 / 插入分割线 / 全局设置", 3),
+        ("more",     "更多：导出笔记 / 全局设置",             3),
     ]
 
     # 颜色面板共用的预设色板（6 列 x 3 行）：深浅灰阶 + 常用强调色
@@ -2614,7 +3587,8 @@ class UIMixin(object):
         "link": "超链接",
         "bullet": "无序列表", "numbered": "有序列表",
         "triangle": "三角列表", "todo": "待办",
-        "code": "代码块", "alarm": "任务提醒", "wrap": "自动换行",
+        "code": "代码块", "alarm": "任务提醒", "hr": "插入分割线",
+        "wrap": "自动换行",
     }
 
     def _tool_cfg(self):
@@ -2755,6 +3729,8 @@ class UIMixin(object):
             b = self._mk_code_ui(parent)
         elif iid == "alarm":
             b = self._mk_icon(parent, "alarm", tip, self.insert_alarm)
+        elif iid == "hr":
+            b = self._mk_icon(parent, "hr", tip, self.insert_hr)
         elif iid == "wrap":
             on = self._editor_wrap_on()
             b = self._mk_icon(parent, "wrap", self._wrap_tip_text(on),
@@ -2856,11 +3832,15 @@ class UIMixin(object):
         ro = self.is_readonly()     # 只读笔记：会改内容的项置灰，界面类项照常可用
         m = PopupMenu(self.root, self.pal)
         # 涂鸦不改正文（笔迹在独立窗口里，关闭即丢），所以只读笔记也照常可用；
-        # 工具栏 14 项已经顶到 559/562px，第 15 枚一律收进 ⋯ 菜单。
+        # 分割线已移到工具栏常驻，⋯ 不再重复收它。
         m.add("涂鸦标注…（Esc 退出）" if not self.doodle_active() else "退出涂鸦标注",
               icon="pencil", command=self.toggle_doodle)
         m.add_separator()
-        m.add("插入分割线", icon="hr", enabled=not ro, command=self.insert_hr)
+        # 折叠入口已移到「选中行后右键」（工具栏不再常驻折叠按钮）；这里只留
+        # 展开，作为折叠后不选中任何行时也能一键铺开的兜底。展开是纯视图操作，
+        # 不改正文、不落库，只读笔记也照常可用。
+        if self._folds:
+            m.add("展开所有折叠", icon="chevron", command=self._fold_unfold_all)
         m.add("还原默认格式", icon="undo", enabled=not ro, command=self.reset_format)
         m.add_separator()
         # 导出不属于「改内容」，只读笔记照样能导
@@ -3021,6 +4001,8 @@ class UIMixin(object):
     def apply_palette(self, old_pal=None):
         """整窗重刷配色。`old_pal` 只在运行时换主题时给（启动时控件刚建好，无需翻译）。"""
         p = self.pal
+        # 折叠提示片是 Canvas 自绘（soft 色文字 + editor 底），换主题要跟着重画
+        self._fold_chips_repaint()
         # 纯色背景（已移除渐变）：根/顶栏/侧栏用浅色实底，列表与编辑区保持纯色确保文字可读
         self.root.configure(bg=p["top"])
         self.top.configure(bg=p["top"])
@@ -3048,6 +4030,8 @@ class UIMixin(object):
         self.search_ent.configure(bg=p["editor"], fg=p["text"],
                                   insertbackground=p["accent"])
         self._style_search_box()
+        # 左下角回收站入口（选中态 / 徽章 / 自绘垃圾桶图标跟着换肤）
+        self._restyle_recycle_bar()
         # 顶栏应用名与图标（含两条竖分割线：应用名右侧、「关于」与「新建」之间；
         # 都是同一个 _top_rule_color()，与顶栏那条横线同色）
         self.brand.configure(bg=p["top"], fg=p["text"])
@@ -3294,9 +4278,13 @@ class UIMixin(object):
                 cache = (key, max(8, int(bs * 1.33)))
             self._char_w_cache = cache
         _char_w = cache[1]
+        # 正文 Tab = 2 个汉字宽。Tk 的 tabs 只给一个位置时，后面按同一间隔循环，
+        # 制表位就落在第 2、4、6… 个汉字列上（标准 Tab 停位语义，不是每次固定跳 2 字）。
+        # 汇总表行有 tag 级 tabs 覆盖，不会被这里带着走；字号 / 字体变了这里也重算。
+        self.text.configure(tabs=(EDITOR_TAB_HANZI * _char_w,))
         # 「任务提醒列表」汇总表：五列靠 **tag 级制表位** 按像素对齐。
-        # 只作用于带 ALARM_ROW_TAG 的行 —— 普通笔记里的制表符仍是默认制表位，
-        # 也不用切笔记时还原 widget 级配置；字号 / 字体一变本函数会重算一遍。
+        # 只作用于带 ALARM_ROW_TAG 的行 —— 普通笔记走上面的 widget 级制表位，
+        # 两者互不影响；字号 / 字体一变本函数会重算一遍。
         # ⚠️ 别退回「按字数补空格」：正文字体中文 15px / 半角空格 8px（1.875 倍，
         # 不是 2），每行会按汉字数累积误差，任务名一长后面三列肉眼就歪。
         try:
@@ -3314,7 +4302,17 @@ class UIMixin(object):
                 _tabs.append(_x)
             self.text.tag_configure(ALARM_ROW_TAG, tabs=tuple(_tabs))
         except Exception:
-            pass                            # 量不到字体就留默认制表位，别让启动白屏
+            pass                            # 量不到字体就不配 tag 级制表位，别让启动白屏
+        # 汇总表状态列：四态各一色，与正文卡片同一套语言（star / soft / green）。
+        # 只配 foreground、不配 tabs —— 制表位由 ALARM_ROW_TAG 提供，两个 tag 叠加
+        # 在同一段字符上，Tk 会各取所需。
+        import alarm as _alarm
+        for _st, _key in ((_alarm.STATE_PENDING, "star"),
+                          (_alarm.STATE_EXPIRED, "soft"),
+                          (_alarm.STATE_ACKED, "green"),
+                          (_alarm.STATE_MARK, "soft")):
+            self.text.tag_configure(ALARM_STATE_TAG_PREFIX + _st,
+                                    foreground=p.get(_key, "#76767e"))
         _qind = _char_w * 2
         self.text.tag_configure("quote", lmargin1=_qind, lmargin2=_qind,
                                 rmargin=_char_w,
@@ -3338,6 +4336,9 @@ class UIMixin(object):
                                 foreground=_sel_fg(p))
         # 加密笔记未解锁时正文区的占位说明：用最淡的字色，一眼就知道它不是正文
         self.text.tag_configure("locked_ph", foreground=p["soft"])
+        # 远程图还在下载时的占位文字：淡字 + 斜体，和正文区分开（下载完就被替换掉）
+        self.text.tag_configure(self.IMG_LOADING_TAG, foreground=p["soft"],
+                                font=(fam, bs, "italic"))
         # 动态样式：用户自选的文字颜色 / 字体（家族+字号），存入 data["styles"] 以便重开还原
         self.data.setdefault("styles", {})
         for name, spec in self.data["styles"].items():
@@ -3412,7 +4413,7 @@ class UIMixin(object):
 
         标签字号改了，已存在于文本里的这些标签会自动跟着变（Tk tag_configure 即时生效）。
         """
-        self.body_size = min(25, max(8, int(size)))
+        self.body_size = min(BODY_SIZE_MAX, max(BODY_SIZE_MIN, int(size)))
         self.text.configure(font=(getattr(self, "ui_font", None) or FONT[0], self.body_size))
         self._config_tags()
         # 字号一换，一个空格多少像素就变了 —— 光标条给虚拟列估位置用的正是它
@@ -3421,6 +4422,11 @@ class UIMixin(object):
         for blk in self._codes:
             try:
                 blk.apply_size(max(9, self.body_size - 1))
+            except Exception:
+                pass
+        for card in (getattr(self, "_alarm_cards", None) or {}).values():
+            try:
+                card.refresh()
             except Exception:
                 pass
         # 字号变了 → 正文高度变了，浮动导航的显隐/可用端跟着重算
@@ -3441,6 +4447,11 @@ class UIMixin(object):
         和滚动位置全留在原地，不 destroy 再 create —— 那一下就是用户看到的「闪」。
         """
         state = _state or {}
+        # 「取消」要能回滚主题 / 字体：这两项是点选当下就落库的（见 on_theme /
+        # on_family），不像字号 / 勾选那样等「确定」。进窗先记下原值，cancel 时
+        # 若被改过就恢复回去并重新落库，否则「取消」对这两项形同虚设。
+        _orig_theme = self._current_theme()
+        _orig_font = self.ui_font
         # 本窗当前配色。刻意**拷贝**而不是引用 self.pal：set_theme 会把 app 的 pal
         # 整个换掉，而窗内控件 / 闭包都按 p 取值；换肤时把 p 原地更新，重画图标等
         # 闭包就自动拿到最新的一套，不需要重建窗口。
@@ -3498,10 +4509,17 @@ class UIMixin(object):
         fam_row.pack(anchor="w", padx=dpi.px(20), pady=(dpi.px(8), 0))
         tk.Label(fam_row, text="正文字体", bg=p["editor"], fg=p["text"],
                  font=(FONT[0], 12)).pack(side=tk.LEFT, padx=(0, dpi.px(10)))
-        fam_cb = ttk.Combobox(fam_row, width=16, state="readonly", height=8)
-        fam_cb["values"] = [f[0] for f in self.FONT_FAMILIES]
-        fam_cb.set(next((lb for lb, fam in self.FONT_FAMILIES
-                         if (fam or "") == (self.ui_font or "")), "默认"))
+        # 主题化自绘下拉框：跟预览盒 / 色卡 / 圆角按钮同一套视觉语言，换肤时
+        # 颜色跟着走（原生 ttk.Combobox 走系统主题，深色主题下是突兀的一块白）。
+        # 每项用它自己的字体渲染 —— 字体选择器所见即所得。
+        fam_items = list(self.FONT_FAMILIES)          # [(显示名, 字体族或 None)]
+        fam_cb = ThemedComboBox(
+            fam_row, p, [lb for lb, _fam in fam_items],
+            current=next((lb for lb, fam in fam_items
+                          if (fam or "") == (self.ui_font or "")), "默认"),
+            font_map={lb: fam for lb, fam in fam_items},
+            width=dpi.px(150),               # 固定 150 宽：切换字体项时框不跳宽
+            command=lambda _lb: on_family())
         fam_cb.pack(side=tk.LEFT)
 
         def on_family(_e=None):
@@ -3514,8 +4532,6 @@ class UIMixin(object):
             preview()
             save_data(self.data)
 
-        fam_cb.bind("<<ComboboxSelected>>", on_family)
-
         tk.Label(body, text="正文大小（只改正文；H1 / H2 按比例跟随，正文 12 号时是 16 / 14）",
                  bg=p["editor"], fg=p["soft"], font=(FONT[0], 11)).pack(anchor="w", padx=dpi.px(20),
                                                                     pady=(dpi.px(10), 0))
@@ -3524,9 +4540,10 @@ class UIMixin(object):
         # 宽高按最大字号 25pt 一次性算好并锁死 —— 文字单行、盒高固定，拖动滑杆时
         # 对话框不会跟着变宽变高（不抖动）。
         import tkinter.font as _tf
-        _h1_max = _tf.Font(family=FONT[0], size=self._heading_size(25, self.H1_SCALE),
+        _h1_max = _tf.Font(family=FONT[0],
+                           size=self._heading_size(BODY_SIZE_MAX, self.H1_SCALE),
                            weight="bold")
-        _body_max = _tf.Font(family=FONT[0], size=25)
+        _body_max = _tf.Font(family=FONT[0], size=BODY_SIZE_MAX)
         _h1_text = "一级标题 H1"
         _sample_text = "正文预览：笔记内容 Abc"
         box = tk.Frame(body, bg=p["hover"], bd=dpi.px(1), relief=tk.SOLID,
@@ -3561,7 +4578,8 @@ class UIMixin(object):
         # 字号滑杆：8–25pt 连续步进，拖动时气泡显示当前值
         # 画布本身固定 340 宽，靠 anchor="center" 整体水平居中（轨道、滑钮、
         # 右上角 pt 数值、两端 8/25 标签都跟着居中，不再缩在左侧）
-        slider = FontSizeSlider(body, p, cur, minimum=8, maximum=25,
+        slider = FontSizeSlider(body, p, cur, minimum=BODY_SIZE_MIN,
+                                maximum=BODY_SIZE_MAX,
                                 command=preview, width=dpi.px(340))
         slider.pack(anchor="center", pady=(dpi.px(12), dpi.px(2)))
 
@@ -3759,13 +4777,19 @@ class UIMixin(object):
         for i, (tid, _lb) in enumerate(theme_items):
             cv = tk.Canvas(theme_grid, width=CELL_W, height=CELL_H,
                            bg=p["editor"], bd=0, highlightthickness=0,
-                           takefocus=0, cursor="hand2")
+                           takefocus=1, cursor="hand2")
             cv.grid(row=i // THEME_COLS, column=i % THEME_COLS,
                     padx=dpi.px(3), pady=dpi.px(2))
             cv._theme_tid = tid          # 回归测试按这个标记找色卡，别按尺寸猜
             cv.bind("<Button-1>", lambda _e, t=tid: on_theme(t))
             cv.bind("<Enter>", lambda _e, t=tid: on_theme_hover(t))
             cv.bind("<Leave>", lambda _e: on_theme_hover(None))
+            # 键盘可达：同窗复选框 / 滑杆都能 Tab 聚焦操作，色卡此前只能鼠标点。
+            # 焦点进出复用 hover 高亮当视觉反馈，Return / Space 切换主题。
+            cv.bind("<FocusIn>", lambda _e, t=tid: on_theme_hover(t))
+            cv.bind("<FocusOut>", lambda _e: on_theme_hover(None))
+            for key in ("<Return>", "<space>"):
+                cv.bind(key, lambda _e, t=tid: (on_theme(t), "break")[1])
             theme_cards.append((tid, cv))
         draw_theme_cards()
 
@@ -3816,7 +4840,7 @@ class UIMixin(object):
         j = 0
         for iid, label, _g in self.TOOL_ITEMS:
             if iid == "more":
-                # ⋯ 不可隐藏：菜单里还有折叠工具栏、插入分割线这些不进勾选表的东西，
+                # ⋯ 不可隐藏：菜单里还有折叠工具栏这些不进勾选表的东西，
                 # 一旦藏掉它们就再没入口（原来那个独立小窗也同理跳过它）。
                 continue
             name = self.TOOL_SHORT_NAMES.get(iid) or label.split("：")[0]
@@ -3833,6 +4857,126 @@ class UIMixin(object):
                                row=j // 3, column=j % 3, sticky="w",
                                padx=(dpi.px(4), 0), pady=dpi.px(1))
             j += 1
+
+        # ---- 图片与图床：PicList 路径。留空 = 图片存本地 data/media/ ----
+        # 这是**本机**配置（exe 路径换台机器就失效），存 settings["piclist_exe"]，
+        # 属 STATE_KEYS：不进备份。配了它，插图成功后会自动上传图床并删本地文件。
+        tk.Frame(body, height=dpi.px(1), bg=p["line"]).pack(
+            fill=tk.X, padx=dpi.px(20), pady=(dpi.px(12), 0))
+        img_head = tk.Frame(body, bg=p["editor"])
+        img_head.pack(fill=tk.X, padx=dpi.px(20), pady=(dpi.px(8), 0))
+        sec_icon(img_head, "image").pack(side=tk.LEFT, padx=(0, dpi.px(6)),
+                                         pady=(dpi.px(1), 0))
+        tk.Label(img_head, text="图片与图床", bg=p["editor"], fg=p["text"],
+                 font=(FONT[0], 12, "bold")).pack(side=tk.LEFT)
+        # 当前状态徽标：跟着 PicList 路径有没有填切换（B 版「状态徽标 + 分行说明」）
+        pic_state_var = tk.StringVar()
+        # 浅绿底是派生色，repaint_widget_colors 认不出来，换肤时得在
+        # repaint_settings 里单独按新板重算（见下方 pic_badge.configure）。
+        pic_badge = tk.Label(img_head, textvariable=pic_state_var,
+                             bg=_mix_hex(p["editor"], p["accent"], 0.12),
+                             fg=p["accent"], font=(FONT[0], 10),
+                             padx=dpi.px(8), pady=dpi.px(1))
+        pic_badge.pack(side=tk.RIGHT)
+        # 说明拆两段：第一段讲留空行为，第二段把「删除本地副本」这个副作用用
+        # 一条 accent 竖线单独拎出来 —— 原版把它埋在长句尾巴里，最容易踩。
+        tk.Label(body, text="留空 PicList路径：图片保存在 data/media/，不联网。",
+                 bg=p["editor"], fg=p["soft"], font=(FONT[0], 11), justify="left",
+                 wraplength=_panel_width(dlg) - 44).pack(
+                     anchor="w", padx=dpi.px(20), pady=(dpi.px(4), 0))
+        warn_row = tk.Frame(body, bg=p["editor"])
+        warn_row.pack(fill=tk.X, padx=dpi.px(20), pady=(dpi.px(2), 0))
+        tk.Frame(warn_row, width=dpi.px(2), bg=p["accent"]).pack(
+            side=tk.LEFT, fill=tk.Y, padx=(0, dpi.px(8)))
+        tk.Label(warn_row, text="填好路径：插图后自动上传图床，上传成功会删除本地副本。",
+                 bg=p["editor"], fg=p["text"], font=(FONT[0], 11), justify="left",
+                 wraplength=_panel_width(dlg) - 60).pack(side=tk.LEFT, anchor="w")
+
+        pic_var = tk.StringVar(value=str(
+            (self.data.get("settings") or {}).get("piclist_exe") or ""))
+        pic_row = tk.Frame(body, bg=p["editor"])
+        pic_row.pack(fill=tk.X, padx=dpi.px(20), pady=(dpi.px(6), 0))
+        tk.Label(pic_row, text="PicList路径", bg=p["editor"], fg=p["text"],
+                 font=(FONT[0], 11)).pack(side=tk.LEFT, padx=(0, dpi.px(8)))
+        # ⚠️ 边框必须走 highlight 画在**控件外围**，不能用 bd=1 + SOLID：
+        # SOLID 的边框画在控件内侧，下面那张占位 Label 的白底盖上去就会把
+        # 下边框/左边框吃掉一截（实测 x=112..237 整段下边框消失，看着像框只
+        # 画了一半）。项目里其余 Entry 一律是 FLAT + highlight，保持一致；
+        # 子 Label 再大也盖不到外围的 highlight。highlightbackground 归通用
+        # 换肤的 DIALOG_COLOR_OPTS 管，切主题会跟着刷。
+        pic_entry = tk.Entry(pic_row, textvariable=pic_var, bg=p["editor"],
+                             fg=p["text"], bd=0, relief=tk.FLAT,
+                             highlightthickness=dpi.px(1),
+                             highlightbackground=p["line"],
+                             highlightcolor=p["accent"],
+                             font=(FONT[0], 10), insertbackground=p["accent"])
+        pic_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=dpi.px(3))
+        # Entry 没有 placeholder；子 Label 是项目里的既有做法（见查找框）。
+        # 往 textvariable 塞假文字会污染真正的配置值，绝对不能那么干。
+        pic_ph = tk.Label(pic_entry, text="留空即使用本机保存", bg=p["editor"],
+                          fg=p["soft"], bd=0, font=(FONT[0], 10), cursor="xterm")
+        # ⚠️ 别把占位文字往左塞：Entry 的光标就停在最左边那一格，压上去会
+        # 变成「文字被一根竖线穿过」。让占位文字从光标右侧起，视觉上不打架。
+        pic_ph._ph_offset = dpi.px(6)
+        pic_ph.bind("<Button-1>", lambda ev: (pic_entry.focus_set(), "break")[1])
+
+        def _sync_pic(*_a):
+            raw = pic_var.get()
+            if raw:
+                pic_ph.place_forget()
+            else:
+                pic_ph.place(x=pic_ph._ph_offset, rely=0.5, anchor="w")
+            pic_state_var.set("当前：图床上传" if raw.strip() else "当前：本机保存")
+
+        pic_var.trace_add("write", _sync_pic)
+        _sync_pic()
+        # 底部备注：讲清本机配置的边界，别让人以为换台机器也跟着走。
+        # 字号跟上面两条说明统一用 11（原来是 10，明显小一号）。
+        tk.Label(body, text="路径只在本机生效，不随备份带走",
+                 bg=p["editor"], fg=p["soft"], font=(FONT[0], 11)).pack(
+                     anchor="w", padx=dpi.px(20), pady=(dpi.px(4), 0))
+
+        def pick_exe():
+            pth = filedialog.askopenfilename(
+                parent=dlg, title="选择 PicList",
+                filetypes=[("PicList", "PicList.exe"), ("可执行文件", "*.exe")])
+            if pth:
+                pic_var.set(pth)
+
+        def test_pic():
+            s = {"piclist_exe": pic_var.get()}
+            if not piclist.configured(s):
+                self._show_error("测试上传", "请先选择 PicList 路径。")
+                return
+            test_btn.set_enabled(False)
+
+            def work():
+                try:
+                    return (True, piclist.test_upload(s))
+                except Exception as e:
+                    return (False, str(e))
+
+            def done(res):
+                test_btn.set_enabled(True)
+                if res[0]:
+                    self._show_info("测试上传", "上传成功：\n%s" % res[1])
+                else:
+                    self._show_error("测试上传", "上传失败：\n%s" % res[1])
+
+            self._img_async(work, done)
+
+        # 「浏览」按钮接上 pick_exe：原来那函数定义了却没入口，用户只能手输 exe 路径
+        browse_btn = RoundButton(pic_row, p, "浏览", command=pick_exe,
+                                 base=p["editor"], fg=p["soft"], outline=p["line"],
+                                 padx=dpi.px(10), pady=dpi.px(4))
+        browse_btn.pack(side=tk.LEFT, padx=(dpi.px(8), 0))
+        browse_btn.bind_events()
+        test_btn = RoundButton(pic_row, p, "测试上传", command=test_pic,
+                               base=p["editor"], fg=p["soft"], outline=p["line"],
+                               padx=dpi.px(10), pady=dpi.px(4))
+        test_btn.pack(side=tk.LEFT, padx=(dpi.px(8), 0))
+        test_btn.bind_events()
+        section_icons  # 换肤重画会遍历它（这张节图标也已登记）
 
         # ---- 标签页：工具带下面那条标签条要不要出现 ----
         # 与「工具栏按钮定制」同属界面开关，所以并排放在同一张窗里；用分割线 + 小节标题
@@ -3897,9 +5041,11 @@ class UIMixin(object):
             # 1) 普通 tk 控件：逐颜色 option 翻译旧板色 → 新板色
             #    （ttk 下拉框、系统默认色、派生色认不出来，自动跳过）
             repaint_widget_colors(dlg, old, new, SETTINGS_PAL_KEYS)
-            # 2) 可滚区：外框 / 画布 / 内框 / 右侧细滚动条四层，yview 原样保留
+            # 2) 主题化字体下拉框：自绘 Canvas 不走颜色 option，单独按新板重画
+            fam_cb.apply_theme(new)
+            # 3) 可滚区：外框 / 画布 / 内框 / 右侧细滚动条四层，yview 原样保留
             scroller.apply_theme(new, bg=new["editor"])
-            # 3) Canvas 自绘：四枚小节图标、字号滑杆、四枚圆角按钮、六张主题色卡
+            # 4) Canvas 自绘：四枚小节图标、字号滑杆、四枚圆角按钮、六张主题色卡
             for cv in section_icons:
                 kind, n = cv._sec_icon
                 cv.delete("all")
@@ -3912,7 +5058,10 @@ class UIMixin(object):
             # 调到这里重刷，选中标记也不会停在旧主题上。
             theme_selected[0] = self._current_theme()
             draw_theme_cards()
-            for btn in (b_none, b_all, b_ok, b_cancel):
+            # 状态徽标的浅绿底是 _mix_hex 派生色，通用重刷认不出来，单独按新板重算
+            pic_badge.configure(bg=_mix_hex(new["editor"], new["accent"], 0.12),
+                                fg=new["accent"])
+            for btn in (b_none, b_all, b_ok, b_cancel, browse_btn, test_btn):
                 # old_pal 只影响显式传过 fg / outline 的那几枚：那两个值是写死在
                 # 实例上的旧板色，不在 tk option 里，得单独翻译。
                 btn.apply_theme(new, base=new["editor"], old_pal=old)
@@ -3922,6 +5071,8 @@ class UIMixin(object):
             # 开关先落库，再让 _save_body_size 一次写盘（两处都 save 会多写一遍）
             mt_new = snap["multi_tab"]
             self.data.setdefault("settings", {})["multi_tab"] = mt_new
+            # PicList 路径即时生效：是本机配置，不进备份（STATE 语义）
+            self.data["settings"]["piclist_exe"] = pic_var.get().strip()
             self._save_body_size(snap["size"])
             # 点确定就生效：开着就现造标签条、关掉就拆掉，不必重启
             self._apply_multi_tab(mt_new)
@@ -3939,6 +5090,21 @@ class UIMixin(object):
             dlg.destroy()
 
         def cancel(_=None):
+            # 主题 / 字体是点选即落库的，取消必须把它们也还原，否则用户点了
+            # 「取消」还留着半路改掉的皮肤和字体，跟同窗其它项的语义相矛盾。
+            changed = False
+            if self._current_theme() != _orig_theme:
+                # set_theme 内部会 save_data + 刷主窗，回滚走同一条正规路径
+                self.set_theme(_orig_theme)
+                changed = True
+            if (self.ui_font or "") != (_orig_font or ""):
+                self.ui_font = _orig_font
+                self.data.setdefault("settings", {})["font_family"] = _orig_font
+                self._config_tags()
+                self.text.configure(font=(_orig_font or FONT[0], self.body_size))
+                changed = True
+            if changed:
+                save_data(self.data)
             dlg.destroy()
 
 
@@ -4723,12 +5889,13 @@ class UIMixin(object):
                  bg=p["top"], fg=p["soft"], font=(FONT[0], 11)).pack(
                      anchor="w", padx=dpi.px(18), pady=(dpi.px(6), dpi.px(2)))
         # 两种方式的差别必须写清：覆盖会连外观一起换回备份的样子，合并只动内容。
-        # 两行各自成句（wraplength 430 大于最长那行的 408px），断行位置由文案决定，
-        # 不靠窗口宽度去折 —— 否则换个字体就折成三行、跟上面的信息行错位。
+        # 两行各自成句（wraplength 500 大于 11 号字下最长那行的 469px），断行位置
+        # 由文案决定，不靠窗口宽度去折 —— 否则换个字体就折成三行、跟上面的信息行
+        # 错位。字号与上面两条说明统一为 11（原来是 10，明显小一号）。
         tk.Label(win, text="覆盖 = 用备份完全替换现有数据，外观设置也按备份恢复；\n"
                            "合并 = 保留现有内容，只追加本机没有的笔记，内容相同的自动跳过。",
-                 bg=p["top"], fg=p["soft"], font=(FONT[0], 10), justify="left",
-                 wraplength=dpi.px(430)).pack(anchor="w", padx=dpi.px(18))
+                 bg=p["top"], fg=p["soft"], font=(FONT[0], 11), justify="left",
+                 wraplength=dpi.px(500)).pack(anchor="w", padx=dpi.px(18))
 
         def choose(v):
             res["v"] = v
@@ -4770,7 +5937,13 @@ class UIMixin(object):
         self._note_sel = set()
         self._note_anchor = None
         try:
-            self.search_var.set("")
+            # 静默清（同 recycle_open）：紧接着的 refresh_all 会整列重建，
+            # 再让 trace 刷一遍等于白重建一次。
+            self._search_quiet = True
+            try:
+                self.search_var.set("")
+            finally:
+                self._search_quiet = False
         except Exception:
             pass
         self.body_size = self._read_body_size()
@@ -4890,6 +6063,114 @@ class UIMixin(object):
         s.pack(side=tk.LEFT, padx=dpi.px(5), pady=dpi.px(8))
         self._tool_seps.append(s)
 
+    # ---------- 左下角回收站入口 ----------
+    def _build_recycle_bar(self):
+        """左下角回收站入口：**独立工具槽**样式，刻意区别于上方的文件夹行。
+
+        文件夹行＝「融进侧栏的圆角卡片 + 绿色选中高亮」；回收站＝「带 1px 描边的
+        独立灰片 + 顶部分隔线 + 墨色垃圾桶」。一眼看出这是功能区、不是文件夹。
+        换肤走 _restyle_recycle_bar 就地重刷，不重建控件。
+        """
+        p = self.pal
+        bar = self.recycle_bar
+        ink = _ink_target(p["side"])
+        # 顶部细分隔线：把回收站从文件夹列里隔出来。1px 线不取 pal["line"]
+        # （红线），从底色推；padx 留白让它像一条短线、不是通栏。
+        sep = tk.Frame(bar, height=dpi.px(1),
+                       bg=_mix_hex(p["side"], ink, 0.18))
+        sep.pack(side=tk.TOP, fill=tk.X, padx=dpi.px(4), pady=(0, dpi.px(6)))
+        # 常态底色：略深于侧栏的中性灰片，配描边 → 像一枚独立按钮，而不是
+        # 文件夹那种「无描边、融进侧栏」的一行。
+        base = _mix_hex(p["side"], ink, 0.06)
+        row = tk.Frame(bar, bg=base, cursor="hand2")
+        row.pack(fill=tk.X)
+        row._card_outside = p["side"]
+        row._card = self._card_layer(row, base, p["side"], border_ink=ink)
+        row._base_bg = base
+        icon = tk.Canvas(row, width=FOLDER_ICON_W, height=FOLDER_ICON_H,
+                         bg=base, bd=0, highlightthickness=0)
+        icon.pack(side=tk.LEFT, padx=(dpi.px(5), dpi.px(5)), pady=dpi.px(5))
+        icon.refresh_bg = lambda cv=icon: self._draw_folder_icon(cv, RECYCLE_FOLDER)
+        lbl = tk.Label(row, text="回收站", bg=base, fg=p["soft"],
+                       font=(FONT[0], 12, "normal"), anchor="w")
+        lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        badge = CountBadge(row, 0, bg=base, fg=p["text"], ink=p["text"],
+                           font=self._measure_font(FONT[0], 10))
+        badge.pack(side=tk.RIGHT, padx=(dpi.px(6), dpi.px(8)))
+        self._recycle_parts = {"sep": sep, "row": row, "icon": icon,
+                               "lbl": lbl, "badge": badge}
+        self._draw_folder_icon(icon, RECYCLE_FOLDER)
+        for w in (bar, row, icon, lbl, badge):
+            w.bind("<Button-1>", lambda e: self.recycle_open())
+            w.bind("<Button-3>", self._recycle_popup)
+        # 悬停：跟文件夹行一样给反馈（只整片底暗一档，不弹气泡、不抢焦点）
+        for w in (row, icon, lbl, badge):
+            w.bind("<Enter>", lambda e: self._recycle_hover(True))
+            w.bind("<Leave>", lambda e: self._recycle_hover(False))
+
+    def _recycle_hover(self, on):
+        """回收站卡片悬停：整片底暗一档；选中态不动，免得看着像被切走。"""
+        parts = getattr(self, "_recycle_parts", None)
+        if not parts or not parts["row"].winfo_exists():
+            return
+        ink = _ink_target(self.pal["side"])
+        base = parts["row"]._base_bg
+        if getattr(parts["row"], "_recycle_active", False):
+            bg = base                      # 选中态不再压暗，免得看着像被切走
+        else:
+            bg = _mix_hex(base, ink, 0.07) if on else base
+        self._row_hover(parts["row"], bg, fb=self.pal["side"])
+
+    def _restyle_recycle_bar(self):
+        """换主题 / 切换视图 / 条数变化时就地刷新，不重建控件。"""
+        parts = getattr(self, "_recycle_parts", None)
+        if not parts or not parts["row"].winfo_exists():
+            return
+        p = self.pal
+        active = self.data.get("current_folder") == RECYCLE_FOLDER
+        ink = _ink_target(p["side"])
+        # 选中态不用文件夹的 sel（绿色高亮）：改成「更沉一档的中性灰片 + 描边 +
+        # 墨绿 bold 字」。两档灰的差要够大（0.06 → 0.14），否则选中/常态几乎一样、
+        # 只剩文字在变，反馈太弱（实测 0.06 vs sel2 看不出差别）。
+        base = _mix_hex(p["side"], ink, 0.14 if active else 0.06)
+        try:
+            cnt = store().recycle_count()
+        except Exception:
+            cnt = 0
+        self.recycle_bar.configure(bg=p["side"])
+        parts["sep"].configure(bg=_mix_hex(p["side"], ink, 0.18))
+        parts["row"].configure(bg=base)
+        # ⚠️ 卡片画布的「外侧底色」必须显式跟着换：文件夹行换肤时会整列重建、
+        # Canvas 用新 pal 建出来，而回收站是就地刷新（不重建）——漏了这一句，
+        # 深色主题下圆角外侧会留着旧主题的浅绿楔形（实测 #e8f0e9 亮块）。
+        parts["row"]._card.configure(bg=p["side"])
+        parts["row"]._base_bg = base
+        parts["row"]._recycle_active = active
+        self._paint_card(parts["row"], base)
+        parts["icon"].configure(bg=base)
+        parts["lbl"].configure(bg=base, fg=(p["selfg"] if active else p["soft"]),
+                               font=(FONT[0], 12, "bold" if active else "normal"))
+        parts["badge"].configure(bg=base)
+        parts["badge"].set_style(p["selfg"] if active else p["text"])
+        parts["badge"].set_count(cnt)
+        parts["badge"].refresh_bg()
+        self._draw_folder_icon(parts["icon"], RECYCLE_FOLDER)
+
+    def _recycle_popup(self, event):
+        """回收站行右键：打开 / 还原全部 / 清空。"""
+        cnt = store().recycle_count()
+        m = PopupMenu(self.root, self.pal)
+        m.add("打开回收站", icon="folder", command=self.recycle_open)
+        m.add("还原全部" if cnt else "还原全部（回收站为空）",
+              icon="move", enabled=bool(cnt),
+              command=lambda: self.recycle_restore(restore_all=True))
+        m.add_separator()
+        m.add("清空回收站%s" % ("" if cnt else "（回收站为空）"),
+              icon="trash", danger=True, enabled=bool(cnt),
+              command=self.recycle_clear)
+        m.popup(event.x_root, event.y_root)
+        return "break"
+
     def refresh_folders(self, keep_scroll=False):
         """重建左栏整列。
 
@@ -4906,30 +6187,42 @@ class UIMixin(object):
                 keep_off = self.folder_panel.canvas.canvasy(0)
             except Exception:
                 keep_off = None
-        for w in list(self.folder_panel.inner.children.values()):
-            w.destroy()
-        self._stop_all_marquee()     # 行即将销毁，先停掉跑马灯计时器
-        self._folder_rows = {}
-        self._folder_count_labels = {}
-        self._folder_name_labels = {}
-        self._folder_icons = {}
-        self._folder_twisty = {}
-        self._fold_header = None     # 「文件夹」标题 Frame：整列重建后换新（见 _reorder_...）
-        # 分两组：智能分类（按条件筛的视图）在上，真实文件夹在下。
-        # 分组只靠 smart 标记分，不依赖 data["folders"] 里的先后 —— 导入来的数据
-        # 顺序可能很乱，但 smart 标记是_ensure_smart_folders 保证过的。
-        smart = [f for f in self.data["folders"] if f.get("smart")]
-        real = [f for f in self.data["folders"] if not f.get("smart")]
-        self._make_group_label("智能分类", top=0)
-        for f in smart:
-            self._make_folder_row(f)
-        self._make_group_label("文件夹", top=dpi.px(12), fold_tools=True)
-        # 真实文件夹按 **树** 渲染（缩进 + 展开三角）。data["folders"] 仍是平铺的
-        # 一维表，父子关系只由 f["parent"] 决定，顺序 = 数组里的先后。
-        self._render_folder_tree(real)
-        # 显式刷新滚动区，确保文件夹过多时滚动条启用、可拖（多重延迟兜底窗口时序）
-        self.folder_panel.inner.update_idletasks()
-        self.folder_panel._update()
+        # ⚠️ 「销毁全部行 → 重建」必须冻着重绘一次走完，与 refresh_notes 同一套：
+        # 行一销毁父窗口立刻就要重画曝光区，而新行要等下一次布局 —— 中间那一帧
+        # 左栏是**空的**。删文件夹（连同里面的笔记一起删）、导入后重建都会白闪。
+        with frozen_paint(self.root):
+            for w in list(self.folder_panel.inner.children.values()):
+                w.destroy()
+            self._stop_all_marquee()     # 行即将销毁，先停掉跑马灯计时器
+            self._folder_rows = {}
+            self._folder_count_labels = {}
+            self._folder_name_labels = {}
+            self._folder_icons = {}
+            self._folder_twisty = {}
+            self._fold_header = None     # 「文件夹」标题 Frame：整列重建后换新（见 _reorder_...）
+            # 分两组：智能分类（按条件筛的视图）在上，真实文件夹在下。
+            # 分组只靠 smart 标记分，不依赖 data["folders"] 里的先后 —— 导入来的数据
+            # 顺序可能很乱，但 smart 标记是_ensure_smart_folders 保证过的。
+            smart = [f for f in self.data["folders"] if f.get("smart")]
+            real = [f for f in self.data["folders"] if not f.get("smart")]
+            self._make_group_label("智能分类", top=0)
+            for f in smart:
+                self._make_folder_row(f)
+            self._make_group_label("文件夹", top=dpi.px(12), fold_tools=True)
+            # 真实文件夹按 **树** 渲染（缩进 + 展开三角）。data["folders"] 仍是平铺的
+            # 一维表，父子关系只由 f["parent"] 决定，顺序 = 数组里的先后。
+            self._render_folder_tree(real)
+            # 显式刷新滚动区，确保文件夹过多时滚动条启用、可拖（多重延迟兜底窗口时序）
+            self.folder_panel.inner.update_idletasks()
+            self.folder_panel._update()
+            if keep_off is not None:
+                self._restore_folder_scroll(keep_off)
+        # 解冻后强制整幅重画：冻结期间 inner 的 Configure 已把新滚动区写进画布，
+        # 再 _update() 是「设同一个值」，Tk 不重画 → 屏幕上留着旧像素（残影）。
+        self.folder_panel.repaint()
+        # repaint 会把滚动区撑高 1px 再设回，滚动比例跟着漂一点：按像素再放一次
+        if keep_off is not None:
+            self._restore_folder_scroll(keep_off)
         # 延后的两次 _update 会按最终行高再算一次滚动区：跟着再放一次偏移，
         # 否则「先按错的高度算 → 再算对」这两步之间滚动位置会漂一次
         def _upd():
@@ -4937,10 +6230,10 @@ class UIMixin(object):
             if keep_off is not None:
                 self._restore_folder_scroll(keep_off)
 
-        if keep_off is not None:
-            self._restore_folder_scroll(keep_off)
-        self.folder_panel.canvas.after(30, _upd)
-        self.folder_panel.canvas.after(120, _upd)
+        # 用 self._after 登记（不是 canvas.after）：关窗后 _alive=False 会拦住回调，
+        # 不会去碰已销毁的面板；canvas.after 无此保护，30~120ms 内关窗会抛 TclError。
+        self._after(30, _upd)
+        self._after(120, _upd)
         # 行被重建后需重新绑定滚轮（否则指针停在行/图标上滚不动）
         self.folder_panel.bind_wheel()
         # 行重建 = 新控件：指针若正停在某个名字上，收不到 Enter，这里补一次
@@ -4993,18 +6286,53 @@ class UIMixin(object):
         """就地刷新左栏每个文件夹的条数。
 
         新建/删除/移动笔记时调用：文件夹行不重建（避免闪烁），只改计数徽章。
+
+        ⚠️ 别对每个文件夹各调一次 `folder_notes`：后者每次都 subtree_ids + 遍历
+        全库 notes，F 个文件夹 × N 条笔记是 O(F×N)，而这个函数被新建/删除/移动/
+        星标等七八处调用。改为**一次遍历全库按 folder 分桶**，再把子节点计数累加
+        到父节点（父级要含子孙，见 folder_subtree），复杂度降到 O(F+N)。
+        智能分类 / 回收站是固定几枚、筛选口径特殊，单独按原逻辑算。
         """
+        # 1) 一次遍历：每个直接 folder 的笔记数
+        direct = {}
+        for n in (self.data.get("notes") or []):
+            fid = n.get("folder")
+            if isinstance(fid, str):
+                direct[fid] = direct.get(fid, 0) + 1
+
+        # 2) 普通文件夹的「含子孙」计数：自底向上把子节点累加到父节点。
+        #     folders 是 [{id,parent}]，可能有更深层级；按 parent 链累加。
+        total = dict(direct)
+        folders = self.data.get("folders") or []
+        by_id = {f.get("id"): f for f in folders if isinstance(f, dict)}
+        # 迭代累加：每条笔记归属的 leaf folder，沿 parent 链给每个祖先 +1
+        # （一次性分摊；比对每个祖先重扫全库省得多）
+        for fid, cnt in direct.items():
+            seen = set()
+            cur = by_id.get(fid)
+            while isinstance(cur, dict):
+                pid = cur.get("parent")
+                if not pid or pid in seen or pid not in by_id:
+                    break
+                seen.add(pid)
+                total[pid] = total.get(pid, 0) + cnt
+                cur = by_id.get(pid)
+
         for fid, badge in list(self._folder_count_labels.items()):
             if badge is None:
                 continue
             try:
                 if not badge.winfo_exists():
                     continue
-                badge.set_count(len(self.folder_notes(fid)))
+                if fid in SMART_FOLDERS or fid == RECYCLE_FOLDER:
+                    n = len(self.folder_notes(fid))   # 智能分类 / 回收站口径特殊
+                else:
+                    n = total.get(fid, 0)
+                badge.set_count(n)
             except Exception:
                 pass
 
-    def _card_layer(self, parent, color, outside, accent=None):
+    def _card_layer(self, parent, color, outside, accent=None, border_ink=None):
         """在行容器内铺一层圆角背景（Canvas + place），返回该 Canvas。
 
         Tk 的 Frame 是矩形、无法圆角，所以背景交给 Canvas 画：画布底色是「卡片外」
@@ -5014,6 +6342,10 @@ class UIMixin(object):
         accent 给定时再在左缘画一条圆头色条（笔记的辨识色）。**必须画在这里**：
         悬停 / 选中换底色走的是同一个 `draw()`，色条跟着一起重画，四周永远是当前
         底色；另贴一块 Canvas 的话，换底色时色条周围会露出一圈旧色的小方块。
+
+        border_ink 给定时额外描一圈 1px 边（回收站专用：让它像一枚独立按钮，而不是
+        融进侧栏的一行文件夹）。描边色**从当前底色推**、不写死，换肤 / 悬停换底色
+        走同一个 draw() 时会一起重算；1px 细线不取 pal["line"]（见 MEMORY 红线）。
         """
         cv = tk.Canvas(parent, bg=outside, bd=0, highlightthickness=0)
         cv.place(relx=0, rely=0, relwidth=1, relheight=1)
@@ -5022,15 +6354,27 @@ class UIMixin(object):
         tk.Misc.lower(cv)
         cv._color = color
         cv._accent = accent
+        cv._border_ink = border_ink
 
         def draw(ev=None):
             w, h = cv.winfo_width(), cv.winfo_height()
             if w < 3 or h < 3:
                 return
             cv.delete("all")
-            cv.create_polygon(_round_rect_points(0.5, 0.5, w - 0.5, h - 0.5,
-                                                 CARD_RADIUS, 6),
-                              fill=cv._color, outline="")
+            if cv._border_ink:
+                # 单个「填底色 + 1px 描边」的多边形：实测三种写法里唯一在浅色 /
+                # 深色底上都四边连续、圆角干净的。fill="" 再叠一层描边（C）上下边
+                # 几乎看不见；「外圈描边色 + 内圈底色」两层填充（B）在深色下圆角
+                # 露出亮色楔形。描边比例压到 0.20，深色主题的 ink 是白色，再高会
+                # 提亮成一圈刺眼的白边。
+                edge = _mix_hex(cv._color, cv._border_ink, 0.20)
+                cv.create_polygon(_round_rect_points(1, 1, w - 1, h - 1,
+                                                     CARD_RADIUS, 6),
+                                  fill=cv._color, outline=edge, width=1)
+            else:
+                cv.create_polygon(_round_rect_points(0.5, 0.5, w - 0.5, h - 0.5,
+                                                     CARD_RADIUS, 6),
+                                  fill=cv._color, outline="")
             if cv._accent:
                 _draw_accent_bar(cv, w, h, cv._accent)
 
@@ -5366,9 +6710,9 @@ class UIMixin(object):
     def _after_folder_toggle(self, off):
         """就地增删行之后的收尾：滚动区、滚轮绑定、图标与选中态。
 
-        ⚠️ `ScrollPanel._update()` 里的 `_nudge_reqheight` 会把内层 Frame 瞬间压成
-        1×1 再放开（为了逼 Tk 重算请求高度），这一步会把滚动偏移钳回 0；所以必须
-        先记住偏移、更新完再放回去 —— 否则「就地插入」省下的那点位移全被它吃掉。
+        ⚠️ `ScrollPanel._update()` 现在按行求和算高度，不再把内层压成 1×1，
+        所以不会再钳滚动偏移；这里的「先记偏移、更新完放回去」保留成保险
+        （画布尺寸变化、滚动条显隐仍可能微调 yview）。
         """
         self.folder_panel.inner.update_idletasks()
         self.folder_panel._update()
@@ -5378,8 +6722,8 @@ class UIMixin(object):
             self.folder_panel._update()
             self._restore_folder_scroll(off)
 
-        self.folder_panel.canvas.after(30, _upd)
-        self.folder_panel.canvas.after(120, _upd)
+        self._after(30, _upd)             # 经 self._after 登记，关窗后不会回调
+        self._after(120, _upd)
         # 新行是新控件：滚轮要重新绑（指针停在新行上才滚得动）
         self.folder_panel.bind_wheel()
         # 就地插入是 append 进字典的 → 键序要和屏幕顺序对齐（Shift 多选靠它取区间）
@@ -5931,6 +7275,23 @@ class UIMixin(object):
             c.create_polygon(body, fill=col, outline=col, width=0)
             return
 
+        if fid == RECYCLE_FOLDER:
+            # 回收站：一只方形垃圾桶（盖 + 提手 + 桶身 + 两道竖纹）。
+            # ⚠️ 全整数矩形拼 —— 18px 的 Canvas 不抗锯齿，oval / arc 会掉成毛刺。
+            # 颜色吃**正文墨色**而不是 soft：文件夹图标走主题色 / 描边，回收站要
+            # 一眼分得开，就用最沉的中性墨色，六套主题下都不跟文件夹撞。
+            col = p["text"]
+            base = c.cget("bg")
+            for a, b, cc, d in (
+                    (6, 1, 12, 2),      # 提手
+                    (3, 2, 15, 4),      # 桶盖
+                    (4, 5, 14, 14),     # 桶身
+                    (6, 7, 7, 12), (9, 7, 10, 12), (12, 7, 13, 12)):  # 竖纹（挖空）
+                c.create_rectangle(a, b, cc, d,
+                                   fill=(base if b == 7 else col),
+                                   outline="", width=0)
+            return
+
         if fid == SMART_ICON_ALARM:
             # 任务提醒：一只方闹钟。⚠️ 18px 里一律整数矩形拼（Canvas 不抗锯齿，
             # oval / arc 会掉成一圈毛刺）：两枚铃铛 + 四条边框 + L 形指针 + 两只脚。
@@ -6170,8 +7531,11 @@ class UIMixin(object):
         # 必须重绘：否则文件夹行的多选高亮会残留在界面上，看起来“没生效”
         self._restyle_folders()
 
-    def _delete_folders(self, fids):
-        """批量删除选中的普通文件夹（连同它们的子文件夹与笔记）。"""
+    def _delete_folders(self, fids, forever=False):
+        """批量删除选中的普通文件夹（连同它们的子文件夹与笔记）。
+
+        `forever=True` ＝ 彻底删除：不写回收站快照，删掉即不可还原。
+        """
         # 智能分类是筛选视图、系统区是程序自带的 —— 都不在可删之列。多选里混进了
         # 系统那一格时直接摘掉，不能因为它整批拒绝（用户选的是别的文件夹）。
         real = [i for i in fids if i not in SMART_FOLDERS and i != SYSTEM_FOLDER]
@@ -6192,8 +7556,27 @@ class UIMixin(object):
                    "删除后这些笔记会一起删除，是否继续？" % (len(real), tail, cnt))
         else:
             msg = "确定删除选中的 %d 个文件夹？" % len(realset)
-        if not self._ask_confirm("删除文件夹", msg, ok_text="删除", danger=True):
+        if forever:
+            msg += "\n\n不会进入回收站，删除后无法还原。"
+        else:
+            msg += "\n\n删除后先移入回收站，%d 天后自动清除。" % RECYCLE_TTL_DAYS
+        if not self._ask_confirm("彻底删除文件夹" if forever else "删除文件夹", msg,
+                                 ok_text="彻底删除" if forever else "删除",
+                                 danger=True):
             return
+        # 每棵被选中的树单独存一份快照：还原时可以一棵一棵地还，不必整批强塞。
+        # 彻底删除不留快照。
+        if not forever:
+            for fid in real:
+                if not any(x["id"] == fid for x in folders):
+                    continue
+                tree = set(subtree_ids(fid, folders))
+                store().recycle_put(
+                    "folder",
+                    {"folders": [dict(f) for f in folders if f["id"] in tree],
+                     "notes": [dict(n) for n in self.data["notes"]
+                               if n.get("folder") in tree]},
+                    origin=fid)
         if cnt:
             dropped = {n["id"] for n in self.data["notes"] if n.get("folder") in realset}
             self.data["notes"] = [x for x in self.data["notes"] if x["id"] not in dropped]
@@ -6209,7 +7592,7 @@ class UIMixin(object):
         self.refresh_all()
 
     def _resolve_note_colors(self, notes):
-        """给这次要画的整列笔记定颜色：保证相邻两条不同，返回 {笔记 id: 颜色}。
+        """给这次要画的整列笔记定颜色：相邻两条不能同色系，返回 {笔记 id: 颜色}。
 
         颜色平时跟着笔记走（`ensure_note_color`），这里只处理「撞在一起」的那几条。
         落库走 `_schedule_save`（和正文同一个去抖），关窗时 `close_app` 会兜底刷库。
@@ -6230,7 +7613,7 @@ class UIMixin(object):
         card._accent = color
         card._draw()
 
-    def _refresh_alarm_index(self):
+    def _refresh_alarm_index(self, rows=None):
         """按全库提醒重建「任务提醒列表」的正文 / 内链（纯内存，不动 updated）。
 
         它是视图不是内容：增删闹钟、时间翻过「已完成」、点过弹窗的「知道了」，
@@ -6242,7 +7625,8 @@ class UIMixin(object):
                   if x.get("id") == ALARM_INDEX_ID), None)
         if n is None:
             return
-        content, links, tips = alarm_index_content(self.data)
+        # rows 由 _alarm_check 刚扫全库时顺带备好，传进去省一次全库扫描
+        content, links, tips = alarm_index_content(self.data, rows=rows)
         n["content"] = content
         n["links"] = links
         # 被截断格子的全文只给悬停提示用：每次重算都换一份，不落库
@@ -6254,26 +7638,59 @@ class UIMixin(object):
         self._star_buttons = {}
         self._rows = {}
         cur = next((f for f in self.data["folders"] if f["id"] == self.data["current_folder"]), None)
-        self.mid_head.configure(text=cur["name"] if cur else "笔记", fg=p["soft"], bg=p["list"])
+        in_recycle = self.data.get("current_folder") == RECYCLE_FOLDER
+        head = ("回收站 · %d 天后自动清除" % RECYCLE_TTL_DAYS) if in_recycle else (
+            cur["name"] if cur else "笔记")
+        self.mid_head.configure(text=head, fg=p["soft"], bg=p["list"])
+        self._restyle_recycle_bar()
         self._stop_all_marquee()     # 行即将销毁，先停掉跑马灯计时器
-        for w in list(self.note_panel.inner.children.values()):
-            w.destroy()
-        notes = self.visible_notes()
-        # 色条：同一屏里相邻两条不能同色（8 色必然有重复，重复色挨在一起就看不出是
-        # 两篇了）。搜索结果是临时行序，只算这一次显示用什么颜色，不写回笔记。
-        accents = self._resolve_note_colors(notes)
-        self._active_title = self._active_preview = self._active_date = None
-        for i, n in enumerate(notes):
-            self._make_note_row(n, i, n["id"] == self.data.get("current_note"),
-                                accent=accents.get(n["id"]))
-        # 布局完成后按可用像素截断标题（此时盒子宽度才量得出来）
-        for n in notes:
-            self._after_idle(lambda nid=n["id"]: self._fit_note_title(nid))
-        # 显式刷新滚动区，确保内容溢出时滚动条启用、可拖（避免“铺满也滚不动”）
-        self.note_panel.inner.update_idletasks()
-        self.note_panel._update()
-        self.note_panel.canvas.after(30, self.note_panel._update)
-        self.note_panel.canvas.after(120, self.note_panel._update)
+        # 整列重建的「销毁旧行 → 建新行」必须冻着重绘一次走完：Tk 在行销毁后
+        # 立刻就要重画父窗口，而新行要等下一次布局，中间那一帧是**空的** ——
+        # 切回收站、切文件夹、敲搜索词都会白闪一下（回收站早先还会闪两次，
+        # 另一处是 search_var.set("") 触发的 trace，见 _on_search_change）。
+        # 与 _remove_note_rows 同一套做法：冻结期间 update_idletasks 照跑（布局
+        # 落地但画不到屏上），解冻后 repaint 强制整画布重画一次。
+        with frozen_paint(self.root):
+            for w in list(self.note_panel.inner.children.values()):
+                w.destroy()
+            notes = self.visible_notes()
+            # 色条：同一屏里相邻两条不能同色系（红/橙、绿/青、蓝/紫挨着看不出是两篇；
+            # 8 色必然有重复，判定口径见 store.note_colors_are_far）。搜索结果是临时
+            # 行序，只算这一次显示用什么颜色，不写回笔记。
+            # 回收站里的假笔记不参与这套（它们是快照，没有真正的笔记颜色）。
+            accents = ({} if in_recycle else self._resolve_note_colors(notes))
+            if in_recycle:
+                accents = {n["id"]: p["soft"] for n in notes}
+            self._active_title = self._active_preview = self._active_date = None
+            if not notes:
+                # 空列表给一句引导：新建笔记的入口原本只藏在列表空白处右键菜单里，
+                # 纯看界面不知道怎么下手。搜索无果与空文件夹用不同文案。
+                searching = bool((self.search_var.get() if hasattr(self, "search_var")
+                                  else "").strip())
+                hint = ("没有匹配的笔记" if searching else
+                        "这里还没有笔记 · 右键空白处或按 Ctrl+N 新建")
+                hint_lbl = tk.Label(self.note_panel.inner, text=hint, bg=p["list"],
+                         fg=p["soft"], font=(FONT[0], 11), anchor="w",
+                         justify="left", wraplength=_panel_width(self.root) - 60)
+                # 打标记：普通文件夹新建走差量插入(_insert_note_row)，不经整列重建，
+                # 得靠这个标记把引导摘掉，否则新笔记和这句话会同时留在列表里。
+                hint_lbl._empty_hint = True
+                hint_lbl.pack(
+                             anchor="w", padx=dpi.px(18), pady=dpi.px(20))
+            for i, n in enumerate(notes):
+                self._make_note_row(n, i, n["id"] == self.data.get("current_note"),
+                                    accent=accents.get(n["id"]))
+            # 布局完成后按可用像素截断标题（此时盒子宽度才量得出来）
+            for n in notes:
+                self._after_idle(lambda nid=n["id"]: self._fit_note_title(nid))
+            # 显式刷新滚动区，确保内容溢出时滚动条启用、可拖（避免“铺满也滚不动”）
+            self.note_panel.inner.update_idletasks()
+            self.note_panel._update()
+        # 解冻后必须整幅重画：冻结期间 inner 的 Configure 已经把新滚动区写进
+        # 画布，再 _update() 是「设同一个值」，Tk 不重画 → 屏幕上留着旧像素。
+        self.note_panel.repaint()
+        self._after(30, self.note_panel._update)    # 经 self._after 登记，关窗安全
+        self._after(120, self.note_panel._update)
         # 行被重建后需重新绑定滚轮（否则指针停在行/文字上滚不动）
         self.note_panel.bind_wheel()
         self._restyle_notes()
@@ -6362,7 +7779,12 @@ class UIMixin(object):
                        bg=child_bg, bd=0, relief=tk.FLAT, cursor="hand2",
                        font=(FONT[0], 17),
                        activebackground=child_bg, activeforeground=(p["star"] if starred else p["soft"]),
+                       state=(tk.DISABLED if self._recycle_view() else tk.NORMAL),
                        command=lambda nid=n["id"]: self.toggle_star(nid))
+        if self._recycle_view():
+            # 回收站里的假笔记不能星标 / 置顶：星标按钮只是个灰掉的占位，
+            # 免得用户点了没反应还以为是 bug
+            sb.configure(text="☆", fg=p["soft"], activeforeground=p["soft"])
         sb.pack(side=tk.RIGHT, padx=(0, dpi.px(6)))
         self._star_buttons[n["id"]] = sb
         dl = tk.Label(right, text=self._date_text(n), bg=child_bg, fg=p["soft"],
@@ -6432,6 +7854,12 @@ class UIMixin(object):
         if n["id"] not in ids:
             self.refresh_notes()
             return
+        # 空文件夹里原本挂着「这里还没有笔记 · 右键…」的引导 Label。新建走的是
+        # 差量插入，不会经过 refresh_notes 的整列重建，得在这里主动摘掉，否则
+        # 新笔记插进来的同时那句引导还在（看起来像没刷新）。
+        for w in list(self.note_panel.inner.children.values()):
+            if getattr(w, "_empty_hint", False):
+                w.destroy()
         idx = ids.index(n["id"])
         # 新笔记是「插进」两行之间：上下两位本来就不同色，只要新这条避开它俩就行。
         # 必须让**新来的**让路 —— 让邻居改色的话，用户会觉得自己点错了笔记。
@@ -6456,7 +7884,7 @@ class UIMixin(object):
         self._after_idle(lambda nid=n["id"]: self._fit_note_title(nid))
         self.note_panel.inner.update_idletasks()
         self.note_panel._update()
-        self.note_panel.canvas.after(30, self.note_panel._update)
+        self._after(30, self.note_panel._update)    # 经 self._after 登记，关窗安全
         self.note_panel.bind_wheel()
 
     def _remove_note_rows(self, ids):
@@ -6466,27 +7894,63 @@ class UIMixin(object):
         收回「首位小间距」——否则删掉第一行后，第二行会多出一段行间距。
         """
         ids = set(ids)
-        for nid in list(ids):
-            rec = self._rows.pop(nid, None)
-            self._star_buttons.pop(nid, None)
-            self._note_sel.discard(nid)
-            try:
-                self._stop_marquee("n:" + nid)
-            except Exception:
-                pass
-            if rec is not None:
+        # 先记下视口顶端的画布 y（像素）：行删掉后内容变短、滚动区跟着收缩，
+        # 偏移若不放回去会被钳到别处 —— 一次删好几条时足够露出一整片空白。
+        panel = self.note_panel
+        try:
+            keep_off = panel.canvas.canvasy(0)
+        except Exception:
+            keep_off = 0.0
+        # ⚠️ 整段必须冻着重绘完成：行销毁后父窗口立刻要重画曝光区，而 pack 的
+        # 重排要等下一个 idle。中间任何一次真实重绘画的都是「行没了、空位还在」
+        # —— 删一条只是一道缝，批量删就是一整片空白（会停在那儿直到重排完成）。
+        # 冻住之后把销毁 + 重排走完，解冻后再动画布（改滚动区 = 整画布重画）。
+        # ⚠️ 别把改滚动区 / yview 挪进冻结段里：冻结期间 Tk 的滚动刷位看不到，
+        # 它自己的「脏区」记账却照走，解冻后只补画一部分，留下半截残影。
+        with frozen_paint(self.root):
+            for nid in list(ids):
+                rec = self._rows.pop(nid, None)
+                self._star_buttons.pop(nid, None)
+                self._note_sel.discard(nid)
                 try:
-                    rec["wrap"].destroy()
+                    self._stop_marquee("n:" + nid)
                 except Exception:
                     pass
-        vis = self.visible_notes()
-        if vis:
-            first = self._rows.get(vis[0]["id"])
-            if first is not None:
-                first["wrap"].pack_configure(pady=(dpi.px(2), 0))
-        self.note_panel.inner.update_idletasks()
-        self.note_panel._update()
-        self.note_panel.bind_wheel()
+                if rec is not None:
+                    try:
+                        rec["wrap"].destroy()
+                    except Exception:
+                        pass
+            vis = self.visible_notes()
+            if vis:
+                first = self._rows.get(vis[0]["id"])
+                if first is not None:
+                    first["wrap"].pack_configure(pady=(dpi.px(2), 0))
+            # 冻结期间跑 idle 是安全的：重排会落地，但画不到屏幕上去。
+            panel.inner.update_idletasks()
+        # 解冻后必须强制整画布重画：冻结时 Configure 已把新滚动区设了进去，
+        # 直接 _update() 是「设同一个值」，Tk 不会重画 → 屏幕留着旧像素残影。
+        panel.repaint()
+        self._restore_panel_offset(panel, keep_off)
+        panel.bind_wheel()
+
+    def _restore_panel_offset(self, panel, off):
+        """把滚动面板的偏移（画布像素）放回去；超出新内容高度就贴底。
+
+        与 `refresh_folders(keep_scroll=True)` 同一套算法，只是这里恒为 True：
+        差量删行本来就该原地不动，而不是整列弹回顶部。
+        """
+        try:
+            h = panel._content_height()
+            vis = panel.canvas.winfo_height() or 0
+            if vis and h < vis:
+                h = vis
+            if h <= 0:
+                return
+            off = max(0.0, min(off, max(0.0, h - vis)))
+            panel.canvas.yview_moveto(off / float(h))
+        except Exception:
+            pass
 
     def select_note(self, nid, sync_folder=True):
         """选中并装载一条笔记。
@@ -6499,6 +7963,9 @@ class UIMixin(object):
         """
         if self.doodle_active():
             return          # 涂鸦期间不许换笔记（蒙层 / 快照都绑在当前正文上）
+        if getattr(self, "_recycle_view", lambda: False)():
+            # 最后一道闸：内链 / @关联 / 标签点击等路径也不能在回收站里打开笔记
+            return
         prev = self.data.get("current_note")
         if prev == nid:
             # 点中「已是当前项」的笔记：同样要取消文件夹多选（否则这里直接 return 会漏掉同步）
@@ -6832,7 +8299,9 @@ class UIMixin(object):
         """统一刷新笔记行样式：当前(active) > 多选高亮 > 普通；不重建行、不闪烁。"""
         p = self.pal
         cur = self.data.get("current_note")
-        valid = {n["id"] for n in self.data["notes"]}
+        valid = ({n["id"] for n in self.visible_notes()}
+                 if getattr(self, "_recycle_view", lambda: False)()
+                 else {n["id"] for n in self.data["notes"]})
         self._note_sel &= valid
         for rid, rec in self._rows.items():
             active = (rid == cur)
@@ -6875,8 +8344,11 @@ class UIMixin(object):
         # 表现为 Shift 区间多选只剩 1 条。文件夹侧的同步只由「普通点击」触发（见 select_note）。
         self._restyle_notes()
 
-    def _delete_notes(self, nids):
-        """批量删除选中的笔记。系统笔记（内置说明 / 任务提醒列表）自动跳过。"""
+    def _delete_notes(self, nids, forever=False):
+        """批量删除选中的笔记。系统笔记（内置说明 / 任务提醒列表）自动跳过。
+
+        `forever=True` ＝ 彻底删除：不写回收站快照，删掉即不可还原。
+        """
         if not nids:
             return
         ids = set(nids)
@@ -6888,11 +8360,24 @@ class UIMixin(object):
                 n = next((x for x in self.data["notes"] if x["id"] in protected), None)
                 self._refuse_sample_delete(n)
                 return
-        msg = "确定删除选中的 %d 条笔记？" % len(ids)
+        if forever:
+            msg = ("确定彻底删除选中的 %d 条笔记？\n\n"
+                   "不会进入回收站，删除后无法还原。" % len(ids))
+        else:
+            msg = "确定删除选中的 %d 条笔记？\n\n删除后先移入回收站，%d 天后自动清除。" % (
+                len(ids), RECYCLE_TTL_DAYS)
         if protected:
-            msg += "\n\n另有 %d 条系统笔记不会删除。" % len(protected)
-        if not self._ask_confirm("删除", msg, ok_text="删除", danger=True):
+            msg += "\n另有 %d 条系统笔记不会删除。" % len(protected)
+        if not self._ask_confirm("彻底删除" if forever else "删除", msg,
+                                 ok_text="彻底删除" if forever else "删除",
+                                 danger=True):
             return
+        # 逐条快照进回收站（保留原 folder / order / 密文，还原时原样放回）；
+        # 彻底删除不写快照。
+        if not forever:
+            for x in self.data["notes"]:
+                if x["id"] in ids:
+                    store().recycle_put("note", dict(x), origin=x.get("folder"))
         self.data["notes"] = [x for x in self.data["notes"] if x["id"] not in ids]
         self._note_sel = set()
         self._note_anchor = None
@@ -6906,11 +8391,25 @@ class UIMixin(object):
         if cur_removed:
             self._active_title = self._active_preview = self._active_date = None
         self._refresh_folder_counts()
+        # 同 delete_note：差量移除行不重建整列，回收站徽标要在这里补刷，
+        # 否则要等用户点一下回收站才看到条数变化。
+        self._restyle_recycle_bar()
         self._restyle_notes()
         if cur_removed:
             self.load_editor()
 
     def _note_press(self, e, nid):
+        if getattr(self, "_recycle_view", lambda: False)():
+            # 回收站里只允许选中（为了右键「还原」这一项）；**不建可拖状态**，
+            # 松手也不会调 select_note —— 快照不能打开成正文（需求明确要求）。
+            if (e.state & 0x0001) or (e.state & 0x0004):
+                self._note_select(e, nid)
+            else:
+                self._note_sel = {nid}
+                self._note_anchor = nid
+                self._restyle_notes()
+            self._drag = None
+            return
         # 按住 Shift / Ctrl 进行多选（批量删除），不进入拖拽逻辑
         if (e.state & 0x0001) or (e.state & 0x0004):
             self._note_select(e, nid)
@@ -7326,6 +8825,7 @@ class UIMixin(object):
         self.text.config(state=tk.NORMAL)
         self._md_pending = None      # 换笔记：上一行遗留的待补样式作废
         self._hide_link_tip()        # 悬停小窗指向的是上一篇的链接，先收起
+        self._img_hover_leave()      # 图片浮层同理：它显示的是上一篇的地址
         self._mention_close()        # 候选面板同样绑着上一篇的插入点
         if getattr(self, "_md_job", None) is not None:
             # 还没执行的 markdown 转换也要取消：它带着**上一篇**的行号，
@@ -7336,6 +8836,7 @@ class UIMixin(object):
                 pass
             self._md_job = None
         # 待办勾选框是正文字符，随 text.delete 一起没了，不必单独销毁
+        self._fold_cleanup()         # 折叠 chip 是嵌入窗口，text.delete 不会销毁它
         for blk in self._codes:
             try:
                 blk.destroy()
@@ -7348,6 +8849,15 @@ class UIMixin(object):
             except Exception:
                 pass
         self._hrs = []
+        # 提醒卡片是嵌入窗口，text.delete 不会替我们销毁它；先逐个销毁再清表，
+        # 否则切笔记后旧卡片仍挂在 Text 的子控件里，内存和位图都泄漏。
+        for card in (getattr(self, "_alarm_cards", None) or {}).values():
+            try:
+                card.destroy()
+            except Exception:
+                pass
+        self._alarm_cards = {}
+        self._alarms = {}
         self.text.delete("1.0", tk.END)
         # 显式把选区标签清掉：现在「切完没有选区」是靠上面那句 delete 顺带实现的
         #（没有内容，sel 自然也就没了），但那只是副作用、不是契约。写死一次更稳：
@@ -7362,6 +8872,26 @@ class UIMixin(object):
         # 换笔记：上一张表里浮出的「格子全文」气泡不能跟着飘过来（它的定位
         # 依据是旧正文，新正文里同一个位置早已是别的字）
         self._hide_cell_tip()
+        if self._recycle_view():
+            # 需求：回收站里**不可打开笔记**。列表那一行是快照包装出来的假笔记，
+            # 这里不给编辑器装任何正文，只放说明；_note_press 也不会调 select_note，
+            # 双保险，免得误把原笔记内容显示出来。
+            sealed = self._seal_prev_note(keep=None)
+            if sealed:
+                self._refresh_note_row(sealed)
+            self._editor_note = None
+            self._set_readonly(True, "recycle")
+            self.text.insert("1.0", "回收站中的笔记 / 文件夹不能打开。\n\n"
+                                    "在列表项上右键可「还原此项」或「清空当前笔记」；\n"
+                                    "在左下角「回收站」上右键可「还原全部」或「清空」。\n\n"
+                                    "超过 %d 天的项目会自动清除。" % RECYCLE_TTL_DAYS)
+            self.text.config(state=tk.DISABLED)
+            # ⚠️ 这里**不能**调 _render_tabs()：它在 current_note 为空时会顺到最近
+            # 一枚标签并 _tab_activate → select_note → 又回到这里，死循环。
+            self._sync_jump_nav()
+            self._refresh_footer()
+            self._apply_search_highlight()
+            return
         n = self.current_note()
         self._refresh_alarm_index()   # 汇总表正开着时，正文也要跟上最新状态
         # 先假设「编辑器里的不是这篇笔记的明文」：解锁失败时正文区放占位文字，
@@ -7450,7 +8980,7 @@ class UIMixin(object):
     # 这类与正文无关的入口，整颗禁掉反而连界面都调不动了。
     READONLY_LOCKED = ("style", "bold", "italic", "underline", "strike",
                        "color", "link", "bullet", "numbered", "triangle",
-                       "todo", "code")
+                       "todo", "code", "hr")
 
     def _set_readonly(self, on, kind=None):
         """切换只读态：提示条、光标、工具栏可用性一起切。
@@ -7499,6 +9029,8 @@ class UIMixin(object):
                         can_rc = False
                     text = ("这篇笔记已加密 · 输入口令或用恢复码查看" if can_rc
                             else "这篇笔记已加密 · 输入口令后才能查看内容")
+                elif kind == "recycle":
+                    text = "回收站中的项目不能打开 · 右键可还原或清空回收站"
                 elif kind == "alarm_index":
                     text = "任务提醒列表 · 自动汇总，内容不可编辑（点 @笔记名 可跳回原文）"
                 else:
@@ -7574,8 +9106,9 @@ class UIMixin(object):
             pass
 
     def _render_content(self, content):
-        # 闹钟表跟着正文一起换：不在这里清空的话，切走的笔记留下的 name → 数据
-        # 会继续留着，新笔记里同名图元（id 撞车）就会认错人
+        # 正文里的图片表跟着正文一起换：不在这里清空的话，切走的笔记留下的
+        # name → PhotoImage 会继续占内存，新笔记里同名图元（id 撞车）就会认错数据
+        self._imgs = {}
         self._alarms = {}
         for it in content:
             if it[0] == "t":
@@ -7597,17 +9130,16 @@ class UIMixin(object):
             elif it[0] == "alarm":
                 self._alarm_add(tk.END, it[1] if len(it) > 1 and isinstance(it[1], dict) else {},
                                 move=False)
+            elif it[0] == "img":
+                self._img_add(tk.END, it, move=False)
         # 方框的 todo / todo_done 标签逐行归一：老库里存在「光有字符没标签」的
         # 待办（早先回车续接的产物），不补的话它们既小又点不动。
         # **必须排在下面画删除线之前**：删除线是按 todo_done 标签范围找行的，
         # 补标签晚一步，那些 ✅ 行就只剩绿框、没有划过线的正文。
         self._sync_todo_tags()
         # 已勾的待办整行套 done（删除线 + 变灰）。勾选态现在是行首那个 ✅ 字符，
-        # 逐行扫一遍即可 —— 不再需要维护控件实例表。
-        # 删除线从**勾选框之后**开始画：划过方框看着像把方框也划掉了。
-        for a, b in zip(*[iter(self.text.tag_ranges("todo_done"))] * 2):
-            ln = str(a).split(".")[0]
-            self.text.tag_add("done", *self._todo_body_span(ln))
+        # 逐行扫一遍即可 —— 不再需要维护控件实例表。撤销后也走同一个入口重刷。
+        self._sync_todo_done()
         self._normalize_quote_spans()
         # 第 1 行恒为标题（旧数据首行可能是 body/h2/quote，打开即纠正）
         self._ensure_title_line()
@@ -7619,6 +9151,10 @@ class UIMixin(object):
         self._after_idle(self._sync_list_indent)
         # 闹钟的悬浮/右键绑定 + 到点轮询（首次载入时挂上，之后靠标记防重复）
         self._alarm_bind()
+        # 行号标记归一：旧库把所有标记塞在一个 tag 里，连续空行已被 Tk 合并成
+        # 一整段（点一行牵连整段）。载入时拆成一行一个 tag，顺手把老数据修好；
+        # 改 tag 不触发 <<Modified>>，不会把这次整理写进笔记。
+        self._gmark_normalize()
 
     def _normalize_quote_spans(self):
         """把每段引用行的标签扩到含行尾换行符。
@@ -8876,8 +10412,32 @@ class UIMixin(object):
             except Exception:
                 return
             self._sync_todo_lines(start, min(last, end + 1))
+            # 复制只带走字符不带 tag：上面补好了 todo_done（绿框），删除线却归
+            # _sync_todo_done 管，它不在撤销栈里、粘贴链也不会自己画。少了这一句，
+            # 粘进来的 ✅ 就是「绿框但没删除线」。顺序不能反：done 是按 todo_done
+            # 范围找行的，必须先让 _sync_todo_lines 把方框标签打上。
+            self._sync_todo_done()
 
         self._after_idle(fix)
+        return None
+
+    def _on_undo_fix_todo(self, event=None):
+        """撤销 / 重做后补齐待办方框的字号、颜色与点击标签。
+
+        Tk 的 undo 栈只记 insert/delete，tag 增删不入栈（见 _apply_search_highlight）：
+        Ctrl+Y 删掉一行待办、再 Ctrl+Z 撤回来，⬜ / ✅ 字符回来了，但 todo /
+        todo_done / todo_gap 没回来 —— 方框按正文大字号渲染（用户看到「变大」），
+        tag_bind 也失效。粘贴有 _on_paste_fix_todo，撤销走这里。
+
+        实例绑定比类绑定早：收到 <<Undo>> / <<Redo>> 时真正的 undo 还没执行，
+        所以推到 idle 再扫。全文归一两次跑不会产生额外撤销单元（tag 不进栈），
+        已正确的行在 _tag_todo_prefix 里直接跳过。只读笔记的撤销已被
+        _readonly_clip_guard 拦掉，这里再挡一次更保险。
+        """
+        if self.is_readonly():
+            return None
+        self._after_idle(self._sync_todo_tags)
+        self._after_idle(self._sync_todo_done)
         return None
 
     def _on_click_untagged_todo(self, event=None):
@@ -8908,6 +10468,137 @@ class UIMixin(object):
             return "break"
         self.toggle_todo_at(idx)     # 切换时会把 todo / todo_done 一起补齐
         return "break"
+
+    # ---------- 图片：悬停看源 / 右键改地址、上传图床 ----------
+
+    # 悬停多久才浮出（毫秒）。太短会跟着鼠标扫过到处闪，太长又不像是「一停就有」。
+    IMG_HOVER_DELAY = 320
+
+    def _img_hover(self, event=None):
+        """指针停在图片上 → 浮出它的 Markdown 源（用户定的：不再点击弹窗）。
+
+        ⚠️ 只在**换了一张图**时才重置计时器：Motion 每秒几十条，若每条都
+        after_cancel + after，指针再停也永远攒不够延迟，浮层就再也弹不出来。
+        """
+        if event is None:
+            return None
+        name = self._img_at_point(event.x, event.y)
+        if name == self._img_hover_name:
+            return None
+        self._img_hover_cancel()
+        self._img_hover_name = name
+        if not name:
+            return None
+        try:
+            self._img_hover_job = self._after(
+                self.IMG_HOVER_DELAY, lambda n=name: self._img_hover_show(n))
+        except Exception:
+            self._img_hover_job = None
+        return None
+
+    def _img_hover_cancel(self):
+        """撤销待弹的浮层并收掉已经弹出来的（不动 _img_hover_name）。
+
+        getattr 兜底：`_load_editor_body` 在建窗过程中就会调到这里，而那时
+        `_img_hover_job` 未必已经初始化。
+        """
+        job = getattr(self, "_img_hover_job", None)
+        if job is not None:
+            try:
+                self._cancel_after(job)
+            except Exception:
+                pass
+        self._img_hover_job = None
+        self._img_hover_hide()
+
+    def _img_hover_hide(self):
+        win = getattr(self, "_img_hover_win", None)
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+        self._img_hover_win = None
+
+    def _img_hover_leave(self, _e=None):
+        self._img_hover_name = None
+        self._img_hover_cancel()
+
+    def _img_hover_show(self, name):
+        """真正建浮层：第一行 Markdown 源，第二行尺寸 + 操作提示。
+
+        无边框 Toplevel，**不 grab、不抢焦点** —— 它只是「看到的」，不是「要操作的」，
+        一 grab 就会打断正在打字的输入法。
+        """
+        self._img_hover_job = None
+        if name != self._img_hover_name:
+            return                       # 期间指针已经移走
+        rec = self._imgs_get().get(name)
+        block = rec.get("block") if isinstance(rec, dict) else None
+        if not (isinstance(block, list) and len(block) > 1
+                and isinstance(block[1], dict)):
+            return
+        try:
+            bb = self.text.bbox(name)
+        except tk.TclError:
+            return
+        if not bb:                       # 滚出可视区 / 被折叠藏了
+            return
+        d = block[1]
+        md = imgstore.format_md_image(block)
+        w, h = d.get("w"), d.get("h")
+        sub = ("%s × %s · 右键可更换地址" % (w, h)) if (w and h) else "右键可更换地址"
+        p = self.pal
+        shell, border = _popover_bg(p), _popover_border(p)
+        try:
+            win = tk.Toplevel(self.root)
+            win.wm_overrideredirect(True)
+            # 主窗自绘标题栏拖动时会临时置顶：浮层不跟着置顶，就会被自家窗口盖住
+            win.attributes("-topmost", True)
+            win.configure(bg=border)
+            box = tk.Frame(win, bg=shell)
+            box.pack(padx=dpi.px(1), pady=dpi.px(1))
+            # 地址可能很长（图床 URL 上百字符）：限宽换行，不把浮层拉成一整条
+            tk.Label(box, text=md, bg=shell, fg=p["text"], font=(FONT[0], 10),
+                     justify="left", anchor="w", wraplength=dpi.px(420)).pack(
+                         fill=tk.X, padx=dpi.px(11), pady=(dpi.px(8), 0))
+            tk.Label(box, text=sub, bg=shell, fg=p["soft"], font=(FONT[0], 9),
+                     justify="left", anchor="w").pack(
+                         fill=tk.X, padx=dpi.px(11), pady=(dpi.px(3), dpi.px(8)))
+            win.update_idletasks()
+            bw, bh = win.winfo_reqwidth(), win.winfo_reqheight()
+            bx, by, _bw, _bh = bb
+            x = self.text.winfo_rootx() + bx
+            y = self.text.winfo_rooty() + by + _bh + dpi.px(6)
+            area = work_area_at(x, y, fallback=win)
+            x, y = clamp_pos(area, x, y, bw, bh, pad=dpi.px(4))
+            win.wm_geometry("+%d+%d" % (x, y))
+            self._img_hover_win = win
+        except Exception:
+            self._img_hover_hide()
+
+    def _img_at_point(self, x, y):
+        """(x, y) 落在哪张正文图片上 → 图片名；不在图上返回 None。
+
+        用 bbox 逐张判，而不是 `index("@x,y")` 比索引：图片在正文里只占一个
+        字符位，而「图片那个字符位」和它左邻字符的右边界是同一个索引 —— 点在图
+        左边一个字上也会判成图。bbox 是实际的绘制矩形，点到才算。
+        """
+        try:
+            names = [n for n in self.text.image_names() if n.startswith("img:")]
+        except tk.TclError:
+            return None
+        for name in names:
+            try:
+                bb = self.text.bbox(name)
+            except tk.TclError:
+                continue
+            if not bb:
+                continue                 # 滚出可视区 / 已被折叠隐藏
+            bx, by, bw, bh = bb
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                return name
+        return None
 
     def _add_hr(self, index=tk.END):
         """在正文里放一条分割线（结构项 ["hr"] 的渲染出口）。"""
@@ -9006,6 +10697,32 @@ class UIMixin(object):
         """给 first..last 行（含）的行首方框补标签；越界交给 _tag_todo_prefix 自己忽略。"""
         for ln in range(max(1, int(first)), int(last) + 1):
             self._tag_todo_prefix(str(ln))
+
+    def _sync_todo_done(self):
+        """按当前方框状态重刷待办行的 done（删除线 + 变灰）。
+
+        done 也是 tag，撤销栈管不到：把 ✅ 撤成 ⬜（或反过来）时字符变了、done
+        却留在原处。先按行首字符摘掉未勾行的残留删除线，再按刚纠正过的
+        todo_done 范围给已勾行加回来。删除线从勾选框之后画起 —— 划过方框看着
+        像把方框也划掉了。
+        """
+        try:
+            last = int(str(self.text.index("end-1c")).split(".")[0])
+        except Exception:
+            return
+        for ln in range(1, last + 1):
+            txt = self.text.get("%d.0" % ln, "%d.end" % ln)
+            kind, prefix = split_list_prefix(txt)
+            if kind != "check" or not prefix:
+                continue
+            off = len(txt) - len(txt.lstrip("\u3000 "))
+            if off >= len(txt):
+                continue
+            if TODO_LEGACY.get(txt[off], txt[off]) != TODO_ON:
+                self.text.tag_remove("done", "%d.0" % ln, "%d.end" % ln)
+        for a, b in zip(*[iter(self.text.tag_ranges("todo_done"))] * 2):
+            ln = str(a).split(".")[0]
+            self.text.tag_add("done", *self._todo_body_span(ln))
 
     def _todo_gap_end(self, ln, txt, col):
         """方框（第 col 列）后面那段间隙的结束列：紧跟的一串空白都算，可能为空。"""
@@ -9133,7 +10850,7 @@ class UIMixin(object):
         分割线也要跟着走：它的画布宽度是显式给的，不重设就会停在旧宽度上，
         窗口一拉宽，线就短了一截。
         """
-        if not self._codes and not self._hrs:
+        if not self._codes and not self._hrs and not getattr(self, "_alarm_cards", None):
             return
         w = self._code_width()
         for b in list(self._codes):
@@ -9146,6 +10863,12 @@ class UIMixin(object):
             try:
                 if h.winfo_exists():
                     h.set_width(w)
+            except Exception:
+                pass
+        for c in list((getattr(self, "_alarm_cards", None) or {}).values()):
+            try:
+                if c.winfo_exists():
+                    c.set_width(w)
             except Exception:
                 pass
 
@@ -9383,6 +11106,16 @@ class UIMixin(object):
                  justify="left", font=(FONT[0], 12), wraplength=DLG_TEXT_W).pack(
                      side=tk.LEFT, fill=tk.X, expand=True)
 
+        # ⚠️ 若本提示框是从另一张模态窗里弹出的（典型：全局设置「测试上传」
+        # 的结果提示），先记下那张窗的 grab：Tk 的 grab 全局只有「一个」，本框
+        # grab_set 会把它抢走，destroy 时又一起释放 → 原来的模态窗（设置窗）
+        # 当场变成非模态，能被主窗盖住、点击穿透。关框后在这里还回去。
+        holder = None
+        try:
+            holder = self.root.grab_current()
+        except Exception:
+            pass
+
         def ok(_=None):
             win.destroy()
 
@@ -9393,6 +11126,12 @@ class UIMixin(object):
         self._center_dialog(win)
         win.grab_set()
         win.wait_window()
+        if holder is not None:
+            try:
+                if holder.winfo_exists():
+                    holder.grab_set()
+            except Exception:
+                pass
 
     def _show_info(self, title, message):
         self._show_alert(title, message, "info")
@@ -9524,6 +11263,10 @@ class UIMixin(object):
                      relief=tk.FLAT, highlightthickness=dpi.px(1),
                      highlightbackground=p["line"], highlightcolor=p["accent"], width=30)
         e.pack(fill=tk.X, padx=dpi.px(16), ipady=dpi.px(5))
+        # 空口令点确定时的内联提示（与 _ask_link 的 hint 同一套）：原来这里
+        # 静默 return，用户以为程序卡死，尤其在解锁加密笔记时最明显。
+        pw_hint = tk.Label(win, text="", bg=p["top"], fg=MENU_DANGER,
+                           anchor="w", font=(FONT[0], 10))
         if out is not None:
             def use_recovery(_=None):
                 out["recovery"] = True
@@ -9538,6 +11281,10 @@ class UIMixin(object):
 
         def ok(_=None):
             if not var.get() and not allow_empty:
+                pw_hint.configure(text="口令不能为空。")
+                if not pw_hint.winfo_ismapped():
+                    pw_hint.pack(fill=tk.X, padx=dpi.px(16), pady=(dpi.px(4), 0))
+                e.focus_set()
                 return
             res["v"] = var.get()
             win.destroy()

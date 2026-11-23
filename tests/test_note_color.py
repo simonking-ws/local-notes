@@ -6,6 +6,9 @@
   2. **均匀** —— 相邻新建的笔记不该连着撞色（撞了「区分」就白做）；
   3. **不出界** —— 只认调色板里的值，脏数据（NULL / 空串 / 乱写）读出来当没有。
 
+相邻两条还要求**不同色系**：8 色里红/橙、绿/青、蓝/紫的色相只差 20~40°，
+并排时看着像同一篇。判定口径见 store.note_colors_are_far（色相夹角 ≥80°）。
+
 运行：
     python -m unittest discover -s tests -v
 """
@@ -19,9 +22,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 import backup                                                  # noqa: E402
-from store import (Store, NOTE_COLORS, ensure_note_color,      # noqa: E402
-                   pick_note_color, _ensure_note_colors, _t,
-                   resolve_adjacent_colors)
+from store import (Store, NOTE_COLORS, NOTE_COLOR_MIN_GAP,      # noqa: E402
+                   ensure_note_color, pick_note_color, _ensure_note_colors,
+                   _t, resolve_adjacent_colors, note_color_gap,
+                   note_colors_are_far)
 
 
 def n(nid, color=None):
@@ -68,6 +72,13 @@ class PickColorTest(unittest.TestCase):
         self.assertIn(pick_note_color(notes, "f_work", list(NOTE_COLORS)),
                       NOTE_COLORS)
 
+    def test_avoid_neighbors_by_family(self):
+        """避开上一位时连它的同色系一起避：红色旁也别挑橙 / 品红。"""
+        notes = [n("a", NOTE_COLORS[0])]
+        got = pick_note_color(notes, "f_work", [NOTE_COLORS[0]])
+        self.assertTrue(note_colors_are_far(got, NOTE_COLORS[0]))
+        self.assertNotIn(got, (NOTE_COLORS[1], NOTE_COLORS[7]))
+
     def test_ensure_is_idempotent(self):
         """已有颜色一律照旧 —— 这是「稳定」的全部意思。"""
         x = n("a", NOTE_COLORS[5])
@@ -100,7 +111,7 @@ class PickColorTest(unittest.TestCase):
 
 
 class AdjacentColorTest(unittest.TestCase):
-    """相邻两条不能同色 —— 8 色必有重复，但重复色挨在一起就分不出是两篇了。"""
+    """相邻两条不能同色系 —— 8 色必有重复，相近色挨在一起就分不出是两篇了。"""
 
     def colors(self, notes):
         return [x["color"] for x in notes]
@@ -109,6 +120,19 @@ class AdjacentColorTest(unittest.TestCase):
         c = self.colors(notes)
         for i in range(1, len(c)):
             self.assertNotEqual(c[i], c[i - 1], "第 %d 条与上一条同色" % i)
+            gap = note_color_gap(c[i], c[i - 1])
+            self.assertGreaterEqual(
+                gap, NOTE_COLOR_MIN_GAP,
+                "第 %d 条(%s)与上一条(%s)是同色系，只差 %.0f°"
+                % (i, c[i], c[i - 1], gap))
+
+    def test_gap_helper(self):
+        """判定口径本身：红/橙算同系、红/青算远色，脏值不误判成冲突。"""
+        self.assertLess(note_color_gap(NOTE_COLORS[0], NOTE_COLORS[1]),
+                        NOTE_COLOR_MIN_GAP)
+        self.assertTrue(note_colors_are_far(NOTE_COLORS[0], NOTE_COLORS[3]))
+        self.assertTrue(note_colors_are_far(None, NOTE_COLORS[0]))
+        self.assertTrue(note_colors_are_far("#12345", NOTE_COLORS[0]))
 
     def test_empty_and_single(self):
         self.assertEqual(resolve_adjacent_colors([]), ({}, False))
@@ -118,11 +142,25 @@ class AdjacentColorTest(unittest.TestCase):
         self.assertEqual(got["a"], NOTE_COLORS[3])
 
     def test_distinct_list_untouched(self):
-        """本来就不同色的列表一个像素都不该动（否则每次刷新整列换色）。"""
-        notes = [n("n%d" % i, NOTE_COLORS[i]) for i in range(len(NOTE_COLORS))]
+        """本来就不同色系的列表一个像素都不该动（否则每次刷新整列换色）。"""
+        # 按调色板顺序的 8 色里红/橙、绿/青是同系，会被改；这里挑一组色相
+        # 错开 80° 以上的（红→青→品红→绿→蓝紫），验证「已经够分散」时不动。
+        spread = (0, 3, 7, 2, 5)
+        notes = [n("n%d" % i, NOTE_COLORS[k]) for i, k in enumerate(spread)]
         got, changed = resolve_adjacent_colors(notes)
         self.assertFalse(changed)
         self.assertEqual(got, {x["id"]: x["color"] for x in notes})
+
+    def test_same_family_pairs_are_split(self):
+        """调色板里那几组同色系：红/橙、绿/青、蓝/蓝紫、蓝紫/紫、品红/红。"""
+        for a, b in ((0, 1), (2, 3), (4, 5), (5, 6), (7, 0)):
+            with self.subTest(a=NOTE_COLORS[a], b=NOTE_COLORS[b]):
+                notes = [n("x", NOTE_COLORS[a]), n("y", NOTE_COLORS[b])]
+                changed = resolve_adjacent_colors(notes)[1]
+                self.assertTrue(changed, "相邻同色系没被拆开")
+                self.assert_no_adjacent(notes)
+                self.assertEqual(notes[0]["color"], NOTE_COLORS[a],
+                                 "只改后面那条，前面的不该动")
 
     def test_duplicate_pair_is_split(self):
         notes = [n("a", NOTE_COLORS[0]), n("b", NOTE_COLORS[0])]

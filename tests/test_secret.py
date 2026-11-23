@@ -80,6 +80,26 @@ class FailureTest(unittest.TestCase):
         with self.assertRaises(secret.BadPassword):
             secret.open_sealed(blob, "pw1234")
 
+    def test_absurd_iter_is_rejected_without_deriving(self):
+        """iter 被改成天文数字时必须立刻拒绝，不能真去 pbkdf2 卡死界面。
+
+        损坏 / 恶意备份能把 sec 头里的 iter 改成 10 亿；验 tag 之前就得拦住。
+        """
+        blob = seal(PLAIN, "pw1234")
+        blob["iter"] = secret.MAX_ITER + 1
+        with self.assertRaises(secret.BadPassword):
+            secret.open_sealed(blob, "pw1234")
+        # 过小 / 非数字同样拒绝
+        blob["iter"] = secret.MIN_ITER - 1
+        with self.assertRaises(secret.BadPassword):
+            secret.open_sealed(blob, "pw1234")
+        blob["iter"] = "not-a-number"
+        with self.assertRaises(secret.BadPassword):
+            secret.open_sealed(blob, "pw1234")
+        # 恢复槽共用的同一个校验工具
+        with self.assertRaises(secret.BadPassword):
+            secret._check_iters(secret.MAX_ITER + 1, secret.RC_ITERATIONS)
+
     def test_broken_blob(self):
         with self.assertRaises(secret.BadPassword):
             secret.open_sealed({"data": "xx"}, "pw1234")
