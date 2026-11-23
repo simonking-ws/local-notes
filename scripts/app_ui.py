@@ -9112,10 +9112,16 @@ class UIMixin(object):
         self._alarms = {}
         for it in content:
             if it[0] == "t":
+                # ⚠️ 必须给**整段**打 tag，不能用 insert-1c：外部备份里的 run 是
+                # 合并过的整段（如 ["t","技术博客",["h2"]]），insert-1c 只指末字符
+                # 「客」→ 前面「技术博」全掉样式。程序自己 serialize() 存的是逐字符
+                # run，旧写法碰巧对；一旦导入合并 run 就露馅。记插入前起点，插完按
+                # 完整区间挂 tag，两种粒度都正确（也和 serialize 的逐字符语义一致）。
+                start = self.text.index("end-1c")
                 self.text.insert(tk.END, it[1])
                 tags = it[2] if len(it) > 2 else []
                 for tg in tags:
-                    self.text.tag_add(tg, "insert-1c", "insert")
+                    self.text.tag_add(tg, start, "insert")
             elif it[0] == "w":
                 # 老数据里的待办是**嵌入窗口**项 ["w", checked, tags]。待办现在是
                 # 字面字符，这里把窗口渲染成 ⬜ / ✅，并把它带的标签一起戴上 ——
@@ -9159,7 +9165,8 @@ class UIMixin(object):
     def _normalize_quote_spans(self):
         """把每段引用行的标签扩到含行尾换行符。
 
-        渲染是按字符逐个 tag_add 的（`insert-1c` → `insert`），换行符不在标签里。
+        渲染按整段 run 打 tag（`insert` 前的起点 → `insert`），run 自带换行符时
+        换行符也带标签；这里仍逐行核对、满行才铺，两种写法口径一致。
         Tk 只在 tag 覆盖到换行符时才把 background 铺满整行宽度，否则底色停在
         最后一个字 —— 多行引用就成了长短不齐的色条，看着像文本高亮而不是引用块。
 
