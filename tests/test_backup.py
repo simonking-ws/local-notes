@@ -454,5 +454,67 @@ class OverwriteTest(unittest.TestCase):
         self.assertEqual([n["id"] for n in out["notes"] if n.get("sample")], ["s1"])
 
 
+class MediaBackupTest(unittest.TestCase):
+    """图片随备份打包：必须扫 media 目录，不能只扫正文 content。
+
+    加密笔记锁定时 content=[]、图片引用只在密文里，扫 content 会静默漏图。
+    """
+
+    def setUp(self):
+        import imgstore
+        self.imgstore = imgstore
+        self.tmp = tempfile.mkdtemp(prefix="sujian-media-backup-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _put_png(self, name, base=None):
+        """在 media 根目录写一张合法命名的假 PNG。"""
+        d = self.imgstore.media_dir(base or self.tmp)
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, name)
+        with open(p, "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"x" * 32)
+        return p
+
+    def test_packs_image_not_referenced_by_any_content(self):
+        """media 里有图、但所有笔记 content 都没引用（如加密笔记锁定态）→ 仍要打包。"""
+        name = "a" * 20 + ".png"
+        self._put_png(name)
+        # notes 全是 content 为空的「锁定态」笔记，collect_refs 收不到任何图
+        locked = [{"id": "n1", "content": [], "sec": {"blob": "..."}}]
+        packed = backup.pack_media(locked, base=self.tmp)
+        self.assertIn("media/" + name, packed, "加密笔记的图被静默漏出备份")
+
+    def test_roundtrip_restores_unreferenced_image(self):
+        """打包 → 导入能还原这张「无正文引用」的图。"""
+        name = "b" * 20 + ".png"
+        self._put_png(name)
+        packed = backup.pack_media([{"id": "n1", "content": []}], base=self.tmp)
+        # 换一个空目录导入
+        dest = tempfile.mkdtemp(prefix="sujian-media-dest-")
+        try:
+            backup.unpack_media(packed, base=dest)
+            self.assertTrue(os.path.isfile(
+                os.path.join(dest, "media", name)), "导入后图没还原")
+        finally:
+            shutil.rmtree(dest, ignore_errors=True)
+
+    def test_skips_cache_and_foreign_files(self):
+        """cache/ 子目录的图床缓存、非白名单文件都不进备份。"""
+        name = "c" * 20 + ".png"
+        self._put_png(name)
+        # cache 子目录放一张同名合法文件 —— 不能被误收（它 src 是 URL）
+        cache = os.path.join(self.imgstore.media_dir(self.tmp), "cache")
+        os.makedirs(cache, exist_ok=True)
+        with open(os.path.join(cache, "d" * 20 + ".png"), "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n" + b"y" * 16)
+        # 根目录放一张不合白名单的文件
+        self._put_png("not_a_hash.png")
+        packed = backup.pack_media([], base=self.tmp)
+        self.assertEqual(set(packed), {"media/" + name},
+                         "缓存图 / 非白名单文件混进了备份：%s" % list(packed))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

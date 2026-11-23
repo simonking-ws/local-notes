@@ -87,6 +87,64 @@ class SortKeyTest(unittest.TestCase):
         self.assertEqual(ids_by(notes), ["new", "old"])
 
 
+class SearchOrderTest(unittest.TestCase):
+    """搜索结果的顺序必须跟不搜索时同一套口径（置顶>手动>星标>时间）。
+
+    `visible_notes` 在无搜索时对 `folder_notes` 做 `sorted(note_sort_key)`；
+    搜索分支若直接返回 SQLite 的 pinned/starred/updated 顺序，就会忽略手动
+    拖拽的 order、把星标提到手动顺序之前 —— 搜与不搜列表跳变。
+    """
+
+    def setUp(self):
+        import store
+        self.store_mod = store
+        self.tmp = tempfile.mkdtemp(prefix="sujian-search-order-")
+        self.db = os.path.join(self.tmp, "n.db")
+        # 三条都含「共」字（都能被搜到），但排序键不同：
+        # manual 有 order 应排第一，star 是星标排第二，plain 无 order 排最后（尽管 updated 最大）
+        self.notes = [
+            n("plain", updated=900, folder="f_work"),
+            n("star", starred=True, updated=5, folder="f_work"),
+            n("manual", updated=10, order=1, folder="f_work"),
+        ]
+        # 内容里带上「共」字，保证 search_ids 搜得到
+        for x in self.notes:
+            x["content"] = _t("共 " + x["id"])
+        s = store.Store(self.db)
+        s.save({"folders": [{"id": "f_work", "name": "工作"}],
+                "notes": self.notes}, full=True)
+        self._old_store = store._STORE
+        store._STORE = s
+        self.s = s
+
+    def tearDown(self):
+        self.store_mod._STORE = self._old_store
+        self.s.close()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _app(self, q):
+        class _V:
+            def get(self_inner):
+                return q
+        fake = _Fake(self.notes)
+        fake.search_var = _V()
+        fake.data = {"notes": self.notes, "current_folder": "f_work"}
+        fake.folder_subtree = lambda fid: [fid]
+        fake._save_job = None
+        fake.current_folder = "f_work"
+        fake.folder_notes = NotesApp.folder_notes.__get__(fake, _Fake)
+        fake.visible_notes = NotesApp.visible_notes.__get__(fake, _Fake)
+        return fake
+
+    def test_search_uses_same_order_as_plain_list(self):
+        plain = [x["id"] for x in self._app("").visible_notes()]
+        found = [x["id"] for x in self._app("共").visible_notes()]
+        self.assertEqual(found, plain,
+                         "搜索结果的顺序跟不搜索时不一致：%s vs %s" % (found, plain))
+        self.assertEqual(found, ["manual", "star", "plain"],
+                         "手动顺序没被尊重（搜索分支用了 SQL 排序）")
+
+
 class EnsureOrderTest(unittest.TestCase):
     def test_freezes_current_order_and_is_idempotent(self):
         notes = [n("a", updated=10), n("b", updated=30), n("c", updated=20)]

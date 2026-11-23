@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 
 from theme import (  # noqa: E402
     THEMES, THEME_LABELS, THEME_ORDER, theme_label, build_palette, list_themes,
-    DEFAULT_THEME, skin_accent, skin_look,
+    DEFAULT_THEME, skin_look,
     FOREST_ACCENT_FALLBACK,
     _contrast_ratio, _color_dist, _luminance, _hex_rgb, on_accent,
     _status_bar_bg, _readonly_bar_bg, _tab_idle_bg, _toolbar_bg, _sel_bg,
@@ -200,7 +200,7 @@ def test_on_accent_readable():
 
 def test_forest_uses_workbuddy_accent():
     """森林绿的 accent 必须等于 WorkBuddy 当前主题色；读不到才用自带的绿。"""
-    acc = skin_accent(None)
+    acc = skin_look().get("accent")
     p = build_palette("forest")
     if acc:
         assert p["accent"] == acc, "森林绿没能拿到 WorkBuddy 的主题色（拿到的是 %s）" % p["accent"]
